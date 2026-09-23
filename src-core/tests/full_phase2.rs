@@ -24,8 +24,7 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new() -> Self {
-        let root = PathBuf::from(r"D:\gpt");
-        fs::create_dir_all(&root).expect("create D drive test root");
+        let root = std::env::temp_dir();
         let path = root.join(format!(
             "aiwork-core-full-phase2-{}-{}",
             std::process::id(),

@@ -42,9 +42,8 @@ impl RouterConfig {
     pub const fn default_port() -> u16 { 7865 }
 
     pub fn load(data_dir: impl Into<PathBuf>) -> Result<Self, String> {
-        let requested = env::var_os("STARLINK_ROUTER_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| data_dir.into());
+        let data_dir_override = env::var_os("STARLINK_ROUTER_DATA_DIR").map(PathBuf::from);
+        let requested = data_dir_override.clone().unwrap_or_else(|| data_dir.into());
         let mut config = Self::defaults(requested);
         let config_path = config.data_dir.join(CONFIG_FILE);
         if config_path.exists() {
@@ -53,6 +52,9 @@ impl RouterConfig {
             let persisted: RouterConfig = serde_json::from_str(&raw)
                 .map_err(|e| format!("解析路由器配置失败: {e}"))?;
             config = persisted;
+        }
+        if let Some(data_dir_override) = data_dir_override {
+            config.data_dir = data_dir_override;
         }
         if let Some(host) = env::var_os("STARLINK_ROUTER_HOST") {
             config.host = host.to_string_lossy().trim().to_string();
@@ -106,34 +108,72 @@ fn default_model() -> String { "deepseek-v4-flash".to_string() }
 #[cfg(test)]
 mod tests {
     use super::RouterConfig;
-    use std::{fs, path::PathBuf};
+    use std::{
+        env,
+        ffi::OsString,
+        fs,
+        sync::Mutex,
+    };
+
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard(Option<OsString>);
+
+    impl EnvGuard {
+        fn set(name: &str, value: &std::path::Path) -> Self {
+            let old = env::var_os(name);
+            env::set_var(name, value);
+            Self(old)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => env::set_var("STARLINK_ROUTER_DATA_DIR", value),
+                None => env::remove_var("STARLINK_ROUTER_DATA_DIR"),
+            }
+        }
+    }
 
     #[test]
     fn router_defaults_to_port_7865_and_separate_data_directory() {
-        let config = RouterConfig::defaults(PathBuf::from(r"D:\gpt\starlink-dimension-router-data"));
+        let config = RouterConfig::defaults(std::env::temp_dir().join("starlink-router-data"));
         assert_eq!(config.port, 7865);
         assert_eq!(config.display_name, "星链维度分流系统");
     }
 
     #[test]
     fn persisted_public_base_url_survives_router_restart() {
-        let dir = PathBuf::from(format!(r"D:\gpt\starlink-router-config-test-{}", rand::random::<u64>()));
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("starlink-router-config-test-{}", rand::random::<u64>()));
         fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join("router.json"),
-            r#"{
-                "data_dir": "D:\\gpt\\starlink-dimension-router-data",
-                "host": "127.0.0.1",
-                "port": 7865,
-                "display_name": "星链维度分流系统",
-                "default_model": "deepseek-v4-flash",
-                "public_base_url": "https://api.gemstory.cn"
-            }"#,
-        )
-        .unwrap();
+        let mut persisted = RouterConfig::defaults(dir.clone());
+        persisted.public_base_url = "https://api.gemstory.cn".into();
+        fs::write(dir.join("router.json"), serde_json::to_vec(&persisted).unwrap()).unwrap();
 
         let config = RouterConfig::load(&dir).unwrap();
         assert_eq!(config.public_base_url, "https://api.gemstory.cn");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn data_directory_environment_override_wins_over_persisted_router_path() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("starlink-router-data-override-{}", rand::random::<u64>()));
+        let config_dir = root.join("configured");
+        let override_dir = root.join("override");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&override_dir).unwrap();
+        let mut persisted = RouterConfig::defaults(config_dir.clone());
+        persisted.public_base_url = "https://api.gemstory.cn".into();
+        fs::write(override_dir.join("router.json"), serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+        let _env = EnvGuard::set("STARLINK_ROUTER_DATA_DIR", &override_dir);
+        let loaded = RouterConfig::load(&config_dir).unwrap();
+        assert_eq!(loaded.data_dir, override_dir);
+        assert_eq!(loaded.public_base_url, "https://api.gemstory.cn");
+        drop(_env);
+        let _ = fs::remove_dir_all(root);
     }
 }

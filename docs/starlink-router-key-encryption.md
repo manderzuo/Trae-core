@@ -10,7 +10,7 @@ Core 只保存普通 API Key 的哈希用于认证；为支持管理员在登录
 .\scripts\new-starlink-router-key-encryption-env.ps1
 ```
 
-脚本默认在 `D:\gpt\starlink-core-secrets\key-encryption.env` 创建随机 32 字节密钥文件，并限制目录和文件 ACL；不会显示密钥，也拒绝覆盖已有文件。若 Core 服务使用专用 Windows 账户，使用 `-ServiceAccount '机器名\账户名'`，并确保该账户与启动脚本中的运行账户一致。环境文件必须位于 Core 数据目录之外。
+脚本默认在仓库/安装根目录的 `secrets\key-encryption.env` 创建随机 32 字节密钥文件，并限制目录和文件 ACL；不会显示密钥，也拒绝覆盖已有文件。数据根目录默认为 `data`，数据库实际保存在 `<DataDir>\data\core.sqlite3`。可通过 `-EnvironmentFile` 和 `-DataDir` 指定其他绝对路径；密钥文件必须位于 Core 数据目录之外。若 Core 服务使用专用 Windows 账户，使用 `-ServiceAccount '机器名\账户名'`，并确保该账户与启动脚本中的运行账户一致。
 
 之后用启动脚本运行 Core：
 

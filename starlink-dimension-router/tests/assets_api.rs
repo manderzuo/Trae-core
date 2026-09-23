@@ -153,8 +153,8 @@ impl BridgeTransport for VideoBridge {
 }
 
 fn test_dir(label: &str) -> PathBuf {
-    PathBuf::from(format!(
-        r"D:\gpt\starlink-assets-api-test-{label}-{}",
+    std::env::temp_dir().join(format!(
+        "starlink-assets-api-test-{label}-{}",
         rand::random::<u64>()
     ))
 }

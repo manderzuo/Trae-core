@@ -1,19 +1,24 @@
 param(
-  [string]$OutputRoot = 'D:\gpt\starlink-dimension-router-release'
+  [string]$OutputRoot = '',
+  [string]$CargoTargetDir = '',
+  [string]$CargoCommand = 'cargo'
 )
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$targetDir = 'D:\gpt\starlink-router-cargo-target'
+$repoRoot = [System.IO.Path]::GetFullPath($repoRoot)
+if ([string]::IsNullOrWhiteSpace($OutputRoot)) { $OutputRoot = Join-Path $repoRoot 'dist' }
+if ([string]::IsNullOrWhiteSpace($CargoTargetDir)) { $CargoTargetDir = Join-Path $repoRoot 'target' }
+$OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
+$targetDir = [System.IO.Path]::GetFullPath($CargoTargetDir)
 $env:CARGO_TARGET_DIR = $targetDir
-$env:TEMP = 'D:\gpt'
-$env:TMP = 'D:\gpt'
 $manifest = Join-Path $repoRoot 'starlink-dimension-router\Cargo.toml'
-$cargo = 'C:\Users\StarLink\.cargo\bin\cargo.exe'
+$cargo = Get-Command -Name $CargoCommand -ErrorAction SilentlyContinue
+if ($null -eq $cargo) { throw "找不到 Cargo 命令：$CargoCommand；请安装 Rust 或通过 -CargoCommand 指定可执行文件。" }
 $releaseDir = Join-Path $OutputRoot 'release'
 
-New-Item -ItemType Directory -Force -Path $OutputRoot, $releaseDir | Out-Null
-& $cargo build --release --manifest-path $manifest --offline
+New-Item -ItemType Directory -Force -Path $OutputRoot, $releaseDir, $targetDir | Out-Null
+& $cargo.Source build --release --manifest-path $manifest --offline
 if ($LASTEXITCODE -ne 0) { throw "独立路由器构建失败，退出码 $LASTEXITCODE" }
 
 $built = Join-Path $targetDir 'release\starlink-dimension-router.exe'

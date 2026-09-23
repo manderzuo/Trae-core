@@ -1,11 +1,13 @@
 param(
   [Parameter(Mandatory=$true)][string]$SourceRoot,
-  [string]$TargetRoot = 'D:\gpt\starlink-dimension-router-data',
+  [string]$TargetRoot = '',
   [Parameter(Mandatory=$true)][string]$MigrationId,
   [switch]$Apply
 )
 
 $ErrorActionPreference = 'Stop'
+$repoRoot = Split-Path -Parent $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($TargetRoot)) { $TargetRoot = Join-Path $repoRoot 'data' }
 if ([string]::IsNullOrWhiteSpace($MigrationId)) { throw 'MigrationId 不能为空' }
 if (-not (Test-Path -LiteralPath $SourceRoot -PathType Container)) { throw "源目录不存在: $SourceRoot" }
 $names = @('data\core.sqlite3','data\api_keys.json','data\remaining_credits.json','data\video_tasks.json')

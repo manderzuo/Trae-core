@@ -3,8 +3,10 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 use aiwork_core::{CoreStore, NewAdminCredential, NewUser, UserRole, CURRENT_SCHEMA_VERSION};
 
 fn test_dir(label: &str) -> PathBuf {
-    let dir = PathBuf::from(format!(r"D:\gpt\starlink-admin-auth-test-{label}-{}", rand::random::<u64>()));
-    let _ = fs::remove_dir_all(&dir);
+    let dir = std::env::temp_dir().join(format!(
+        "starlink-admin-auth-test-{label}-{}",
+        rand::random::<u64>()
+    ));
     dir
 }
 

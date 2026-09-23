@@ -1,10 +1,14 @@
-use std::{fs, net::SocketAddr, path::PathBuf};
+use std::{fs, net::SocketAddr};
 
 use starlink_dimension_router::{bridge_client::BridgeClient, config::RouterConfig, server::build_router, state::StarlinkRouterState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = RouterConfig::load(PathBuf::from(r"D:\gpt\starlink-dimension-router-data"))
+    let executable_dir = std::env::current_exe()?
+        .parent()
+        .map(|path| path.to_path_buf())
+        .unwrap_or(std::env::current_dir()?);
+    let config = RouterConfig::load(executable_dir.join("data"))
         .map_err(std::io::Error::other)?;
     fs::create_dir_all(&config.data_dir)?;
     let (base_url, key) = config

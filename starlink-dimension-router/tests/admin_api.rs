@@ -31,7 +31,10 @@ impl Drop for TestDir {
 }
 
 fn test_dir() -> PathBuf {
-    PathBuf::from(format!(r"D:\gpt\starlink-video-billing-admin-{}", rand::random::<u64>()))
+    std::env::temp_dir().join(format!(
+        "starlink-video-billing-admin-{}",
+        rand::random::<u64>()
+    ))
 }
 
 fn fixture() -> Fixture {

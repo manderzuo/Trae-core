@@ -1,12 +1,15 @@
 param(
   [ValidateRange(1, 4294967295)]
   [uint32]$Version = 1,
-  [string]$EnvironmentFile = 'D:\gpt\starlink-core-secrets\key-encryption.env',
-  [string]$DataDir = 'D:\gpt\starlink-dimension-router-data',
+  [string]$EnvironmentFile = '',
+  [string]$DataDir = '',
   [string]$ServiceAccount = ''
 )
 
 $ErrorActionPreference = 'Stop'
+$repoRoot = Split-Path -Parent $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($EnvironmentFile)) { $EnvironmentFile = Join-Path $repoRoot 'secrets\key-encryption.env' }
+if ([string]::IsNullOrWhiteSpace($DataDir)) { $DataDir = Join-Path $repoRoot 'data' }
 $environmentPath = [System.IO.Path]::GetFullPath($EnvironmentFile)
 $dataPath = [System.IO.Path]::GetFullPath($DataDir).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
 if ($environmentPath.StartsWith($dataPath + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {

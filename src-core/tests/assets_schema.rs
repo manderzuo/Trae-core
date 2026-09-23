@@ -7,8 +7,7 @@ use rusqlite::Connection;
 use aiwork_core::CORE_DB_FILE;
 
 fn test_dir(prefix: &str) -> PathBuf {
-    let root = PathBuf::from(r"D:\gpt");
-    fs::create_dir_all(&root).unwrap();
+    let root = std::env::temp_dir();
     let dir = root.join(format!("aiwork-core-assets-{prefix}-{}", rand::random::<u64>()));
     fs::create_dir_all(&dir).unwrap();
     dir
@@ -83,7 +82,7 @@ fn input(id: &str, expires_at_ms: i64, token: u8) -> CreateAssetInput {
 fn bootstrap_and_migration_create_authoritative_assets_table() {
     let (store, _principal_a, _principal_b, dir) = fixture();
     assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-    assert_eq!(CURRENT_SCHEMA_VERSION, 20);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 21);
     assert_eq!(store.table_count("assets").unwrap(), 1);
     assert_eq!(store.count_rows("assets").unwrap(), 0);
     drop(store);

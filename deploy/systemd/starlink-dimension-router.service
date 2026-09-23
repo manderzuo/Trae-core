@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=ubuntu
 Group=ubuntu
-WorkingDirectory=/var/lib/starlink-dimension-router
+WorkingDirectory=/opt/gemstory/starlink-dimension-router/current
 StateDirectory=starlink-dimension-router
 StateDirectoryMode=0750
 Environment=STARLINK_ROUTER_DATA_DIR=/var/lib/starlink-dimension-router
@@ -15,7 +15,7 @@ EnvironmentFile=/etc/starlink-dimension-router/key-encryption.env
 Environment=STARLINK_ROUTER_HOST=127.0.0.1
 Environment=STARLINK_ROUTER_PORT=17865
 Environment=STARLINK_ROUTER_PUBLIC_BASE_URL=https://api.gemstory.cn
-ExecStart=/opt/gemstory/starlink-dimension-router/releases/20260923-c3a80826/starlink-dimension-router
+ExecStart=/opt/gemstory/starlink-dimension-router/current/starlink-dimension-router
 Restart=on-failure
 RestartSec=3
 UMask=0077

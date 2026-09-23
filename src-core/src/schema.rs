@@ -598,3 +598,7 @@ pub(crate) const SCHEMA_V20: &str = r#"
 ALTER TABLE api_keys ADD COLUMN secret_ciphertext BLOB;
 ALTER TABLE api_keys ADD COLUMN secret_key_version INTEGER CHECK(secret_key_version IS NULL OR secret_key_version > 0);
 "#;
+
+pub(crate) const SCHEMA_V21: &str = r#"
+ALTER TABLE api_keys ADD COLUMN deleted_at_ms INTEGER;
+"#;

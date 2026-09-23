@@ -18,8 +18,7 @@ const NOW_MS: i64 = 1_800_000_000_000;
 const RESOURCE_KIND: &str = "chat_request";
 
 fn test_dir(tag: &str) -> PathBuf {
-    let root = PathBuf::from(r"D:\gpt");
-    fs::create_dir_all(&root).unwrap();
+    let root = std::env::temp_dir();
     let dir = root.join(format!("aiwork-task6-recovery-{tag}-{}", rand::random::<u64>()));
     fs::create_dir_all(&dir).unwrap();
     dir

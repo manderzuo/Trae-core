@@ -12,7 +12,7 @@ use crate::{
     schema::{
         SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V6_FINISH,
         SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
-        SCHEMA_V16, SCHEMA_V17, SCHEMA_V19, SCHEMA_V20,
+        SCHEMA_V16, SCHEMA_V17, SCHEMA_V19, SCHEMA_V20, SCHEMA_V21,
     },
     upstream::{
         account_health_decision, audit_hash, audit_identifier, audit_label,
@@ -27,7 +27,7 @@ use crate::{
 };
 
 pub const CORE_DB_FILE: &str = "core.sqlite3";
-pub const CURRENT_SCHEMA_VERSION: u32 = 20;
+pub const CURRENT_SCHEMA_VERSION: u32 = 21;
 pub const DEFAULT_API_KEY_MAX_CONCURRENCY: i64 = 32;
 
 pub struct CoreStore {
@@ -254,7 +254,7 @@ impl CoreStore {
             11 => {}
             12 => {}
             13 => {}
-            14 | 15 | 16 | 17 | 18 | 19 | CURRENT_SCHEMA_VERSION => Self::harden_v6_records(&transaction)?,
+            14 | 15 | 16 | 17 | 18 | 19 | 20 | CURRENT_SCHEMA_VERSION => Self::harden_v6_records(&transaction)?,
                 version => return Err(CoreError::UnsupportedSchemaVersion { version }),
             }
 
@@ -284,6 +284,9 @@ impl CoreStore {
             }
             if version < 20 {
                 Self::migrate_v19_to_v20(&transaction)?;
+            }
+            if version < 21 {
+                Self::migrate_v20_to_v21(&transaction)?;
             }
             if version < CURRENT_SCHEMA_VERSION {
                 transaction
@@ -1139,7 +1142,8 @@ impl CoreStore {
                             api_keys.created_at_ms, api_keys.revoked_at_ms,
                             EXISTS(SELECT 1 FROM api_key_billing_blocks WHERE key_id = api_keys.id)
                      FROM api_keys INNER JOIN users ON users.id = api_keys.user_id
-                     WHERE api_keys.user_id = ?1 ORDER BY api_keys.created_at_ms, api_keys.id",
+                     WHERE api_keys.user_id = ?1 AND api_keys.deleted_at_ms IS NULL
+                     ORDER BY api_keys.created_at_ms, api_keys.id",
                 )?
             } else {
                 transaction.prepare(
@@ -1148,7 +1152,7 @@ impl CoreStore {
                             api_keys.created_at_ms, api_keys.revoked_at_ms,
                             EXISTS(SELECT 1 FROM api_key_billing_blocks WHERE key_id = api_keys.id)
                      FROM api_keys INNER JOIN users ON users.id = api_keys.user_id
-                     WHERE users.role <> 'admin'
+                     WHERE users.role <> 'admin' AND api_keys.deleted_at_ms IS NULL
                      ORDER BY api_keys.created_at_ms, api_keys.id",
                 )?
             };
@@ -1977,6 +1981,187 @@ impl CoreStore {
             now,
         )?;
         transaction.commit().map_err(CoreError::from)
+    }
+
+    /// Logically delete a non-administrator API key and return only its
+    /// currently available credits to the shared allocatable balance. The
+    /// immediate transaction serializes deletion against reservations.
+    pub fn delete_api_key_as_admin(
+        &self,
+        principal: &Principal,
+        key_id: &str,
+    ) -> Result<i64, CoreError> {
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::authorize_admin_principal_in_transaction(&transaction, principal)?;
+
+        let key = transaction
+            .query_row(
+                "SELECT api_keys.user_id, users.role, api_keys.deleted_at_ms
+                 FROM api_keys INNER JOIN users ON users.id = api_keys.user_id
+                 WHERE api_keys.id = ?1",
+                [key_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::ApiKeyNotFound { api_key_id: key_id.into() })?;
+
+        if key.1 == "admin" {
+            return Err(CoreError::ApiKeyDeletionBlocked {
+                api_key_id: key_id.into(),
+                reason: "administrator_key".into(),
+            });
+        }
+        if key.2.is_some() {
+            transaction.commit()?;
+            return Ok(0);
+        }
+
+        let has_active_request: bool = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM requests
+               WHERE api_key_id = ?1
+                 AND state IN ('received','validating','reserved','queued','dispatched','completing','unknown')
+             )",
+            [key_id],
+            |row| row.get(0),
+        )?;
+        let has_active_job: bool = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM jobs j INNER JOIN requests r ON r.id = j.request_id
+               WHERE r.api_key_id = ?1
+                 AND (j.state IN ('created','queued','running','cancel_requested','unknown')
+                      OR j.reconcile_required = 1)
+             )",
+            [key_id],
+            |row| row.get(0),
+        )?;
+        let has_active_attempt: bool = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM job_attempts a
+               INNER JOIN jobs j ON j.id = a.job_id
+               INNER JOIN requests r ON r.id = j.request_id
+               WHERE r.api_key_id = ?1
+                 AND a.state IN ('queued','running','cancel_requested','unknown')
+             )",
+            [key_id],
+            |row| row.get(0),
+        )?;
+        let has_open_reservation: bool = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM quota_reservations q
+               WHERE (q.api_key_id = ?1 OR q.key_budget_account_id IN (
+                   SELECT id FROM quota_budget_accounts WHERE scope = 'key' AND api_key_id = ?1
+               )) AND q.state IN ('held','unknown')
+             )",
+            [key_id],
+            |row| row.get(0),
+        )?;
+        let has_reconciliation: bool = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM billing_settlements s
+               INNER JOIN requests r ON r.id = s.request_id
+               WHERE r.api_key_id = ?1 AND s.reconcile_required = 1
+             )",
+            [key_id],
+            |row| row.get(0),
+        )?;
+        let has_pending_migration: bool = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM quota_budget_accounts
+               WHERE scope = 'key' AND api_key_id = ?1 AND migration_state <> 'ready'
+             )",
+            [key_id],
+            |row| row.get(0),
+        )?;
+
+        if has_active_request
+            || has_active_job
+            || has_active_attempt
+            || has_open_reservation
+            || has_reconciliation
+            || has_pending_migration
+        {
+            return Err(CoreError::ApiKeyDeletionBlocked {
+                api_key_id: key_id.into(),
+                reason: "pending_request_or_quota_reconciliation".into(),
+            });
+        }
+
+        let credit_account = transaction
+            .query_row(
+                "SELECT id, version FROM quota_budget_accounts
+                 WHERE scope = 'key' AND api_key_id = ?1 AND user_id = ?2 AND resource_kind = 'credits'
+                 ORDER BY id LIMIT 1",
+                params![key_id, key.0],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let mut returned_credits = 0_i64;
+        if let Some((account_id, version)) = credit_account {
+            let available: i64 = transaction.query_row(
+                "SELECT COALESCE(SUM(delta), 0) FROM quota_ledger WHERE budget_account_id = ?1",
+                [&account_id],
+                |row| row.get(0),
+            )?;
+            returned_credits = available.max(0);
+            if returned_credits > 0 {
+                let next_version = version.checked_add(1).ok_or_else(|| CoreError::InvalidConfiguration {
+                    key: "quota_budget_accounts.version".into(),
+                    value: version.to_string(),
+                })?;
+                let now = Utc::now().timestamp_millis();
+                transaction.execute(
+                    "UPDATE quota_budget_accounts SET version = ?1, updated_at_ms = ?2 WHERE id = ?3",
+                    params![next_version, now, account_id],
+                )?;
+                let event_group_id = format!("delete-{key_id}");
+                Self::insert_budget_ledger_entry(
+                    &transaction,
+                    &key.0,
+                    "credits",
+                    "adjust",
+                    returned_credits,
+                    -returned_credits,
+                    None,
+                    Some(&principal.user_id),
+                    Some("删除 API Key 并返还未使用积分"),
+                    now,
+                    Some(&account_id),
+                    Some(&event_group_id),
+                    Some(key_id),
+                    next_version,
+                )?;
+            }
+        }
+
+        let now = Utc::now().timestamp_millis();
+        transaction.execute(
+            "UPDATE api_keys
+             SET status = 'revoked', revoked_at_ms = COALESCE(revoked_at_ms, ?1), deleted_at_ms = ?1
+             WHERE id = ?2 AND deleted_at_ms IS NULL",
+            params![now, key_id],
+        )?;
+        Self::insert_audit_event(
+            &transaction,
+            &principal.user_id,
+            "api_key.delete",
+            "api_key",
+            key_id,
+            serde_json::json!({
+                "returned_microcredits": returned_credits,
+                "result": "deleted",
+            }),
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(returned_credits)
     }
 
     fn revoke_api_key_inner(&self, key_id: &str, actor: &str, require_admin: bool) -> Result<(), CoreError> {
@@ -3095,6 +3280,26 @@ impl CoreStore {
             return Ok(());
         }
         transaction.execute_batch(SCHEMA_V20).map_err(CoreError::migration)
+    }
+
+    fn migrate_v20_to_v21(transaction: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
+        let api_keys_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'api_keys')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !api_keys_exists {
+            return Ok(());
+        }
+        let deleted_at_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('api_keys') WHERE name = 'deleted_at_ms')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !deleted_at_exists {
+            transaction.execute_batch(SCHEMA_V21).map_err(CoreError::migration)?;
+        }
+        Ok(())
     }
 
     fn scale_credit_column_to_microcredits(

@@ -120,7 +120,7 @@ pub fn router() -> Router<Arc<StarlinkRouterState>> {
         .route("/admin/v1/bridge/config", put(bridge_config_save))
         .route("/admin/v1/users", get(users).post(create_user))
         .route("/admin/v1/api-keys", get(list_api_keys).post(issue_key))
-        .route("/admin/v1/api-keys/:key_id", patch(update_key))
+        .route("/admin/v1/api-keys/:key_id", patch(update_key).delete(delete_key))
         .route("/admin/v1/api-keys/:key_id/rotate", post(rotate_key))
         .route("/admin/v1/api-keys/:key_id/copy", post(copy_api_key))
         .route("/admin/v1/api-keys/:key_id/revoke", post(revoke_key))
@@ -468,6 +468,56 @@ async fn update_key(State(state): State<Arc<StarlinkRouterState>>, Extension(pri
     Ok(Json(json!({"id": key.id, "status": key.status, "max_concurrency": key.max_concurrency})))
 }
 
+async fn delete_key(
+    State(state): State<Arc<StarlinkRouterState>>,
+    Extension(principal): Extension<aiwork_core::Principal>,
+    Path(key_id): Path<String>,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    let returned_microcredits = state
+        .store
+        .delete_api_key_as_admin(&principal, &key_id)
+        .map_err(key_deletion_admin_error)?;
+    let returned_credits = decimal_credits(returned_microcredits)?;
+    Ok(no_store_json(json!({
+        "deleted": true,
+        "returned_credits": returned_credits,
+    })))
+}
+
+fn key_deletion_admin_error(error: CoreError) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        CoreError::ApiKeyNotFound { .. } => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": {
+                "type": "api_key_not_found",
+                "message": "未找到该普通 API Key"
+            }})),
+        ),
+        CoreError::ApiKeyDeletionBlocked { reason, .. } if reason == "administrator_key" => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": {
+                "type": "api_key_deletion_blocked",
+                "message": "管理员 API Key 不能在普通 Key 管理页删除"
+            }})),
+        ),
+        CoreError::ApiKeyDeletionBlocked { .. } => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": {
+                "type": "api_key_deletion_blocked",
+                "message": "该 Key 仍有未完成请求、积分预留或待对账事项，请先完成结算后再删除"
+            }})),
+        ),
+        CoreError::AdminRequired => (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": {
+                "type": "admin_required",
+                "message": "需要管理员权限"
+            }})),
+        ),
+        other => internal(other),
+    }
+}
+
 async fn rotate_key(State(state): State<Arc<StarlinkRouterState>>, Extension(principal): Extension<aiwork_core::Principal>, Path(key_id): Path<String>) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
     let key = state.store.rotate_api_key_as_admin_with_encrypted_copy(
         &principal,
@@ -581,14 +631,29 @@ async fn key_quota(
     if query.resource_kind != "credits" {
         return Err(internal("只支持查询统一积分额度"));
     }
-    let balance = state
+    let key = state.store.list_api_keys_as_admin(&principal, None).map_err(internal)?
+        .into_iter().find(|key| key.id == key_id)
+        .ok_or_else(|| internal("API Key 不存在"))?;
+    let used = key.verified_credit_spent;
+    let balance = match state
         .store
         .key_quota_balance_as_admin(&principal, &key_id, &query.resource_kind)
-        .map_err(quota_admin_error)?;
-    let used = state.store.list_api_keys_as_admin(&principal, None).map_err(internal)?
-        .into_iter().find(|key| key.id == key_id)
-        .map(|key| key.verified_credit_spent)
-        .ok_or_else(|| internal("API Key 不存在"))?;
+    {
+        Ok(balance) => balance,
+        Err(CoreError::KeyQuotaNotConfigured { .. }) => {
+            let allocated = decimal_credits(used)?;
+            return Ok(Json(json!({
+                "resource_kind": query.resource_kind,
+                "allocated": allocated,
+                "used": allocated,
+                "available": "0.000000",
+                "deficit": "0.000000",
+                "held": "0.000000",
+                "key_quota_configured": false,
+            })));
+        }
+        Err(error) => return Err(quota_admin_error(error)),
+    };
     let allocated = balance.available.checked_add(balance.held).and_then(|value| value.checked_add(used))
         .ok_or_else(|| internal("Key 积分额度计算溢出"))?;
     let deficit = balance.available.saturating_neg().max(0);
@@ -675,13 +740,24 @@ fn decimal_credits(value: i64) -> Result<CreditAmount, (StatusCode, Json<serde_j
         .ok_or_else(|| internal("Core 返回了无效的负积分余额"))
 }
 
-async fn migration_inspect(Json(input): Json<MigrationInput>) -> Result<Json<migration::MigrationReport>, (StatusCode, Json<serde_json::Value>)> {
-    migration::inspect(input.source_root, r"D:\gpt\starlink-dimension-router-data", &input.migration_id).map(Json).map_err(internal)
+async fn migration_inspect(
+    State(state): State<Arc<StarlinkRouterState>>,
+    Json(input): Json<MigrationInput>,
+) -> Result<Json<migration::MigrationReport>, (StatusCode, Json<serde_json::Value>)> {
+    migration::inspect(input.source_root, &state.config.data_dir, &input.migration_id)
+        .map(Json)
+        .map_err(internal)
 }
 
-async fn migration_apply(Json(input): Json<MigrationInput>) -> Result<Json<migration::MigrationReport>, (StatusCode, Json<serde_json::Value>)> {
-    let report = migration::inspect(&input.source_root, r"D:\gpt\starlink-dimension-router-data", &input.migration_id).map_err(internal)?;
-    migration::apply(&report, input.confirmed).map(Json).map_err(internal)
+async fn migration_apply(
+    State(state): State<Arc<StarlinkRouterState>>,
+    Json(input): Json<MigrationInput>,
+) -> Result<Json<migration::MigrationReport>, (StatusCode, Json<serde_json::Value>)> {
+    let report = migration::inspect(&input.source_root, &state.config.data_dir, &input.migration_id)
+        .map_err(internal)?;
+    migration::apply(&report, input.confirmed)
+        .map(Json)
+        .map_err(internal)
 }
 
 fn internal<E: ToString>(error: E) -> (StatusCode, Json<serde_json::Value>) {

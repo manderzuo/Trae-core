@@ -10,8 +10,7 @@ use rusqlite::Connection;
 use serde_json::json;
 
 fn test_dir(tag: &str) -> PathBuf {
-    let root = PathBuf::from(r"D:\gpt");
-    fs::create_dir_all(&root).unwrap();
+    let root = std::env::temp_dir();
     let dir = root.join(format!("aiwork-core-video-jobs-{tag}-{}", rand::random::<u64>()));
     fs::create_dir_all(&dir).unwrap();
     dir
@@ -625,7 +624,7 @@ fn unknown_video_lease_requires_explicit_success_evidence_to_reconcile_once() {
 #[test]
 fn bootstrap_creates_authoritative_video_job_tables() {
     let (store, _admin, _principal, dir) = fixture();
-    assert_eq!(CURRENT_SCHEMA_VERSION, 20);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 21);
     assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     for table in ["jobs", "job_attempts", "dispatch_queue_cursors"] {
         assert_eq!(store.table_count(table).unwrap(), 1, "missing table {table}");

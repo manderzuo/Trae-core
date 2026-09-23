@@ -1,19 +1,24 @@
 param(
   [string]$ReleaseRoot = '',
-  [string]$DataDir = 'D:\gpt\starlink-dimension-router-data',
-  [string]$EnvironmentFile = 'D:\gpt\starlink-core-secrets\key-encryption.env',
+  [string]$DataDir = '',
+  [string]$EnvironmentFile = '',
   [switch]$Background
 )
 
 $ErrorActionPreference = 'Stop'
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$repoRoot = Split-Path -Parent $scriptRoot
 if ([string]::IsNullOrWhiteSpace($ReleaseRoot)) {
-  $ReleaseRoot = if (Test-Path -LiteralPath (Join-Path $scriptRoot 'release') -PathType Container) {
-    $scriptRoot
-  } else {
-    'D:\gpt\starlink-core-persist-release'
+  $candidates = @($repoRoot, (Join-Path $repoRoot 'dist'))
+  $ReleaseRoot = $candidates | Where-Object {
+    Test-Path -LiteralPath (Join-Path $_ 'release\starlink-dimension-router.exe') -PathType Leaf
+  } | Select-Object -First 1
+  if ([string]::IsNullOrWhiteSpace($ReleaseRoot)) {
+    throw '未找到 release 程序；请先构建，或通过 -ReleaseRoot 指定包含 release 目录的路径。'
   }
 }
+if ([string]::IsNullOrWhiteSpace($DataDir)) { $DataDir = Join-Path $repoRoot 'data' }
+if ([string]::IsNullOrWhiteSpace($EnvironmentFile)) { $EnvironmentFile = Join-Path $repoRoot 'secrets\key-encryption.env' }
 $exe = Join-Path $ReleaseRoot 'release\starlink-dimension-router.exe'
 if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
   throw "未找到 Core 程序: $exe"

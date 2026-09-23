@@ -301,7 +301,7 @@
           <div class="key-credits"><div class="key-label">积分额度</div><div>已分配 <strong>${escapeHtml(formatCredits(credits.allocated))}</strong></div><div>已实扣 <strong>${escapeHtml(formatCredits(credits.used))}</strong></div><div>剩余 <strong>${escapeHtml(formatCredits(credits.remaining))}</strong> · 持有 ${escapeHtml(formatCredits(credits.held))}</div>${billingBlocked?`<div class="error-text">计费冻结 · 超额 ${escapeHtml(formatCredits(credits.deficit))}</div>`:''}</div>
           <div><div class="key-label">并发</div><div>${escapeHtml(formatCount(key.current_concurrency))} / ${escapeHtml(formatCount(key.max_concurrency))}</div></div>
           <div><div class="key-label">权限与状态</div><div class="scope-list">${escapeHtml(scopes)}</div><div style="margin-top:6px"><span class="pill ${billingBlocked?'off':active?'':'off'}">${billingBlocked?'计费冻结':active?'已开启':'已关闭'}</span></div></div>
-          <div class="key-actions"><button class="btn alt small" data-action="copy" type="button">复制 Key</button><button class="btn alt small" data-action="toggle" type="button">${active?'关闭':'开启'}</button><button class="btn alt small" data-action="concurrency" type="button">调整并发</button><button class="btn alt small" data-action="usage" type="button">使用情况</button><button class="btn small" data-action="rotate" type="button">轮换</button></div>
+          <div class="key-actions"><button class="btn alt small" data-action="copy" type="button">复制 Key</button><button class="btn alt small" data-action="toggle" type="button">${active?'关闭':'开启'}</button><button class="btn alt small" data-action="concurrency" type="button">调整并发</button><button class="btn alt small" data-action="usage" type="button">使用情况</button><button class="btn small" data-action="rotate" type="button">轮换</button><button class="btn warn small" data-action="delete" type="button">删除</button></div>
         </div>
         <div class="hint" data-usage hidden>显示名称：${escapeHtml(key.display_name)} · 已分配 ${escapeHtml(formatCredits(credits.allocated))} · 已实扣 ${escapeHtml(formatCredits(credits.used))} · 剩余 ${escapeHtml(formatCredits(credits.remaining))} · 持有 ${escapeHtml(formatCredits(credits.held))}${billingBlocked?` · 计费冻结，超额 ${escapeHtml(formatCredits(credits.deficit))}`:''} · 并发 ${escapeHtml(formatCount(key.current_concurrency))}/${escapeHtml(formatCount(key.max_concurrency))}</div>
       </article>`;
@@ -538,6 +538,18 @@
         showIssuedKey(Object.assign({}, created, {display_name:key.display_name, max_concurrency:key.max_concurrency}));
         await copySecret(created.plaintext);
         showMessage('usersMsg', '旧 Key 已关闭，新 Key 已生成并复制。', true);
+        await refresh();
+        return;
+      }
+      if (button.dataset.action === 'delete') {
+        const quota = await call(`/admin/v1/api-keys/${encodeURIComponent(key.id)}/quota?resource_kind=credits`);
+        const available = quota.available ?? '0.000000';
+        const used = quota.used ?? key.credits?.used ?? '0.000000';
+        const held = quota.held ?? key.credits?.held ?? '0.000000';
+        const confirmed = window.confirm(`确定删除 API Key「${key.display_name || '未命名'}」？\n\n当前可返还：${formatCredits(available)} 积分\n已实扣（不返还）：${formatCredits(used)} 积分\n持有中：${formatCredits(held)} 积分\n\n删除后该 Key 立即失效且不会出现在列表中；存在未完成请求或待对账时系统会拒绝删除。`);
+        if (!confirmed) return;
+        const result = await call(`/admin/v1/api-keys/${encodeURIComponent(key.id)}`, {method:'DELETE'});
+        showMessage('usersMsg', `Key「${key.display_name || '未命名'}」已删除，${formatCredits(result.returned_credits)} 积分已返还可分配额度；已实扣积分不返还。`, true);
         await refresh();
         return;
       }

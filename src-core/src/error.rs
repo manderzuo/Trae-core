@@ -96,6 +96,8 @@ pub enum CoreError {
     UserNotFound { user_id: String },
     #[error("api key {api_key_id} was not found")]
     ApiKeyNotFound { api_key_id: String },
+    #[error("api key {api_key_id} cannot be deleted: {reason}")]
+    ApiKeyDeletionBlocked { api_key_id: String, reason: String },
     #[error("API key encryption is unavailable")]
     ApiKeyEncryptionUnavailable,
     #[error("encrypted key material is unavailable for API key {api_key_id}")]

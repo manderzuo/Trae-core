@@ -6,11 +6,10 @@ use aiwork_core::{
 };
 
 fn test_dir(label: &str) -> PathBuf {
-    let dir = PathBuf::from(format!(
-        r"D:\gpt\aiwork-core-video-billing-{label}-{}",
+    let dir = std::env::temp_dir().join(format!(
+        "aiwork-core-video-billing-{label}-{}",
         rand::random::<u64>()
     ));
-    let _ = fs::remove_dir_all(&dir);
     dir
 }
 

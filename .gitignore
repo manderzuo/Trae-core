@@ -6,9 +6,12 @@
 /target/
 **/target/
 **/release/
+/dist/
 
 # Runtime data and logs
 **/data/
+/data/
+/secrets/
 *.sqlite
 *.sqlite3
 *.sqlite-wal

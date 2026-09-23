@@ -43,6 +43,9 @@ async fn dashboard_has_separate_overview_keys_and_settings_without_legacy_pool_o
     assert!(html.contains("id=\"page-settings\""));
     assert!(html.contains("id=\"trendKey\""));
     assert!(html.contains("data-action=\"copy\""));
+    assert!(html.contains("data-action=\"delete\""));
+    assert!(html.contains("quota?resource_kind=credits"));
+    assert!(html.contains("DELETE"));
     assert!(html.contains("复制 Key"));
     assert!(!html.contains("活跃 API Key"));
     assert!(!html.contains("活跃账号数"));

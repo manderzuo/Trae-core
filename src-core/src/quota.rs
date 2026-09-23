@@ -3135,7 +3135,7 @@ impl CoreStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn insert_budget_ledger_entry(
+    pub(crate) fn insert_budget_ledger_entry(
         transaction: &Transaction<'_>,
         user_id: &str,
         resource_kind: &str,
