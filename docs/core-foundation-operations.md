@@ -1,0 +1,133 @@
+# Core 基础运维手册（Phase 0/1/2）
+
+本文描述统一网关的 Core 身份、幂等、逻辑额度、迁移和信用感知调度基础。Phase 1 的闭环使用
+内存 Mock executor 验证，不代表真实上游余额、真实上游计费或真实视频/图片生成已经
+验证；Phase 2 的调度证据同样只代表本地 Mock/fixture 路径。
+
+## 1. 三种运行模式
+
+网关设置中的 `core_mode` 只能是 `off`、`shadow` 或 `enforce`，默认是 `off`。
+
+| 模式 | 身份与请求路径 | 额度行为 | 适用场景 |
+| --- | --- | --- | --- |
+| `off` | 继续使用现有 legacy 鉴权和请求路径；Core 不作为权威决策源 | 不由 Core 预占/结算 | 默认兼容、尚未完成迁移 |
+| `shadow` | Core 打开并可观察 Key/用户匹配；legacy 仍负责放行 | 不用 Core 结果拒绝请求，也不把 shadow 观察当作扣费 | 迁移核对、生成 parity report |
+| `enforce` | Core Key → Principal 是权威身份；用户、Key、scope、policy、幂等和额度失败即拒绝 | 先原子预占，再按成功/明确失败/不确定结果结算 | 完成迁移核对后的小范围启用 |
+
+Phase 1 的 `enforce` 只覆盖非流式 Chat 闭环。`stream=true` 明确返回 501，不能借流式
+路径绕过预算；视频、素材、取消、重启对账和真实账号调度属于后续独立计划。
+
+## 2. Core 数据库和停机备份
+
+默认数据根目录是 `%APPDATA%\\AIWorkAssistant`；设置 `AIWORK_DATA_DIR` 后，Core 数据库位于：
+
+```text
+<AIWORK_DATA_DIR>\\data\\core.sqlite3
+```
+
+例如桌面默认位置为 `%APPDATA%\\AIWorkAssistant\\data\\core.sqlite3`。数据库使用 SQLite
+WAL、外键和事务迁移。备份采用停机文件级方式：
+
+1. 停止 API 服务并退出桌面应用，确认没有其他进程打开 Core 数据库。
+2. 复制整个 `data` 目录（至少包括 `core.sqlite3`，以及存在时的 `core.sqlite3-wal`
+   和 `core.sqlite3-shm`）到带时间戳的只读备份目录。
+3. 同时保留旧 JSON、日志和迁移报告；不要在备份过程中复制正在写入的 SQLite 文件。
+4. 恢复前先停机，把备份恢复到独立数据根目录，启动后检查 `core_status` 的 schema、
+   外键和余额，再切回生产目录。
+
+旧 JSON 不会因为 Core 启用而删除或覆盖。它们仍是 legacy 兼容数据和迁移输入；
+`remaining_credits.json` 等上游/本地缓存不会被当作 Core 用户额度或真实计费结果导入。
+
+## 3. 管理员、Key 与逻辑额度
+
+写入/变更类管理命令要求传入真实的 `admin_api_key`，服务端从 Key 记录解析 Principal 并再次
+校验 admin 角色；`core_status`、`core_migration_inspect` 是只读例外，不要求管理 Key。
+不能用 `actor_user_id` 或用户 ID 代替 Key；其他命令的鉴权以当前实现为准。首个 admin 的
+bootstrap 必须在受控初始化环境完成，后续使用正常管理 Key。
+
+Key 的明文只在 `core_api_key_issue` 成功响应中显示一次。Core 只保存 digest 和 prefix，
+不会把明文 Key 写入 SQLite、审计元数据或日志；应立即放入外部安全存储，遗失只能撤销后
+重新签发。Key scope 至少应按实际能力授予，例如 Chat 需要 `chat:invoke`。
+
+Core grant 是逻辑额度账本操作，不是向上游查询余额。管理员通过 `core_quota_grant`
+指定 `user_id`、`resource_kind`、整数 `amount` 和非空 `reason`；常用 Chat 资源名为
+`chat_request`。每次调整都持久化 actor、原因和 delta；余额由账本聚合，并通过命令响应
+返回，不能把该余额解释为上游账户剩余积分或已向上游支付的费用。
+
+## 4. 迁移和启用顺序
+
+推荐顺序如下：
+
+1. 停机并完成上文的文件级备份，保留旧 JSON 原件。
+2. 在 `off` 或 `shadow` 下运行 `core_migration_inspect`，读取并保留待核对的 owner 字段
+   （不做 owner 映射校验，也不返回候选映射；真正的 owner 校验在 apply 阶段执行）；inspect
+   仅检查 JSON 是否可解析、数量和哈希，不检查物理素材文件、大小或 SHA-256。缺失或不确定项
+   必须保留为待核对，不能猜测 owner。
+3. 使用管理员 Key 执行 `core_migration_apply`。apply 才会对 owner、物理素材文件存在性、
+   大小和 SHA-256 做 fail-closed 校验；通过后才在单个事务内写入记录。旧明文 Key 不写入
+   Core，旧 Key 的 legacy 使用状态按迁移结果禁用/标记。
+4. 保存 inspect/apply 输出和 parity report，逐项核对 legacy 数量、owner、资源状态和
+   账本边界。迁移不会把旧 JSON 的 remaining credits 变成 Core grant。
+5. 先在 `shadow` 观察鉴权和映射，再确认 **user、Key、scope、cost policy、grant、
+   parity report** 齐全，才可小范围切换 `core_mode=enforce`。
+6. 若出现未知上游结果，Core 保留 reservation 为 `unknown`，等待后续对账；不能直接
+   当作未扣费并释放。
+
+## 5. Phase 1 验证边界
+
+批准的 smoke 入口为 `src-core/tests/full_phase1.rs` 中的 `run_phase1_smoke()`。它按固定
+顺序验证 admin/user、一次性 Key、grant 2、成功 1、同幂等键重放、预算不足、timeout→
+unknown、Store 重启恢复、审计和不超额余额。executor 只能是内存 Mock；测试不得读取
+`AGENT_HOST`、`remaining_credits.json`、真实 API Key，也不得调用当前运行的服务。
+
+允许作为 Phase 1 证据的本地验证包括：
+
+```powershell
+cargo test --offline --manifest-path src-core/Cargo.toml --test full_phase1 -- --nocapture
+cargo test --offline --manifest-path src-core/Cargo.toml
+```
+
+不要把真实 upstream 测试、真实账号余额、真实计费响应或真实生成结果写进 Phase 1
+验收结论；尤其不要把 `src-python/tests/test_api_server.py` 的真实上游路径作为本计划
+smoke 证据。真实上游执行器、媒体生命周期和生产部署必须在后续独立计划中单独设计、
+审阅和验证。
+
+## 6. Phase 2 信用感知调度边界
+
+Phase 2 在 schema v6 中持久化上游账号、观测、lease 和健康状态。账号的
+`credentials_ref` 仍只是 opaque vault 引用；Core 不保存 JWT、Cookie、refresh token、
+完整上游响应或 prompt。上游观测是调度输入和诊断历史，**不是用户 grant**，也不能从
+`remaining_credits.json`、WorkBuddy cache 或任何上游余额自动生成用户额度。
+
+调度模式与 `core_mode` 必须按
+[credit-aware-scheduler-operations.md](credit-aware-scheduler-operations.md) 的兼容矩阵使用。
+`enforce` 没有可信 reader、executor、fresh observation、cost policy、用户 grant 或
+账号绑定时必须 fail-closed，返回稳定的 `scheduler_endpoint_not_enabled`/调度错误，不能
+回退到旧的 `ApiPool`。`off` 才保留原有池路径；`shadow` 只产生诊断，不拒绝请求、不扣
+用户额度。
+
+过期的 `held`/`active` upstream lease 只能转为 `unknown`，对应 reservation/request
+保持 unknown 并继续占用 hold；恢复过程不产生 release ledger，也不自动重试或释放。必须
+经过明确的对账/人工处理后才可结束该不确定状态。管理员状态接口只返回聚合计数（fresh、
+stale、active、unknown、reader failure、槽位饱和等），普通用户不得查询管理员投影，且
+不包含账号、凭据、用户额度或其他用户的 request 行。
+
+调度事件采用固定 JSONL 结构，使用 account/observation hash 和固定 error category；
+请求/响应 body、prompt、JWT、Cookie、credentials_ref 不得进入该结构化事件。遗留的 debug
+请求日志仍是显式诊断开关，启用前应按本机日志权限和敏感内容风险处理。
+
+## 7. 视频实际积分结算安全门
+
+视频计费控制默认持久化为 `paused`。在没有经任务级回执证明的上游 `credits` 单位前，
+普通视频提交必须在预占额度前返回 `video_billing_paused`，不能调用上游，也不能产生固定
+1 积分扣费。管理员只能为已有普通 Key 登记一次、绑定请求哈希的一次性诊断；诊断成功后
+控制会自动回到 `paused`。
+
+视频 202 接受只创建 `held` 预占。只有同时匹配任务 ID、终态、明确的 `credits` 单位、
+非负且受支持精度的实际值，并且实际值不超过预占上限时，才允许一次性结算；缺失、冲突、
+格式错误、超额或重启后的未知结果都保留预占并进入 `reconcile_required`。后台对账器每
+15 秒检查一次，查询接口重复调用不会产生第二条账本记录。
+
+本地验收使用 `scripts/test-video-billing-state.mjs`，Cargo target、日志和报告固定写入
+`D:\gpt\starlink-video-billing-test`。在真实回执被独立确认前，不得启用 `active`，不得
+进行固定点或小数积分迁移，也不得把上游余额、token、时长或价格字段当作单任务消耗。

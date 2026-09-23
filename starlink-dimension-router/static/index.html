@@ -1,0 +1,596 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>星链维度分流系统</title>
+  <style>
+    :root{font-family:Inter,"Microsoft YaHei",sans-serif;color:#e8edf7;background:#0b1020;color-scheme:dark}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 15% 0,#1b2d59 0,#0b1020 42%,#070b15 100%)}
+    button,input,select,textarea{font:inherit}.wrap{max-width:1240px;margin:0 auto;padding:28px 20px 60px}
+    .top{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;margin-bottom:22px}.eyebrow{color:#7aa8ff;font-size:12px;letter-spacing:.14em}.title{font-size:30px;font-weight:750;margin:5px 0}.sub{color:#95a3bd;font-size:13px}.status{border:1px solid #2a426f;background:#102044;color:#a8c4ff;padding:10px 14px;border-radius:12px;font-size:13px}.status.bad{border-color:#77394b;background:#321928;color:#ffb7c9}
+    .panel{background:rgba(17,25,45,.9);border:1px solid #253453;border-radius:16px;padding:18px;margin-bottom:16px;box-shadow:0 16px 50px rgba(0,0,0,.16)}.panel h2{font-size:16px;margin:0 0 14px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.card{border:1px solid #263758;background:#121c33;border-radius:13px;padding:15px;min-width:0}.label{color:#93a3be;font-size:12px}.value{font-size:25px;font-weight:700;margin-top:8px;overflow-wrap:anywhere}.hint{font-size:12px;color:#71809a;margin-top:6px;line-height:1.55}.hint.ok{color:#8ce0b5}.hint.err,.error-text{color:#ff9db5}.error-text{font-size:12px;font-weight:650;margin-top:5px}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.field{flex:1;min-width:190px}.field label{display:block;color:#9aa8bf;font-size:12px;margin-bottom:6px}.field input,.field select,.field textarea{width:100%;background:#0c1427;border:1px solid #30415f;color:#edf3ff;border-radius:9px;padding:10px 11px;outline:none}.field input:focus,.field select:focus,.field textarea:focus{border-color:#68a0ff}.checks{display:flex;gap:9px;flex-wrap:wrap;align-items:center;min-height:40px}.check{display:flex!important;align-items:center;gap:6px;color:#d5def0!important;margin:0!important;white-space:nowrap}.check input{width:auto!important;accent-color:#3d7cff}.btn{border:0;border-radius:9px;padding:10px 14px;color:white;background:#3d7cff;cursor:pointer;font-weight:650;white-space:nowrap}.btn.alt{background:#263758}.btn.warn{background:#8b4055}.btn.small{padding:7px 10px;font-size:12px}.btn:disabled{opacity:.5;cursor:not-allowed}.msg{margin-top:10px;color:#aab9d2;font-size:13px;white-space:pre-wrap}.msg.ok{color:#8ce0b5}.msg.err{color:#ff9db5}.auth{max-width:620px;margin:36px auto}.auth .field{min-width:240px}.auth-note{color:#aab9d2;font-size:13px;line-height:1.7;margin:0 0 16px}
+    .admin-nav{display:flex;gap:8px;align-items:center;margin:0 0 16px}.admin-tab{border:1px solid #263758;background:#111a2f;color:#91a3c3;border-radius:9px;padding:9px 14px;cursor:pointer}.admin-tab.active{background:#203966;border-color:#4b7ed2;color:#eef4ff}.nav-spacer{flex:1}.page-section[hidden]{display:none!important}.section-head{display:flex;justify-content:space-between;align-items:center;gap:14px}.section-head h2{margin:0}.trend-toolbar{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:10px}.trend-toolbar .field{flex:0 0 210px;min-width:170px}.trend-chart{min-height:280px;border:1px solid #243452;border-radius:12px;background:linear-gradient(180deg,rgba(15,29,57,.8),rgba(9,17,32,.72));padding:9px;overflow:hidden}.trend-chart svg{display:block;width:100%;height:280px}.trend-legend{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:10px;color:#9aaccb;font-size:12px}.trend-legend i{display:inline-block;width:18px;height:3px;border-radius:3px;background:#8de0b5}.trend-meta{margin-left:auto;color:#7386a7}.list{display:grid;gap:10px}.key-row{border:1px solid #263758;background:#101a2e;border-radius:12px;padding:14px}.key-main{display:grid;grid-template-columns:minmax(150px,1.1fr) minmax(145px,1fr) minmax(170px,1.2fr) minmax(110px,.7fr) minmax(150px,1.2fr) auto;gap:14px;align-items:start}.key-label{font-size:11px;color:#7486a5;margin-bottom:5px}.key-name{font-weight:700;overflow-wrap:anywhere}.key-prefix{font:12px ui-monospace,Consolas,monospace;color:#bac9e2;overflow-wrap:anywhere}.key-credits{font-size:12px;color:#b8c8e3;line-height:1.65}.key-credits strong{color:#f1f5fd;font-weight:650}.key-actions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}.scope-list{font-size:12px;color:#aebdd5;line-height:1.55}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:4px 9px;font-size:11px;background:#153b31;color:#8ce0b5}.pill.off{background:#41202c;color:#ffb7c9}.secret{font-family:ui-monospace,Consolas,monospace;background:#081020;padding:12px;border-radius:9px;border:1px dashed #e5a954;color:#ffd08c;word-break:break-all;margin-top:12px}.secret code{font-size:13px}.allocator{border-color:#365183}.allocator-balance{font-size:14px;color:#9fc1ff;margin:4px 0 12px}.list-empty{padding:16px;border:1px dashed #30415f;border-radius:10px;color:#8494ae;text-align:center}.settings-note{border:1px solid #243452;padding:11px;border-radius:10px;color:#c3cee0;font-size:13px;display:flex;justify-content:space-between;gap:12px}.stack{display:grid;gap:9px}.copy-dialog{width:min(620px,calc(100vw - 28px));border:1px solid #38527f;border-radius:14px;background:#111a2f;color:#e8edf7;padding:18px}.copy-dialog::backdrop{background:rgba(2,6,15,.78)}.copy-dialog textarea{min-height:90px;resize:vertical;font:13px ui-monospace,Consolas,monospace;overflow-wrap:anywhere}
+    @media(max-width:980px){.key-main{grid-template-columns:repeat(3,minmax(0,1fr))}.key-actions{grid-column:1/-1;justify-content:flex-start}}
+    @media(max-width:720px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.top{align-items:flex-start;flex-direction:column}.trend-toolbar{align-items:stretch;flex-direction:column}.trend-toolbar .field{flex:1}.trend-meta{margin-left:0}.key-main{grid-template-columns:repeat(2,minmax(0,1fr))}.admin-nav{overflow:auto}.admin-tab{white-space:nowrap}}
+    @media(max-width:460px){.wrap{padding:20px 12px 36px}.grid{grid-template-columns:1fr}.key-main{grid-template-columns:1fr 1fr}.key-actions{grid-column:1/-1}.admin-tab{padding:8px 10px}}
+  </style>
+</head>
+<body>
+<main class="wrap">
+  <header class="top">
+    <div><div class="eyebrow">STARLINK DIMENSION ROUTER</div><h1 class="title">星链维度分流系统</h1><div class="sub">统一积分、API Key 额度与调用管理</div></div>
+    <div id="status" class="status" role="status" aria-live="polite">未连接</div>
+  </header>
+
+  <section id="authPanel" class="panel auth">
+    <h2 id="authTitle">管理员登录</h2>
+    <p id="authNote" class="auth-note">使用管理员账户进入管理界面。浏览器只保留当前会话，不保存管理员凭证。</p>
+    <div id="loginBox"><div class="row"><div class="field"><label for="loginUsername">账户</label><input id="loginUsername" value="admin" autocomplete="username" /></div><div class="field"><label for="loginPassword">密码</label><input id="loginPassword" type="password" autocomplete="current-password" /></div><button class="btn" id="loginBtn" type="button">登录</button></div></div>
+    <div id="changeBox" hidden><div class="row"><div class="field"><label for="currentPassword">当前密码</label><input id="currentPassword" type="password" autocomplete="current-password" /></div><div class="field"><label for="newPassword">新密码（至少 10 个字符）</label><input id="newPassword" type="password" autocomplete="new-password" /></div><button class="btn" id="changePasswordBtn" type="button">修改管理员密码</button></div></div>
+    <div id="authMsg" class="msg" aria-live="polite"></div>
+  </section>
+
+  <div id="dashboard" hidden>
+    <nav class="admin-nav" aria-label="管理页面">
+      <button class="admin-tab active" data-page="overview" type="button">运行概览</button>
+      <button class="admin-tab" data-page="keys" type="button">API Key 管理</button>
+      <button class="admin-tab" data-page="settings" type="button">设置</button>
+      <span class="nav-spacer"></span><button class="admin-tab" id="logoutBtn" type="button">退出登录</button>
+    </nav>
+
+    <section id="page-overview" class="page-section">
+      <section class="panel">
+        <div class="section-head"><div><h2>运行与额度概览</h2><div id="summaryFreshness" class="hint">正在读取额度快照…</div></div><div class="row"><span id="refreshHint" class="hint">每 5 秒自动刷新</span><button class="btn alt" id="refreshSummary" type="button">立即刷新</button></div></div>
+        <div id="cards" class="grid" style="margin-top:14px"></div>
+        <div class="hint">可分配余额以 AI Work 当前统一积分为上限；已用只统计同一请求编号返回并核验的真实结算，持有中不计入消耗。</div>
+      </section>
+
+      <section class="panel">
+        <div class="trend-toolbar"><div><h2>积分实扣趋势</h2><div class="hint">按最终结算时间排序，只显示已核验的统一积分实扣。</div></div><div class="field"><label for="trendRange">时间范围</label><select id="trendRange"><option value="24h">最近 24 小时</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option></select></div><div class="field"><label for="trendKey">API Key</label><select id="trendKey"><option value="">全部 Key</option></select></div></div>
+        <div id="trendChart" class="trend-chart"><div class="hint">登录后读取趋势数据…</div></div>
+        <div class="trend-legend"><span><i></i>已核验实扣积分</span><span id="trendMeta" class="trend-meta">—</span></div>
+      </section>
+    </section>
+
+    <section id="page-keys" class="page-section" hidden>
+      <section class="panel">
+        <h2>生成普通 API Key</h2>
+        <div class="row">
+          <div class="field"><label for="displayName">显示名称</label><input id="displayName" maxlength="64" placeholder="例如：周的公网客户端" /></div>
+          <div class="field"><label for="keyConcurrency">最大并发数</label><input id="keyConcurrency" type="number" min="1" max="1024" value="1" /></div>
+          <div class="field"><label>权限作用域</label><div class="checks"><label class="check"><input type="checkbox" name="scope" value="chat:invoke" checked /> 文字处理</label><label class="check"><input type="checkbox" name="scope" value="videos:submit" checked /> 视频生成</label><label class="check"><input type="checkbox" name="scope" value="assets:write" /> 素材上传</label></div></div>
+          <button class="btn" id="issueKey" type="button">生成普通 Key</button>
+        </div>
+        <div id="usersMsg" class="msg" aria-live="polite"></div>
+        <div id="issuedKey" class="secret" hidden></div>
+      </section>
+
+      <section class="panel allocator">
+        <div class="section-head"><div><h2>分配统一积分</h2><div class="hint">可直接为 Key 分配；所有 Key 的额度合计受上游可分配余额限制。</div></div></div>
+        <div id="allocatableHint" class="allocator-balance">正在读取剩余可分配积分…</div>
+        <div class="row">
+          <div class="field"><label for="allocationKey">分配给</label><select id="allocationKey"><option value="">请先生成或选择 API Key</option></select></div>
+          <div class="field"><label for="quotaAmount">分配积分</label><input id="quotaAmount" inputmode="decimal" autocomplete="off" placeholder="例如 100 或 100.5" /></div>
+          <div class="field"><label for="quotaReason">备注</label><input id="quotaReason" maxlength="200" value="管理员配置" /></div>
+          <button class="btn" id="grantQuota" type="button">分配积分</button>
+        </div>
+        <div id="quotaMsg" class="msg" aria-live="polite"></div>
+      </section>
+
+      <section class="panel">
+        <div class="section-head"><div><h2>API Key 列表</h2><div class="hint">Key 可随时单独复制；明文只在受控复制操作期间返回，不写入浏览器存储。</div></div><span id="keyCount" class="hint"></span></div>
+        <div id="keyList" class="list" style="margin-top:12px"><div class="list-empty">登录后读取 API Key 列表…</div></div>
+      </section>
+    </section>
+
+    <section id="page-settings" class="page-section" hidden>
+      <section class="panel" id="bridgeConfig">
+        <h2>AI Work 桥接配置</h2>
+        <div class="row"><div class="field"><label for="bridgeUrl">AI Work Base URL</label><input id="bridgeUrl" placeholder="例如 http://127.0.0.1:7864 或公网 HTTPS 地址" /></div><div class="field"><label for="bridgeKey">AI Work 桥接管理员 Key</label><input id="bridgeKey" type="password" autocomplete="new-password" placeholder="粘贴 AI Work 生成的一次性桥接 Key" /></div><button class="btn" id="bridgeSave" type="button">测试并保存</button></div>
+        <div class="hint">桥接 Key 不会回显；保存成功后会清空输入框。</div><div id="bridgeMsg" class="msg" aria-live="polite"></div>
+      </section>
+
+      <section class="panel">
+        <div class="section-head"><div><h2>视频计费安全状态</h2><div class="hint">只有拿到任务级、可核验的上游积分回执后才会结算；未知状态保持待对账。</div></div><div class="row"><span id="videoBillingStatus" class="hint">等待读取</span><button class="btn alt" id="videoBillingRefresh" type="button">刷新</button></div></div>
+        <div id="videoBillingCards" class="grid" style="margin-top:14px"></div><div id="videoBillingReason" class="hint" style="margin-top:10px">—</div>
+        <div class="row" style="margin-top:12px"><div class="field"><label for="videoBillingMode">安全闸门模式</label><select id="videoBillingMode"><option value="paused">保持暂停</option><option value="active">启用（仅在回执契约已确认后）</option></select></div><div class="field"><label for="videoBillingReasonInput">调整原因</label><input id="videoBillingReasonInput" value="管理员调整视频计费安全状态" /></div><button class="btn" id="videoBillingSave" type="button">保存模式</button></div>
+        <div class="row" style="margin-top:12px"><div class="field"><label for="videoDiagnosticKeyId">验收普通 Key 内部 ID（不是明文 Key）</label><input id="videoDiagnosticKeyId" placeholder="例如 key-..." /></div><div class="field"><label for="videoDiagnosticHash">本次请求 SHA-256（64 位十六进制）</label><input id="videoDiagnosticHash" placeholder="仅登记精确的一次请求" /></div><div class="field"><label for="videoDiagnosticReason">验收原因</label><input id="videoDiagnosticReason" value="一次性视频计费验收" /></div><button class="btn warn" id="videoDiagnosticRegister" type="button">登记一次性验收</button></div>
+        <div id="videoBillingMsg" class="msg" aria-live="polite"></div>
+      </section>
+
+      <section class="panel"><h2>系统说明</h2><div class="stack"><div class="settings-note"><span>文字请求</span><span class="hint">Core 校验 Key 额度后，通过 AI Work 桥接转发并按真实回执结算。</span></div><div class="settings-note"><span>视频请求</span><span class="hint">统一使用 Core Key 额度和任务归属；状态未知时不自动重试或伪造成功。</span></div><div class="settings-note"><span>积分口径</span><span class="hint">展示统一积分；预占与待对账不算已消耗，趋势只计最终核验的实际结算。</span></div></div></section>
+    </section>
+  </div>
+</main>
+
+<dialog id="copyDialog" class="copy-dialog">
+  <form method="dialog"><div class="section-head"><h2>复制 API Key</h2><button class="btn alt small" aria-label="关闭">关闭</button></div><p class="hint">浏览器未允许自动复制。可在下方选择并手动复制；关闭后明文将从页面移除。</p><div class="field"><textarea id="copyFallbackValue" readonly spellcheck="false"></textarea></div><div class="row" style="margin-top:10px"><button class="btn" id="copyFallbackButton" type="button">再次复制</button></div></form>
+</dialog>
+
+<script>
+(() => {
+  let refreshTimer = null;
+  let refreshing = false;
+  let authenticated = false;
+  let latestKeys = [];
+  let currentSummary = null;
+  const $ = id => document.getElementById(id);
+  const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+  const MICRO = 1000000n;
+
+  function parseCredits(value) {
+    if (typeof value === 'bigint') return value;
+    const match = String(value ?? '').trim().match(/^(\d+)(?:\.(\d{1,6}))?$/);
+    if (!match) return null;
+    const whole = BigInt(match[1]);
+    const fraction = BigInt((match[2] ?? '').padEnd(6, '0') || '0');
+    return whole * MICRO + fraction;
+  }
+
+  function formatCredits(value) {
+    const units = parseCredits(value);
+    if (units === null) return '—';
+    const whole = units / MICRO;
+    const fraction = (units % MICRO).toString().padStart(6, '0').replace(/0+$/, '');
+    return new Intl.NumberFormat('zh-CN').format(whole) + (fraction ? `.${fraction}` : '');
+  }
+
+  function formatCount(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? new Intl.NumberFormat('zh-CN').format(number) : '—';
+  }
+
+  function showMessage(id, text, good = false) {
+    const element = $(id);
+    element.textContent = text || '';
+    element.className = `msg ${good ? 'ok' : 'err'}`;
+  }
+
+  async function call(path, options = {}) {
+    const headers = Object.assign({'content-type':'application/json'}, options.headers || {});
+    const response = await fetch(path, Object.assign({}, options, {headers, credentials:'same-origin', cache:'no-store'}));
+    const text = await response.text();
+    let body = {};
+    try { body = text ? JSON.parse(text) : {}; } catch { body = {message:text}; }
+    if (!response.ok) throw new Error(body?.error?.message || body?.message || `HTTP ${response.status}`);
+    return body;
+  }
+
+  function setStatus(text, good = false) {
+    $('status').textContent = text;
+    $('status').className = `status${good ? '' : ' bad'}`;
+  }
+
+  function renderSummary(summary) {
+    currentSummary = summary;
+    const core = summary?.core || {};
+    const credits = summary?.credits || {};
+    const fresh = credits.upstream_fresh === true;
+    const freshnessText = fresh
+      ? `AI Work 统一积分快照已更新${credits.upstream_updated_at_ms ? ` · ${new Date(credits.upstream_updated_at_ms).toLocaleString('zh-CN')}` : ''}`
+      : 'AI Work 积分快照不可用或已过期；新增额度保持关闭';
+    $('summaryFreshness').textContent = freshnessText;
+    $('summaryFreshness').className = `hint ${fresh ? 'ok' : 'err'}`;
+    const cards = [
+      ['AI Work 当前总积分', credits.upstream_total, fresh ? '上游统一积分余额' : '显示值可能已过期'],
+      ['已分配给 API Key', credits.allocated, '所有 Key 的额度合计'],
+      ['Key 未用承诺', credits.key_commitments, '剩余额度与未结算持有'],
+      ['剩余可分配', credits.available_to_allocate, fresh ? '不能超过此余额' : '上游快照不可用'],
+      ['已核验真实消耗', credits.verified_spent, '按 request_id 对应的最终回执'],
+      ['持有中', credits.held, '尚未结算，不计入实扣'],
+      ['上游额度缺口', credits.upstream_deficit, '缺口存在时暂停新增请求'],
+      ['排队任务', core.queued_jobs, '等待处理的异步任务'],
+      ['运行中任务', core.running_jobs, '当前正在处理'],
+      ['待对账', core.reconcile_required_count, '未知或需要人工核对的账目'],
+    ];
+    $('cards').innerHTML = cards.map(([label, value, note]) => `<div class="card"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(typeof value === 'number' ? formatCount(value) : formatCredits(value))}</div><div class="hint">${escapeHtml(note)}</div></div>`).join('');
+    renderAllocationHint();
+  }
+
+  function renderAllocationHint() {
+    const credits = currentSummary?.credits || {};
+    const fresh = credits.upstream_fresh === true;
+    const remaining = credits.available_to_allocate;
+    $('allocatableHint').textContent = fresh
+      ? `剩余可分配积分：${formatCredits(remaining)}${credits.upstream_deficit && parseCredits(credits.upstream_deficit) > 0n ? ` · 上游缺口 ${formatCredits(credits.upstream_deficit)}` : ''}`
+      : '剩余可分配积分：— · 上游余额未确认，暂不能分配';
+    $('allocatableHint').className = `allocator-balance ${fresh ? '' : 'hint err'}`;
+    $('grantQuota').disabled = !fresh || !$('allocationKey').value || !latestKeys.some(key => key.status === 'active');
+  }
+
+  function trendPath(points, maxUnits, width, height, padding) {
+    const usableWidth = width - padding.left - padding.right;
+    const usableHeight = height - padding.top - padding.bottom;
+    return points.map((point, index) => {
+      const units = parseCredits(point.credits) ?? 0n;
+      const x = padding.left + (points.length <= 1 ? usableWidth / 2 : usableWidth * index / (points.length - 1));
+      const ratio = maxUnits > 0n ? Number(units * 1000000n / maxUnits) / 1000000 : 0;
+      const y = height - padding.bottom - ratio * usableHeight;
+      return `${index ? 'L' : 'M'} ${x.toFixed(1)} ${y.toFixed(1)}`;
+    }).join(' ');
+  }
+
+  function renderTrend(trend) {
+    const points = Array.isArray(trend?.points) ? trend.points : [];
+    if (!points.length) {
+      $('trendChart').innerHTML = '<div class="hint">暂无积分消耗数据</div>';
+      $('trendMeta').textContent = '暂无数据';
+      return;
+    }
+    const width = 1000, height = 280;
+    const padding = {left:82, right:20, top:18, bottom:34};
+    const values = points.map(point => parseCredits(point.credits) ?? 0n);
+    const maxUnits = values.reduce((max, value) => value > max ? value : max, 0n) || 1n;
+    const grid = [0n, 1n, 2n].map(step => {
+      const ratio = Number(step) / 2;
+      const y = height - padding.bottom - ratio * (height - padding.top - padding.bottom);
+      const labelUnits = maxUnits * step / 2n;
+      return `<line x1="${padding.left}" y1="${y}" x2="${width-padding.right}" y2="${y}" stroke="#243452"/><text x="${padding.left-9}" y="${y+4}" text-anchor="end" fill="#8293ae" font-size="11">${escapeHtml(formatCredits(labelUnits.toString()))}</text>`;
+    }).join('');
+    const path = trendPath(points, maxUnits, width, height, padding);
+    const dots = points.map((point, index) => {
+      const x = padding.left + (points.length <= 1 ? (width-padding.left-padding.right)/2 : (width-padding.left-padding.right) * index / (points.length-1));
+      const ratio = maxUnits > 0n ? Number(values[index] * 1000000n / maxUnits) / 1000000 : 0;
+      const y = height - padding.bottom - ratio * (height-padding.top-padding.bottom);
+      return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3" fill="#8de0b5"><title>${escapeHtml(new Date(point.bucket_start_ms).toLocaleString('zh-CN'))} · ${escapeHtml(formatCredits(point.credits))} 积分</title></circle>`;
+    }).join('');
+    const labelIndexes = [...new Set([0, Math.floor((points.length-1)/2), points.length-1])];
+    const labels = labelIndexes.map(index => {
+      const date = new Date(points[index].bucket_start_ms);
+      const label = trend.window === '24h'
+        ? date.toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit'})
+        : date.toLocaleDateString('zh-CN', {month:'2-digit', day:'2-digit'});
+      const x = padding.left + (points.length <= 1 ? (width-padding.left-padding.right)/2 : (width-padding.left-padding.right) * index / (points.length-1));
+      return `<text x="${x.toFixed(1)}" y="${height-8}" text-anchor="middle" fill="#8293ae" font-size="11">${escapeHtml(label)}</text>`;
+    }).join('');
+    $('trendChart').innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="按最终结算时间统计的统一积分实扣趋势">${grid}<path d="${path}" fill="none" stroke="#8de0b5" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>${dots}${labels}</svg>`;
+    const total = values.reduce((sum, value) => sum + value, 0n);
+    $('trendMeta').textContent = `区间实扣 ${formatCredits(total.toString())} 积分 · ${points.length} 个时间点`;
+  }
+
+  function renderTrendError() {
+    $('trendChart').innerHTML = '<div class="hint">趋势数据暂时读取失败，请稍后刷新。</div>';
+    $('trendMeta').textContent = '读取失败';
+  }
+
+  async function refreshTrend() {
+    try {
+      const params = new URLSearchParams({window:$('trendRange').value});
+      if ($('trendKey').value) params.set('key_id', $('trendKey').value);
+      renderTrend(await call(`/admin/v1/usage-trend?${params.toString()}`));
+    } catch { renderTrendError(); }
+  }
+
+  const scopeLabel = scope => ({'chat:invoke':'文字处理','videos:submit':'视频生成','videos:read':'视频查询/下载','assets:write':'素材上传'})[scope] || scope;
+
+  function renderKeyOptions() {
+    const select = $('allocationKey');
+    const trendSelect = $('trendKey');
+    const allocationPrevious = select.value;
+    const trendPrevious = trendSelect.value;
+    const assignableKeys = latestKeys.filter(key => key.status === 'active');
+    select.innerHTML = assignableKeys.length
+      ? '<option value="">请选择 API Key</option>' + assignableKeys.map(key => `<option value="${escapeHtml(key.id)}">${escapeHtml(key.display_name)} · ${escapeHtml(key.prefix)}…</option>`).join('')
+      : '<option value="">请先生成 API Key</option>';
+    trendSelect.innerHTML = '<option value="">全部 Key</option>' + latestKeys.map(key => `<option value="${escapeHtml(key.id)}">${escapeHtml(key.display_name)}</option>`).join('');
+    if (latestKeys.some(key => key.id === allocationPrevious)) select.value = allocationPrevious;
+    if (latestKeys.some(key => key.id === trendPrevious)) trendSelect.value = trendPrevious;
+    renderAllocationHint();
+  }
+
+  function renderKeyList(keys) {
+    latestKeys = Array.isArray(keys) ? keys : [];
+    $('keyCount').textContent = `${latestKeys.length} 个 Key`;
+    renderKeyOptions();
+    if (!latestKeys.length) {
+      $('keyList').innerHTML = '<div class="list-empty">暂无 API Key，请先填写显示名称并生成。</div>';
+      return;
+    }
+    $('keyList').innerHTML = latestKeys.map(key => {
+      const active = key.status === 'active';
+      const billingBlocked = key.billing_blocked === true;
+      const scopes = (key.scopes || []).map(scopeLabel).join('、') || '未设置';
+      const credits = key.credits || {};
+      return `<article class="key-row" data-key-id="${escapeHtml(key.id)}">
+        <div class="key-main">
+          <div><div class="key-label">显示名称</div><div class="key-name">${escapeHtml(key.display_name || '未命名')}</div></div>
+          <div><div class="key-label">Key（脱敏）</div><div class="key-prefix">${escapeHtml(key.prefix)}••••••</div></div>
+          <div class="key-credits"><div class="key-label">积分额度</div><div>已分配 <strong>${escapeHtml(formatCredits(credits.allocated))}</strong></div><div>已实扣 <strong>${escapeHtml(formatCredits(credits.used))}</strong></div><div>剩余 <strong>${escapeHtml(formatCredits(credits.remaining))}</strong> · 持有 ${escapeHtml(formatCredits(credits.held))}</div>${billingBlocked?`<div class="error-text">计费冻结 · 超额 ${escapeHtml(formatCredits(credits.deficit))}</div>`:''}</div>
+          <div><div class="key-label">并发</div><div>${escapeHtml(formatCount(key.current_concurrency))} / ${escapeHtml(formatCount(key.max_concurrency))}</div></div>
+          <div><div class="key-label">权限与状态</div><div class="scope-list">${escapeHtml(scopes)}</div><div style="margin-top:6px"><span class="pill ${billingBlocked?'off':active?'':'off'}">${billingBlocked?'计费冻结':active?'已开启':'已关闭'}</span></div></div>
+          <div class="key-actions"><button class="btn alt small" data-action="copy" type="button">复制 Key</button><button class="btn alt small" data-action="toggle" type="button">${active?'关闭':'开启'}</button><button class="btn alt small" data-action="concurrency" type="button">调整并发</button><button class="btn alt small" data-action="usage" type="button">使用情况</button><button class="btn small" data-action="rotate" type="button">轮换</button></div>
+        </div>
+        <div class="hint" data-usage hidden>显示名称：${escapeHtml(key.display_name)} · 已分配 ${escapeHtml(formatCredits(credits.allocated))} · 已实扣 ${escapeHtml(formatCredits(credits.used))} · 剩余 ${escapeHtml(formatCredits(credits.remaining))} · 持有 ${escapeHtml(formatCredits(credits.held))}${billingBlocked?` · 计费冻结，超额 ${escapeHtml(formatCredits(credits.deficit))}`:''} · 并发 ${escapeHtml(formatCount(key.current_concurrency))}/${escapeHtml(formatCount(key.max_concurrency))}</div>
+      </article>`;
+    }).join('');
+  }
+
+  async function refreshSettings() {
+    try {
+      const bridge = await call('/admin/v1/bridge/status');
+      if (bridge.base_url && !$('bridgeUrl').value) $('bridgeUrl').value = bridge.base_url;
+    } catch {}
+    await refreshVideoBilling();
+  }
+
+  function renderVideoBilling(data) {
+    const counts = data?.counts || {};
+    const mode = data?.mode || 'paused';
+    const labels = {paused:'已暂停',diagnostic_once:'一次性验收待使用',active:'已启用'};
+    $('videoBillingStatus').textContent = labels[mode] || mode;
+    $('videoBillingStatus').className = `hint ${mode === 'active' ? 'ok' : mode === 'diagnostic_once' ? '' : 'err'}`;
+    $('videoBillingMode').value = mode === 'active' ? 'active' : 'paused';
+    $('videoBillingCards').innerHTML = [
+      ['安全状态', labels[mode] || mode, mode === 'active' ? '仅在回执已验证时允许视频任务' : '视频提交默认被安全闸门拦截'],
+      ['预占中', counts.held ?? 0, '尚未结算，保持额度占用'],
+      ['待对账', counts.reconcile_required ?? 0, '不自动重试或重复扣费'],
+      ['已核验结算', counts.verified_settled ?? 0, '仅统计有任务级回执的任务'],
+      ['历史未核验', counts.legacy_unverified ?? 0, '旧任务不自动补扣或退款'],
+    ].map(([label, value, note]) => `<div class="card"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(formatCount(value))}</div><div class="hint">${escapeHtml(note)}</div></div>`).join('');
+    $('videoBillingReason').textContent = `当前原因：${data?.reason || '—'}${data?.diagnostic?.claimed ? ' · 本次一次性验收已使用' : ''}`;
+  }
+
+  async function refreshVideoBilling() {
+    try { renderVideoBilling(await call('/admin/v1/video-billing')); }
+    catch (error) { $('videoBillingStatus').textContent = '读取失败'; $('videoBillingStatus').className = 'hint err'; $('videoBillingReason').textContent = error.message || String(error); }
+  }
+
+  async function refresh({silent = false} = {}) {
+    if (refreshing || !authenticated) return;
+    refreshing = true;
+    try {
+      const [summary, keys] = await Promise.all([call('/admin/v1/summary'), call('/admin/v1/api-keys')]);
+      renderSummary(summary);
+      renderKeyList(keys);
+      await refreshTrend();
+      setStatus('已连接 · 管理员', true);
+      $('refreshHint').textContent = `刚刚刷新 · ${new Date().toLocaleTimeString('zh-CN')}`;
+      if (!silent) showMessage('authMsg', '概览与 Key 用量已更新。', true);
+    } catch (error) {
+      setStatus('连接失败');
+      if (!silent) showMessage('authMsg', error.message || String(error));
+      if (/登录|会话|管理员/.test(error.message || '')) showLogin('登录会话已失效，请重新登录。');
+    } finally { refreshing = false; }
+  }
+
+  function startAutoRefresh() {
+    if (refreshTimer) clearInterval(refreshTimer);
+    refreshTimer = setInterval(() => void refresh({silent:true}), 5000);
+  }
+
+  function showPage(page) {
+    document.querySelectorAll('.page-section').forEach(section => { section.hidden = section.id !== `page-${page}`; });
+    document.querySelectorAll('.admin-tab[data-page]').forEach(button => button.classList.toggle('active', button.dataset.page === page));
+    if (page === 'settings' && authenticated) void refreshSettings();
+    if (page === 'keys' && authenticated) void refresh();
+  }
+
+  function showLogin(message = '') {
+    authenticated = false;
+    if (refreshTimer) clearInterval(refreshTimer);
+    latestKeys = [];
+    currentSummary = null;
+    $('issuedKey').replaceChildren();
+    $('issuedKey').hidden = true;
+    $('bridgeKey').value = '';
+    $('copyFallbackValue').value = '';
+    if ($('copyDialog').open) $('copyDialog').close();
+    $('authPanel').hidden = false;
+    $('loginBox').hidden = false;
+    $('changeBox').hidden = true;
+    $('dashboard').hidden = true;
+    $('authTitle').textContent = '管理员登录';
+    $('authNote').textContent = '使用管理员账户进入管理界面。浏览器只保留当前会话，不保存管理员凭证。';
+    setStatus('需要登录');
+    if (message) showMessage('authMsg', message);
+  }
+
+  function showPasswordChange() {
+    authenticated = true;
+    $('authPanel').hidden = false;
+    $('loginBox').hidden = true;
+    $('changeBox').hidden = false;
+    $('dashboard').hidden = true;
+    $('authTitle').textContent = '首次登录需要修改密码';
+    $('authNote').textContent = '为了保护管理界面，请先设置一个新的管理员密码。修改成功后才能进入控制台。';
+    setStatus('待修改密码');
+    showMessage('authMsg', '初始密码仅用于首次登录，修改后不会再次显示。', true);
+  }
+
+  async function showDashboard() {
+    authenticated = true;
+    $('authPanel').hidden = true;
+    $('dashboard').hidden = false;
+    showPage('overview');
+    setStatus('已连接 · 管理员', true);
+    await refresh();
+    if (authenticated) startAutoRefresh();
+  }
+
+  function showIssuedKey(body) {
+    $('issuedKey').hidden = false;
+    $('issuedKey').innerHTML = `<div>普通 API Key（仅在此管理会话中显示）：</div><div class="row" style="margin-top:8px"><code id="issuedPlaintext">${escapeHtml(body.plaintext)}</code><button class="btn" id="copyIssuedKey" type="button">复制 Key</button></div><div class="hint" style="margin-top:6px">显示名称：${escapeHtml(body.display_name || '')} · 最大并发：${escapeHtml(body.max_concurrency || '')}</div>`;
+    $('copyIssuedKey').onclick = () => void copySecret($('issuedPlaintext').textContent);
+  }
+
+  async function copySecret(secret) {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable');
+      await navigator.clipboard.writeText(secret);
+      if ($('copyDialog').open) $('copyDialog').close();
+      showMessage('usersMsg', 'Key 已复制到剪贴板。', true);
+    } catch {
+      $('copyFallbackValue').value = secret;
+      $('copyDialog').showModal();
+      $('copyFallbackValue').focus();
+      $('copyFallbackValue').select();
+      showMessage('usersMsg', '浏览器未允许自动复制，可在弹窗中手动复制。');
+    }
+  }
+
+  $('loginBtn').onclick = async () => {
+    const username = $('loginUsername').value.trim();
+    const password = $('loginPassword').value;
+    if (!username || !password) { showMessage('authMsg', '请输入账户和密码'); return; }
+    try {
+      const body = await call('/admin/v1/login', {method:'POST', body:JSON.stringify({username, password})});
+      $('loginPassword').value = '';
+      if (body.must_change_password) showPasswordChange(); else await showDashboard();
+    } catch (error) { showMessage('authMsg', `登录失败：${error.message}`); }
+  };
+
+  $('changePasswordBtn').onclick = async () => {
+    const currentPassword = $('currentPassword').value;
+    const newPassword = $('newPassword').value;
+    if (!currentPassword || !newPassword) { showMessage('authMsg', '请填写当前密码和新密码'); return; }
+    try {
+      await call('/admin/v1/password', {method:'POST', body:JSON.stringify({current_password:currentPassword, new_password:newPassword})});
+      $('currentPassword').value = ''; $('newPassword').value = '';
+      await showDashboard();
+    } catch (error) { showMessage('authMsg', `修改密码失败：${error.message}`); }
+  };
+
+  $('logoutBtn').onclick = async () => {
+    try { await call('/admin/v1/logout', {method:'POST', body:'{}'}); } catch {}
+    $('copyFallbackValue').value = '';
+    if ($('copyDialog').open) $('copyDialog').close();
+    showLogin('已退出登录。');
+  };
+  $('refreshSummary').onclick = () => void refresh();
+  document.querySelectorAll('.admin-tab[data-page]').forEach(button => button.onclick = () => showPage(button.dataset.page));
+  $('trendRange').onchange = () => void refreshTrend();
+  $('trendKey').onchange = () => void refreshTrend();
+  $('allocationKey').onchange = renderAllocationHint;
+  $('quotaAmount').oninput = renderAllocationHint;
+  $('videoBillingRefresh').onclick = () => void refreshVideoBilling();
+
+  $('bridgeSave').onclick = async () => {
+    const candidate = {base_url:$('bridgeUrl').value.trim(), api_key:$('bridgeKey').value.trim()};
+    if (!candidate.base_url || !candidate.api_key) { showMessage('bridgeMsg', '请填写 Base URL 和 AI Work 桥接 Key'); return; }
+    try {
+      await call('/admin/v1/bridge/test', {method:'POST', body:JSON.stringify(candidate)});
+      const saved = await call('/admin/v1/bridge/config', {method:'PUT', body:JSON.stringify(candidate)});
+      $('bridgeKey').value = '';
+      showMessage('bridgeMsg', `连接测试成功，桥接配置已保存。模型：${saved.default_model || '已连接'}`, true);
+      await refresh();
+    } catch (error) { showMessage('bridgeMsg', `连接失败，未保存配置：${error.message}`); }
+  };
+
+  $('issueKey').onclick = async () => {
+    try {
+      const displayName = $('displayName').value.trim();
+      const scopes = [...document.querySelectorAll('input[name="scope"]:checked')].map(input => input.value);
+      const maxConcurrency = Number($('keyConcurrency').value);
+      if (!displayName) { showMessage('usersMsg', '请填写显示名称'); return; }
+      if (!scopes.length) { showMessage('usersMsg', '请至少勾选一个权限作用域'); return; }
+      if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > 1024) { showMessage('usersMsg', '最大并发数必须是 1 到 1024 的整数'); return; }
+      const body = await call('/admin/v1/api-keys', {method:'POST', body:JSON.stringify({display_name:displayName, scopes, max_concurrency:maxConcurrency})});
+      showIssuedKey(body);
+      showMessage('usersMsg', '普通 API Key 已生成。可在下方随时复制，也可以现在复制保存。', true);
+      $('displayName').value = '';
+      await refresh();
+      $('allocationKey').value = body.id;
+      renderAllocationHint();
+    } catch (error) { showMessage('usersMsg', `新建 Key 失败：${error.message}`); }
+  };
+
+  $('grantQuota').onclick = async () => {
+    try {
+      const keyId = $('allocationKey').value;
+      const amount = $('quotaAmount').value.trim();
+      const amountUnits = parseCredits(amount);
+      const availableUnits = parseCredits(currentSummary?.credits?.available_to_allocate);
+      const reason = $('quotaReason').value.trim();
+      if (!keyId) { showMessage('quotaMsg', '请选择显示名称对应的 API Key'); return; }
+      if (amountUnits === null || amountUnits <= 0n) { showMessage('quotaMsg', '积分必须是非负数，最多 6 位小数'); return; }
+      if (!currentSummary?.credits?.upstream_fresh || availableUnits === null) { showMessage('quotaMsg', 'AI Work 积分快照不可用，暂不能分配'); return; }
+      if (amountUnits > availableUnits) { showMessage('quotaMsg', `超过剩余可分配积分 ${formatCredits(availableUnits.toString())}`); return; }
+      if (!reason) { showMessage('quotaMsg', '请填写分配备注'); return; }
+      await call(`/admin/v1/api-keys/${encodeURIComponent(keyId)}/quota`, {method:'POST', body:JSON.stringify({resource_kind:'credits', amount, reason})});
+      showMessage('quotaMsg', '积分额度已分配，Key 列表与剩余余额已刷新。', true);
+      $('quotaAmount').value = '';
+      await refresh();
+    } catch (error) { showMessage('quotaMsg', `积分分配失败：${error.message}`); }
+  };
+
+  $('keyList').onclick = async event => {
+    const button = event.target.closest('button[data-action]');
+    if (!button) return;
+    const row = button.closest('[data-key-id]');
+    const key = latestKeys.find(item => item.id === row?.dataset.keyId);
+    if (!key) return;
+    try {
+      if (button.dataset.action === 'usage') {
+        const details = row.querySelector('[data-usage]');
+        details.hidden = !details.hidden;
+        return;
+      }
+      if (button.dataset.action === 'copy') {
+        const secret = await call(`/admin/v1/api-keys/${encodeURIComponent(key.id)}/copy`, {method:'POST', body:'{}'});
+        await copySecret(secret.plaintext);
+        return;
+      }
+      if (button.dataset.action === 'rotate') {
+        const created = await call(`/admin/v1/api-keys/${encodeURIComponent(key.id)}/rotate`, {method:'POST', body:'{}'});
+        showIssuedKey(Object.assign({}, created, {display_name:key.display_name, max_concurrency:key.max_concurrency}));
+        await copySecret(created.plaintext);
+        showMessage('usersMsg', '旧 Key 已关闭，新 Key 已生成并复制。', true);
+        await refresh();
+        return;
+      }
+      let maxConcurrency = key.max_concurrency;
+      if (button.dataset.action === 'concurrency') {
+        const value = window.prompt('请输入最大并发数（1-1024）', String(key.max_concurrency));
+        if (value === null) return;
+        maxConcurrency = Number(value);
+        if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > 1024) { showMessage('usersMsg', '最大并发数必须是 1 到 1024 的整数'); return; }
+      }
+      const enabled = button.dataset.action === 'toggle' ? key.status !== 'active' : key.status === 'active';
+      await call(`/admin/v1/api-keys/${encodeURIComponent(key.id)}`, {method:'PATCH', body:JSON.stringify({enabled, max_concurrency:maxConcurrency})});
+      showMessage('usersMsg', button.dataset.action === 'concurrency' ? '并发数已调整。' : 'Key 状态已更新。', true);
+      await refresh();
+    } catch (error) { showMessage('usersMsg', `操作失败：${error.message}`); }
+  };
+
+  $('videoBillingSave').onclick = async () => {
+    try {
+      const mode = $('videoBillingMode').value;
+      const reason = $('videoBillingReasonInput').value.trim();
+      if (!reason) { showMessage('videoBillingMsg', '请填写调整原因'); return; }
+      renderVideoBilling(await call('/admin/v1/video-billing', {method:'PUT', body:JSON.stringify({mode, reason})}));
+      showMessage('videoBillingMsg', mode === 'active' ? '视频安全闸门已启用；请先确认上游回执契约。' : '视频安全闸门已保持暂停。', true);
+    } catch (error) { showMessage('videoBillingMsg', `保存失败：${error.message}`); }
+  };
+
+  $('videoDiagnosticRegister').onclick = async () => {
+    try {
+      const keyId = $('videoDiagnosticKeyId').value.trim();
+      const requestHash = $('videoDiagnosticHash').value.trim();
+      const reason = $('videoDiagnosticReason').value.trim();
+      if (!keyId || !/^[0-9a-fA-F]{64}$/.test(requestHash) || !reason) { showMessage('videoBillingMsg', '请填写普通 Key 内部 ID、64 位 SHA-256 和验收原因；不要填写明文 Key。'); return; }
+      renderVideoBilling(await call('/admin/v1/video-billing/diagnostic', {method:'POST', body:JSON.stringify({key_id:keyId, request_hash:requestHash, reason})}));
+      showMessage('videoBillingMsg', '一次性验收已登记；只有匹配该 Key 和请求摘要的下一次视频请求可以通过。', true);
+    } catch (error) { showMessage('videoBillingMsg', `登记失败：${error.message}`); }
+  };
+
+  $('copyFallbackButton').onclick = () => void copySecret($('copyFallbackValue').value);
+  $('copyDialog').addEventListener('close', () => { $('copyFallbackValue').value = ''; });
+
+  async function boot() {
+    try {
+      const session = await call('/admin/v1/session');
+      if (session.authenticated) {
+        if (session.must_change_password) showPasswordChange();
+        else await showDashboard();
+      } else showLogin();
+    } catch (error) { showLogin(`暂时无法读取登录状态：${error.message}`); }
+  }
+
+  void boot();
+})();
+</script>
+</body>
+</html>

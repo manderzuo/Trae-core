@@ -1,0 +1,67 @@
+# 腾讯云/公网中转机上的 Nginx 配置模板。
+# FRP 将 Core 的 127.0.0.1:7865 映射为本机 127.0.0.1:17865。
+# 仅开放 443；不要开放 7865 或 17865。
+# 先申请 api.gemstory.cn 的 HTTPS 证书，再启用下面的 443 server。
+
+upstream starlink_core_backend {
+    server 127.0.0.1:17865;
+    keepalive 32;
+}
+
+server {
+    listen 80;
+    server_name api.gemstory.cn;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name api.gemstory.cn;
+
+    ssl_certificate     /etc/letsencrypt/live/api.gemstory.cn/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.gemstory.cn/privkey.pem;
+
+    client_max_body_size 46m;
+    proxy_read_timeout 900s;
+    proxy_send_timeout 900s;
+
+    location = /healthz {
+        proxy_pass http://starlink_core_backend/healthz;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 30s;
+    }
+
+    location = /health {
+        proxy_pass http://starlink_core_backend/health;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 30s;
+    }
+
+    location / {
+        proxy_pass http://starlink_core_backend;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}

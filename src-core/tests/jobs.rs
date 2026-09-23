@@ -1,0 +1,953 @@
+use std::{collections::BTreeSet, fs, path::PathBuf};
+
+use aiwork_core::{
+    BeginRequestInput, CoreStore, CostPolicy, CreateVideoJobInput, LeaseOutcome, LeaseState, NewUser, ObservationStatus,
+    KeyQuotaGrant, PreflightReserveInput, Principal, QuotaGrant, RegisterUpstreamAccount, SchedulerLeaseRequest,
+    SelectionStrategy, UpstreamObservation, UserRole, VideoJobEnqueueResult, VideoJobLeaseResult,
+    CURRENT_SCHEMA_VERSION,
+};
+use rusqlite::Connection;
+use serde_json::json;
+
+fn test_dir(tag: &str) -> PathBuf {
+    let root = PathBuf::from(r"D:\gpt");
+    fs::create_dir_all(&root).unwrap();
+    let dir = root.join(format!("aiwork-core-video-jobs-{tag}-{}", rand::random::<u64>()));
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn fixture() -> (CoreStore, Principal, Principal, PathBuf) {
+    let dir = test_dir("schema");
+    let store = CoreStore::open(&dir).unwrap();
+    store.migrate().unwrap();
+    store
+        .create_user(
+            NewUser {
+                id: "admin".into(),
+                name: "admin".into(),
+                role: UserRole::Admin,
+            },
+            "bootstrap",
+        )
+        .unwrap();
+    store
+        .create_user(
+            NewUser {
+                id: "video-user".into(),
+                name: "video-user".into(),
+                role: UserRole::User,
+            },
+            "admin",
+        )
+        .unwrap();
+    let scopes = BTreeSet::from([
+        "videos:submit".to_string(),
+        "videos:read".to_string(),
+        "videos:cancel".to_string(),
+    ]);
+    let key = store
+        .issue_api_key("video-user", "video-key", scopes.clone(), "admin")
+        .unwrap();
+    let admin_key = store
+        .issue_api_key("admin", "admin-key", BTreeSet::new(), "bootstrap")
+        .unwrap();
+    (
+        store,
+        Principal {
+            user_id: "admin".into(),
+            key_id: admin_key.id,
+            scopes: BTreeSet::new(),
+        },
+        Principal {
+            user_id: "video-user".into(),
+            key_id: key.id,
+            scopes,
+        },
+        dir,
+    )
+}
+
+fn prepare_video_scheduler(store: &CoreStore, admin: &Principal, principal: &Principal) {
+    store
+        .upsert_cost_policy(CostPolicy {
+            id: "video-policy".into(),
+            endpoint: "videos".into(),
+            model_pattern: "mock-video".into(),
+            resource_kind: "video_job".into(),
+            reserve_amount: 4,
+            max_actual_amount: Some(4),
+            version: 1,
+            enabled: true,
+        })
+        .unwrap();
+    store
+        .grant(QuotaGrant {
+            user_id: "video-user".into(),
+            resource_kind: "video_job".into(),
+            amount: 10,
+            actor_user_id: "admin".into(),
+            reason: "phase3c fixture".into(),
+        })
+        .unwrap();
+    store
+        .key_quota_grant_as_admin(
+            admin,
+            KeyQuotaGrant {
+                api_key_id: principal.key_id.clone(),
+                resource_kind: "video_job".into(),
+                amount: 10,
+                actor_user_id: "ignored-by-principal".into(),
+                reason: "phase3c key quota fixture".into(),
+            },
+        )
+        .unwrap();
+    let mut account = RegisterUpstreamAccount::new(
+        "video-account".into(),
+        "mock-video".into(),
+        "vault://phase3c/video-ref".into(),
+    );
+    account.capabilities.insert("video".into());
+    account.max_concurrency = 1;
+    store.upsert_upstream_account(account, admin).unwrap();
+    store
+        .append_upstream_observation(UpstreamObservation::new(
+            "video-observation".into(),
+            "video-account".into(),
+            "video_job".into(),
+            Some(100),
+            1,
+            "reader".into(),
+            ObservationStatus::Fresh,
+            1_800_000_000_000,
+            1_800_000_060_000,
+            json!({"available": 100, "source": "reader"}),
+        ))
+        .unwrap();
+}
+
+fn scheduler_request(principal: &Principal, key: &str, now_ms: i64) -> SchedulerLeaseRequest {
+    SchedulerLeaseRequest {
+        preflight: PreflightReserveInput {
+            request: BeginRequestInput {
+                user_id: "video-user".into(),
+                api_key_id: principal.key_id.clone(),
+                protocol: "openai".into(),
+                endpoint: "videos".into(),
+                model: "mock-video".into(),
+                idempotency_key: key.into(),
+                body: json!({"model": "mock-video", "prompt": "redacted"}),
+            },
+            resource_kind: "video_job".into(),
+            amount: 4,
+            ttl_ms: 10_000,
+        },
+        provider_hint: Some("mock-video".into()),
+        required_capabilities: vec!["video".into()],
+        region: None,
+        predicted_units: 4,
+        safety_margin_units: 0,
+        observation_max_age_ms: 60_000,
+        allowed_accounts: Some(vec!["video-account".into()]),
+        dedicated_account: None,
+        selection_strategy: SelectionStrategy::HighestNormalizedAvailable,
+        now_ms,
+        lease_ttl_ms: 60_000,
+        reconcile_ttl_ms: 600_000,
+    }
+}
+
+#[test]
+fn durable_video_queue_claim_round_robins_users_and_claims_each_job_once() {
+    let (store, admin, principal, dir) = fixture();
+    store
+        .create_user(
+            NewUser {
+                id: "video-user-2".into(),
+                name: "video-user-2".into(),
+                role: UserRole::User,
+            },
+            "admin",
+        )
+        .unwrap();
+    let user2_key = store
+        .issue_api_key("video-user-2", "video-key-2", BTreeSet::from([
+            "videos:submit".to_string(),
+            "videos:read".to_string(),
+            "videos:cancel".to_string(),
+        ]), "admin")
+        .unwrap();
+    let principal2 = Principal {
+        user_id: "video-user-2".into(),
+        key_id: user2_key.id,
+        scopes: BTreeSet::from([
+            "videos:submit".to_string(),
+            "videos:read".to_string(),
+            "videos:cancel".to_string(),
+        ]),
+    };
+    prepare_video_scheduler(&store, &admin, &principal);
+    let mut account = RegisterUpstreamAccount::new(
+        "video-account".into(),
+        "mock-video".into(),
+        "vault://phase4e/video-ref".into(),
+    );
+    account.capabilities.insert("video".into());
+    account.max_concurrency = 8;
+    store.upsert_upstream_account(account, &admin).unwrap();
+    store
+        .grant(QuotaGrant {
+            user_id: "video-user-2".into(),
+            resource_kind: "video_job".into(),
+            amount: 20,
+            actor_user_id: "admin".into(),
+            reason: "phase4e queue fixture".into(),
+        })
+        .unwrap();
+    store
+        .key_quota_grant_as_admin(
+            &admin,
+            KeyQuotaGrant {
+                api_key_id: principal2.key_id.clone(),
+                resource_kind: "video_job".into(),
+                amount: 20,
+                actor_user_id: "ignored-by-principal".into(),
+                reason: "phase4e key quota fixture".into(),
+            },
+        )
+        .unwrap();
+
+    let queue_request = |owner: &Principal, user_id: &str, key: &str, now_ms: i64| {
+        SchedulerLeaseRequest {
+            preflight: PreflightReserveInput {
+                request: BeginRequestInput {
+                    user_id: user_id.into(),
+                    api_key_id: owner.key_id.clone(),
+                    protocol: "openai".into(),
+                    endpoint: "videos".into(),
+                    model: "mock-video".into(),
+                    idempotency_key: key.into(),
+                    body: json!({"model": "mock-video", "prompt": "redacted"}),
+                },
+                resource_kind: "video_job".into(),
+                amount: 4,
+                ttl_ms: 60_000,
+            },
+            provider_hint: Some("mock-video".into()),
+            required_capabilities: vec!["video".into()],
+            region: None,
+            predicted_units: 4,
+            safety_margin_units: 0,
+            observation_max_age_ms: 60_000,
+            allowed_accounts: Some(vec!["video-account".into()]),
+            dedicated_account: None,
+            selection_strategy: SelectionStrategy::HighestNormalizedAvailable,
+            now_ms,
+            lease_ttl_ms: 60_000,
+            reconcile_ttl_ms: 600_000,
+        }
+    };
+
+    for (index, (owner, user_id)) in [
+        (&principal, "video-user"),
+        (&principal2, "video-user-2"),
+        (&principal, "video-user"),
+        (&principal2, "video-user-2"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let result = store
+            .enqueue_video_job(
+                owner,
+                queue_request(owner, user_id, &format!("queue-{index}"), 1_800_000_000_000 + index as i64),
+                CreateVideoJobInput {
+                    id: format!("queue-job-{index}"),
+                    input_hash: vec![index as u8 + 1; 32],
+                },
+            )
+            .unwrap();
+        assert!(matches!(result, VideoJobEnqueueResult::Created { .. }));
+    }
+
+    assert_eq!(store.count_rows("upstream_leases").unwrap(), 0);
+
+    let claimed = (0..4)
+        .map(|index| {
+            store
+                .claim_next_video_job("worker-phase4e", 1_800_000_010_000 + index)
+                .unwrap()
+                .unwrap()
+                .job
+                .user_id
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(claimed, ["video-user", "video-user-2", "video-user", "video-user-2"]);
+    assert!(store
+        .claim_next_video_job("worker-phase4e", 1_800_000_010_004)
+        .unwrap()
+        .is_none());
+    assert_eq!(store.count_rows("jobs").unwrap(), 4);
+    assert_eq!(store.count_rows("job_attempts").unwrap(), 4);
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn queued_video_cancel_releases_user_hold_before_any_upstream_lease_exists() {
+    let (store, admin, principal, dir) = fixture();
+    prepare_video_scheduler(&store, &admin, &principal);
+    let result = store
+        .enqueue_video_job(
+            &principal,
+            scheduler_request(&principal, "queued-cancel", 1_800_000_000_000),
+            CreateVideoJobInput {
+                id: "queued-cancel-job".into(),
+                input_hash: vec![7; 32],
+            },
+        )
+        .unwrap();
+    let job = match result {
+        VideoJobEnqueueResult::Created { job, .. } => job,
+        VideoJobEnqueueResult::Replay { .. } => panic!("unexpected idempotent replay"),
+    };
+    assert_eq!(store.count_rows("upstream_leases").unwrap(), 0);
+    let canceled = store
+        .request_video_cancel(&principal, &job.id, 1_800_000_000_100)
+        .unwrap();
+    assert_eq!(canceled.state, aiwork_core::JobState::Canceled);
+    assert_eq!(store.request_state(&job.request_id).unwrap(), aiwork_core::RequestState::Settled);
+    assert_eq!(store.count_rows("upstream_leases").unwrap(), 0);
+    let balance = store
+        .key_quota_balance_as_admin(&admin, &principal.key_id, "video_job")
+        .unwrap();
+    assert_eq!((balance.available, balance.held), (10, 0));
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn queued_video_job_can_resolve_its_internal_principal_without_exposing_key_material() {
+    let (store, admin, principal, dir) = fixture();
+    prepare_video_scheduler(&store, &admin, &principal);
+    let result = store
+        .enqueue_video_job(
+            &principal,
+            scheduler_request(&principal, "worker-principal", 1_800_000_000_000),
+            CreateVideoJobInput {
+                id: "worker-principal-job".into(),
+                input_hash: vec![11; 32],
+            },
+        )
+        .unwrap();
+    let job_id = match result {
+        VideoJobEnqueueResult::Created { job, .. } => job.id,
+        VideoJobEnqueueResult::Replay { .. } => panic!("unexpected idempotent replay"),
+    };
+
+    let resolved = store.principal_for_video_job(&job_id).unwrap().unwrap();
+    assert_eq!(resolved.user_id, principal.user_id);
+    assert_eq!(resolved.key_id, principal.key_id);
+    assert!(resolved.scopes.contains("videos:submit"));
+    let serialized = format!("{resolved:?}");
+    assert!(!serialized.contains("sk-"));
+
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn admin_video_job_projection_is_bounded_and_redacted() {
+    let (store, admin, principal, dir) = fixture();
+    prepare_video_scheduler(&store, &admin, &principal);
+    let result = store
+        .enqueue_video_job(
+            &principal,
+            scheduler_request(&principal, "admin-job-projection", 1_800_000_000_000),
+            CreateVideoJobInput {
+                id: "admin-job-projection".into(),
+                input_hash: vec![42; 32],
+            },
+        )
+        .unwrap();
+    let job_id = match result {
+        VideoJobEnqueueResult::Created { job, .. } => job.id,
+        VideoJobEnqueueResult::Replay { .. } => panic!("unexpected idempotent replay"),
+    };
+
+    let queued = store
+        .list_video_jobs_as_admin(&admin, None, 10)
+        .unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].id, job_id);
+    assert_eq!(queued[0].user_id, "video-user");
+    assert_eq!(queued[0].state, "queued");
+    assert!(!queued[0].queue_claimed);
+    assert_eq!(queued[0].quota_amount, Some(4));
+    assert_eq!(queued[0].quota_state.as_deref(), Some("held"));
+    let serialized = serde_json::to_string(&queued[0]).unwrap();
+    assert!(!serialized.contains("input_hash"));
+    assert!(!serialized.contains("request_id"));
+    assert!(!serialized.contains("video-account"));
+    assert!(!serialized.contains("vault://"));
+    assert!(!serialized.contains("prompt"));
+
+    store
+        .claim_video_job_by_id("admin-projection-worker", &job_id, 1_800_000_010_000)
+        .unwrap()
+        .unwrap();
+    let claimed = store
+        .list_video_jobs_as_admin(&admin, Some("running"), 10)
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert!(claimed[0].queue_claimed);
+    assert_eq!(claimed[0].attempt_state.as_deref(), Some("running"));
+    assert_eq!(claimed[0].lease_state.as_deref(), Some("active"));
+    assert!(!claimed[0].upstream_request_ref_present);
+
+    assert!(matches!(
+        store.list_video_jobs_as_admin(&principal, None, 10),
+        Err(aiwork_core::CoreError::AdminRequired)
+    ));
+    assert!(matches!(
+        store.list_video_jobs_as_admin(&principal, None, 0),
+        Err(aiwork_core::CoreError::AdminRequired)
+    ));
+    assert!(store.list_video_jobs_as_admin(&admin, None, 0).is_err());
+    assert!(store.list_video_jobs_as_admin(&admin, Some("not-a-state"), 10).is_err());
+
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn claimed_video_job_heartbeat_is_owner_bound_and_keeps_all_runtime_rows_alive() {
+    let (store, admin, principal, dir) = fixture();
+    prepare_video_scheduler(&store, &admin, &principal);
+    let result = store
+        .enqueue_video_job(
+            &principal,
+            scheduler_request(&principal, "heartbeat-claim", 1_800_000_000_000),
+            CreateVideoJobInput {
+                id: "heartbeat-claim-job".into(),
+                input_hash: vec![8; 32],
+            },
+        )
+        .unwrap();
+    let job_id = match result {
+        VideoJobEnqueueResult::Created { job, .. } => job.id,
+        VideoJobEnqueueResult::Replay { .. } => panic!("unexpected idempotent replay"),
+    };
+    let claim = store
+        .claim_video_job_by_id("heartbeat-worker", &job_id, 1_800_000_000_100)
+        .unwrap()
+        .unwrap();
+
+    let heartbeated = store
+        .heartbeat_video_job("heartbeat-worker", &job_id, 1_800_000_000_200, 120_000)
+        .unwrap();
+    assert_eq!(heartbeated.last_heartbeat_ms, Some(1_800_000_000_200));
+    let attempt = store
+        .video_job_attempt_for_user(&principal, &job_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempt.last_heartbeat_ms, Some(1_800_000_000_200));
+    let lease = store
+        .list_recoverable_leases()
+        .unwrap()
+        .into_iter()
+        .find(|lease| lease.id == claim.lease.id)
+        .unwrap();
+    assert_eq!(lease.lease_expires_at_ms, 1_800_000_120_200);
+
+    let connection = Connection::open(dir.join("data").join("core.sqlite3")).unwrap();
+    let queue_owner: String = connection
+        .query_row(
+            "SELECT queue_claim_owner FROM jobs WHERE id = ?1",
+            [&job_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(queue_owner, "heartbeat-worker");
+    let queue_expiry: i64 = connection
+        .query_row(
+            "SELECT queue_claim_expires_at_ms FROM jobs WHERE id = ?1",
+            [&job_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(queue_expiry, 1_800_000_120_200);
+    drop(connection);
+
+    let wrong_owner = store.heartbeat_video_job("other-worker", &job_id, 1_800_000_000_300, 120_000);
+    assert!(matches!(
+        wrong_owner,
+        Err(aiwork_core::ScheduleError::Core(aiwork_core::CoreError::InvalidConfiguration { .. }))
+    ));
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn expired_claim_recovery_clears_worker_ownership_without_releasing_the_hold() {
+    let (store, admin, principal, dir) = fixture();
+    prepare_video_scheduler(&store, &admin, &principal);
+    let result = store
+        .enqueue_video_job(
+            &principal,
+            scheduler_request(&principal, "recover-claim", 1_800_000_000_000),
+            CreateVideoJobInput {
+                id: "recover-claim-job".into(),
+                input_hash: vec![9; 32],
+            },
+        )
+        .unwrap();
+    let job_id = match result {
+        VideoJobEnqueueResult::Created { job, .. } => job.id,
+        VideoJobEnqueueResult::Replay { .. } => panic!("unexpected idempotent replay"),
+    };
+    let claim = store
+        .claim_video_job_by_id("recovery-worker", &job_id, 1_800_000_000_100)
+        .unwrap()
+        .unwrap();
+
+    let recovered = store
+        .recover_expired_upstream_leases(claim.lease.lease_expires_at_ms + 1)
+        .unwrap();
+    assert_eq!(recovered.len(), 1);
+    let job = store.video_job_for_user(&principal, &job_id).unwrap().unwrap();
+    assert_eq!(job.state, aiwork_core::JobState::Unknown);
+    assert!(job.reconcile_required);
+    let connection = Connection::open(dir.join("data").join("core.sqlite3")).unwrap();
+    let ownership: (Option<String>, Option<i64>) = connection
+        .query_row(
+            "SELECT queue_claim_owner, queue_claim_expires_at_ms FROM jobs WHERE id = ?1",
+            [&job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(ownership, (None, None));
+    drop(connection);
+    let balance = store
+        .key_quota_balance_as_admin(&admin, &principal.key_id, "video_job")
+        .unwrap();
+    assert_eq!((balance.available, balance.held), (6, 4));
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn unknown_video_lease_requires_explicit_success_evidence_to_reconcile_once() {
+    let (store, admin, principal, dir) = fixture();
+    prepare_video_scheduler(&store, &admin, &principal);
+    let result = store
+        .enqueue_video_job(
+            &principal,
+            scheduler_request(&principal, "reconcile-unknown", 1_800_000_000_000),
+            CreateVideoJobInput {
+                id: "reconcile-unknown-job".into(),
+                input_hash: vec![10; 32],
+            },
+        )
+        .unwrap();
+    let job_id = match result {
+        VideoJobEnqueueResult::Created { job, .. } => job.id,
+        VideoJobEnqueueResult::Replay { .. } => panic!("unexpected idempotent replay"),
+    };
+    let claim = store
+        .claim_video_job_by_id("reconcile-worker", &job_id, 1_800_000_000_100)
+        .unwrap()
+        .unwrap();
+    let active_reconcile = store.reconcile_unknown_upstream_lease(
+        &principal,
+        &claim.lease.id,
+        LeaseOutcome::Success {
+            actual_units: Some(4),
+            upstream_request_ref: Some("too-early".into()),
+            now_ms: 1_800_000_000_101,
+        },
+    );
+    assert!(matches!(
+        active_reconcile,
+        Err(aiwork_core::ScheduleError::Core(aiwork_core::CoreError::InvalidConfiguration { .. }))
+    ));
+    store
+        .recover_expired_upstream_leases(claim.lease.lease_expires_at_ms + 1)
+        .unwrap();
+
+    let reconciled = store
+        .reconcile_unknown_upstream_lease(
+            &principal,
+            &claim.lease.id,
+            LeaseOutcome::Success {
+                actual_units: Some(4),
+                upstream_request_ref: Some("reconciled-upstream-ref".into()),
+                now_ms: 1_800_000_500_000,
+            },
+        )
+        .unwrap();
+    assert!(reconciled.applied);
+    assert_eq!(reconciled.lease.state, LeaseState::Succeeded);
+    assert_eq!(store.request_state(&claim.job.request_id).unwrap(), aiwork_core::RequestState::Settled);
+    assert_eq!(store.video_job_for_user(&principal, &job_id).unwrap().unwrap().state, aiwork_core::JobState::Succeeded);
+    assert_eq!(store.reservation_for_request(&claim.job.request_id).unwrap().unwrap().state, aiwork_core::ReservationState::Committed);
+    assert_eq!(
+        store
+            .key_quota_balance_as_admin(&admin, &principal.key_id, "video_job")
+            .unwrap()
+            .held,
+        0
+    );
+
+    let replay = store
+        .reconcile_unknown_upstream_lease(
+            &principal,
+            &claim.lease.id,
+            LeaseOutcome::Success {
+                actual_units: Some(4),
+                upstream_request_ref: Some("reconciled-upstream-ref".into()),
+                now_ms: 1_800_000_500_001,
+            },
+        )
+        .unwrap();
+    assert!(!replay.applied);
+    assert_eq!(
+        store
+            .key_quota_balance_as_admin(&admin, &principal.key_id, "video_job")
+            .unwrap()
+            .held,
+        0
+    );
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn bootstrap_creates_authoritative_video_job_tables() {
+    let (store, _admin, _principal, dir) = fixture();
+    assert_eq!(CURRENT_SCHEMA_VERSION, 20);
+    assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    for table in ["jobs", "job_attempts", "dispatch_queue_cursors"] {
+        assert_eq!(store.table_count(table).unwrap(), 1, "missing table {table}");
+        assert_eq!(store.count_rows(table).unwrap(), 0);
+    }
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn v8_migration_preserves_assets_and_does_not_import_legacy_video_jobs() {
+    let dir = test_dir("v8-migration");
+    let store = CoreStore::open(&dir).unwrap();
+    store.migrate().unwrap();
+    drop(store);
+
+    let database = dir.join("data").join("core.sqlite3");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO legacy_jobs
+               (id, owner_key_id, user_id, status, reconcile_required, created_at_ms, updated_at_ms,
+                migration_id, actor_user_id, reason)
+             SELECT 'legacy-video', 'legacy-key', id, 'processing', 1, 1, 1,
+                    'phase3c-test', id, 'fixture'
+               FROM users WHERE id = 'video-user';
+             DROP TABLE dispatch_queue_cursors;
+             DROP TABLE jobs;
+             DROP TABLE job_attempts;
+             ALTER TABLE api_keys DROP COLUMN secret_key_version;
+             ALTER TABLE api_keys DROP COLUMN secret_ciphertext;
+             UPDATE schema_meta SET value = '8' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = CoreStore::open(&dir).unwrap();
+    store.migrate().unwrap();
+    assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    assert_eq!(store.count_rows("jobs").unwrap(), 0);
+    assert_eq!(store.count_rows("job_attempts").unwrap(), 0);
+    assert_eq!(store.table_count("assets").unwrap(), 1);
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn job_tables_reject_invalid_states_and_unbounded_references() {
+    let (store, _admin, _principal, dir) = fixture();
+    let connection = Connection::open(dir.join("data").join("core.sqlite3")).unwrap();
+    assert!(connection
+        .execute(
+            "INSERT INTO jobs
+             (id, request_id, user_id, kind, model, input_hash, state, reconcile_required, created_at_ms, updated_at_ms)
+             VALUES ('job-1', 'missing-request', 'video-user', 'video', 'mock-video', zeroblob(32), 'processing', 0, 1, 1)",
+            [],
+        )
+        .is_err());
+    assert!(connection
+        .execute(
+            "INSERT INTO jobs
+             (id, request_id, user_id, kind, model, input_hash, state, reconcile_required, created_at_ms, updated_at_ms)
+             VALUES ('job-2', 'missing-request', 'video-user', 'video', 'mock-video', zeroblob(32), 'queued', 0, 1, 1)",
+            [],
+        )
+        .is_err());
+    drop(connection);
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn video_preflight_creates_one_job_and_attempt_and_replays_idempotently() {
+    let (store, admin, principal, dir) = fixture();
+    store
+        .upsert_cost_policy(CostPolicy {
+            id: "video-policy".into(),
+            endpoint: "videos".into(),
+            model_pattern: "mock-video".into(),
+            resource_kind: "video_job".into(),
+            reserve_amount: 4,
+            max_actual_amount: Some(4),
+            version: 1,
+            enabled: true,
+        })
+        .unwrap();
+    store
+        .grant(QuotaGrant {
+            user_id: "video-user".into(),
+            resource_kind: "video_job".into(),
+            amount: 10,
+            actor_user_id: "admin".into(),
+            reason: "phase3c fixture".into(),
+        })
+        .unwrap();
+    store
+        .key_quota_grant_as_admin(
+            &admin,
+            KeyQuotaGrant {
+                api_key_id: principal.key_id.clone(),
+                resource_kind: "video_job".into(),
+                amount: 10,
+                actor_user_id: "ignored-by-principal".into(),
+                reason: "phase3c key quota fixture".into(),
+            },
+        )
+        .unwrap();
+    let mut account = RegisterUpstreamAccount::new(
+        "video-account".into(),
+        "mock-video".into(),
+        "vault://phase3c/video-ref".into(),
+    );
+    account.capabilities.insert("video".into());
+    account.max_concurrency = 1;
+    store.upsert_upstream_account(account, &admin).unwrap();
+    store
+        .append_upstream_observation(UpstreamObservation::new(
+            "video-observation".into(),
+            "video-account".into(),
+            "video_job".into(),
+            Some(100),
+            1,
+            "reader".into(),
+            ObservationStatus::Fresh,
+            1_800_000_000_000,
+            1_800_000_060_000,
+            json!({"available": 100, "source": "reader"}),
+        ))
+        .unwrap();
+    let scheduler = || SchedulerLeaseRequest {
+        preflight: PreflightReserveInput {
+            request: BeginRequestInput {
+                user_id: "video-user".into(),
+                api_key_id: principal.key_id.clone(),
+                protocol: "openai".into(),
+                endpoint: "videos".into(),
+                model: "mock-video".into(),
+                idempotency_key: "video-idem-1".into(),
+                body: json!({"model": "mock-video", "prompt": "redacted"}),
+            },
+            resource_kind: "video_job".into(),
+            amount: 4,
+            ttl_ms: 10_000,
+        },
+        provider_hint: Some("mock-video".into()),
+        required_capabilities: vec!["video".into()],
+        region: None,
+        predicted_units: 4,
+        safety_margin_units: 0,
+        observation_max_age_ms: 60_000,
+        allowed_accounts: Some(vec!["video-account".into()]),
+        dedicated_account: None,
+        selection_strategy: SelectionStrategy::HighestNormalizedAvailable,
+        now_ms: 1_800_000_000_000,
+        lease_ttl_ms: 60_000,
+        reconcile_ttl_ms: 600_000,
+    };
+    let first = store
+        .preflight_video_job(
+            &principal,
+            scheduler(),
+            CreateVideoJobInput {
+                id: "job-video-1".into(),
+                input_hash: vec![7; 32],
+            },
+        )
+        .unwrap();
+    let (job_id, lease_id) = match first {
+        VideoJobLeaseResult::Acquired { job, attempt, lease } => {
+            assert_eq!(job.state, aiwork_core::JobState::Queued);
+            assert_eq!(job.user_id, "video-user");
+            assert_eq!(attempt.state, aiwork_core::JobAttemptState::Queued);
+            assert_eq!(attempt.account_ref, "video-account");
+            (job.id, lease.lease_id)
+        }
+        other => panic!("expected acquired video job, got {other:?}"),
+    };
+    let running = store
+        .mark_video_job_running(&principal, &job_id, 1_800_000_000_001)
+        .unwrap();
+    assert_eq!(running.state, aiwork_core::JobState::Running);
+    let settled = store
+        .settle_upstream_lease(
+            &principal,
+            &lease_id,
+            LeaseOutcome::Success {
+                actual_units: Some(4),
+                upstream_request_ref: Some("mock-upstream-request".into()),
+                now_ms: 1_800_000_000_002,
+            },
+        )
+        .unwrap();
+    assert_eq!(settled.state, LeaseState::Succeeded);
+    assert_eq!(
+        store
+            .video_job_for_user(&principal, &job_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        aiwork_core::JobState::Succeeded
+    );
+    assert_eq!(
+        store
+            .video_job_attempt_for_user(&principal, &job_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        aiwork_core::JobAttemptState::Succeeded
+    );
+    assert_eq!(
+        store
+            .key_quota_balance_as_admin(&admin, &principal.key_id, "video_job")
+            .unwrap()
+            .available,
+        6
+    );
+    let replay = store
+        .preflight_video_job(
+            &principal,
+            scheduler(),
+            CreateVideoJobInput {
+                id: "job-video-different-id-is-ignored-on-replay".into(),
+                input_hash: vec![7; 32],
+            },
+        )
+        .unwrap();
+    match replay {
+        VideoJobLeaseResult::Replay { job, attempt, lease } => {
+            assert_eq!(job.id, job_id);
+            assert_eq!(attempt.lease_id, lease_id);
+            assert_eq!(lease.id, lease_id);
+        }
+        other => panic!("expected replay video job, got {other:?}"),
+    }
+    assert_eq!(store.count_rows("jobs").unwrap(), 1);
+    assert_eq!(store.count_rows("job_attempts").unwrap(), 1);
+    assert_eq!(store.count_rows("quota_reservations").unwrap(), 1);
+    assert_eq!(store.count_rows("upstream_leases").unwrap(), 1);
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn cancel_request_is_persisted_without_releasing_until_confirmed() {
+    let (store, admin, principal, dir) = fixture();
+    prepare_video_scheduler(&store, &admin, &principal);
+    let acquired = store
+        .preflight_video_job(
+            &principal,
+            scheduler_request(&principal, "video-cancel", 1_800_000_000_000),
+            CreateVideoJobInput {
+                id: "job-video-cancel".into(),
+                input_hash: vec![8; 32],
+            },
+        )
+        .unwrap();
+    let (job_id, request_id) = match acquired {
+        VideoJobLeaseResult::Acquired { job, .. } => (job.id, job.request_id),
+        other => panic!("expected acquired video job, got {other:?}"),
+    };
+    let audit_before_cancel = store.count_rows("audit_events").unwrap();
+    let canceled = store
+        .request_video_cancel(&principal, &job_id, 1_800_000_000_001)
+        .unwrap();
+    assert_eq!(canceled.state, aiwork_core::JobState::CancelRequested);
+    assert_eq!(
+        store
+            .video_job_attempt_for_user(&principal, &job_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        aiwork_core::JobAttemptState::CancelRequested
+    );
+    assert_eq!(store.request_state(&request_id).unwrap(), aiwork_core::RequestState::CancelRequested);
+    let balance = store
+        .key_quota_balance_as_admin(&admin, &principal.key_id, "video_job")
+        .unwrap();
+    assert_eq!(balance.available, 6);
+    assert_eq!(balance.held, 4);
+    let audit_after_cancel = store.count_rows("audit_events").unwrap();
+    assert_eq!(audit_after_cancel, audit_before_cancel + 1);
+    let replay = store
+        .request_video_cancel(&principal, &job_id, 1_800_000_000_002)
+        .unwrap();
+    assert_eq!(replay.state, aiwork_core::JobState::CancelRequested);
+    assert_eq!(store.count_rows("audit_events").unwrap(), audit_after_cancel);
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn expired_video_lease_recovers_job_to_unknown_without_release() {
+    let (store, admin, principal, dir) = fixture();
+    prepare_video_scheduler(&store, &admin, &principal);
+    let acquired = store
+        .preflight_video_job(
+            &principal,
+            scheduler_request(&principal, "video-recovery", 1_800_000_000_000),
+            CreateVideoJobInput {
+                id: "job-video-recovery".into(),
+                input_hash: vec![9; 32],
+            },
+        )
+        .unwrap();
+    let (job_id, request_id) = match acquired {
+        VideoJobLeaseResult::Acquired { job, .. } => (job.id, job.request_id),
+        other => panic!("expected acquired video job, got {other:?}"),
+    };
+    let recovered = store
+        .recover_expired_upstream_leases(1_800_000_060_001)
+        .unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].state, LeaseState::Unknown);
+    let job = store.video_job_for_user(&principal, &job_id).unwrap().unwrap();
+    assert_eq!(job.state, aiwork_core::JobState::Unknown);
+    assert!(job.reconcile_required);
+    assert_eq!(store.request_state(&request_id).unwrap(), aiwork_core::RequestState::Unknown);
+    let balance = store
+        .key_quota_balance_as_admin(&admin, &principal.key_id, "video_job")
+        .unwrap();
+    assert_eq!(balance.available, 6);
+    assert_eq!(balance.held, 4);
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}

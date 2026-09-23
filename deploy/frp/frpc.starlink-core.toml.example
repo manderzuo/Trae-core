@@ -1,0 +1,17 @@
+# 星链维度分流系统所在 Windows 主机上的 frpc 示例。
+# Core 本地监听 127.0.0.1:7865；不要把 7865 直接暴露到公网。
+# 真实 serverAddr、token 不要提交到 Git 或发到聊天中。
+
+serverAddr = "__RELAY_LAN_OR_CLOUD_IP__"
+serverPort = 7000
+
+auth.method = "token"
+auth.token = "__REPLACE_WITH_SAME_TOKEN_AS_FRPS__"
+transport.tls.enable = true
+
+[[proxies]]
+name = "starlink-core-gateway"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 7865
+remotePort = 17865
