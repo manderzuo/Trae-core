@@ -1,0 +1,25 @@
+# Isolated development worktree and plan-runner scratch
+/.worktrees/
+/.superpowers/
+
+# Rust build outputs
+/target/
+**/target/
+**/release/
+
+# Runtime data and logs
+**/data/
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.log
+
+# Local configuration and credentials
+**/.env
+**/.env.*
+!**/.env.example
+**/*-secrets.env
+**/*.pem
+**/*.key
