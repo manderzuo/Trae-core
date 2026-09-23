@@ -854,6 +854,89 @@ impl CoreStore {
         self.begin_request_internal(input, false)
     }
 
+    /// Link a separately billed internal child call to its client-visible
+    /// request. Parent and child must be owned by the same user and API key.
+    pub fn link_seedance_assist_request(
+        &self,
+        parent_request_id: &str,
+        child_request_id: &str,
+    ) -> Result<(), CoreError> {
+        if parent_request_id == child_request_id {
+            return Err(CoreError::InvalidConfiguration {
+                key: "request_relation".into(),
+                value: "parent and child request IDs must differ".into(),
+            });
+        }
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let parent = transaction
+            .query_row(
+                "SELECT user_id, api_key_id FROM requests WHERE id = ?1",
+                [parent_request_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::RequestNotFound {
+                request_id: parent_request_id.to_owned(),
+            })?;
+        let child = transaction
+            .query_row(
+                "SELECT user_id, api_key_id FROM requests WHERE id = ?1",
+                [child_request_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::RequestNotFound {
+                request_id: child_request_id.to_owned(),
+            })?;
+        if parent != child {
+            return Err(CoreError::InvalidRequestIdentity {
+                user_id: parent.0,
+                api_key_id: child.1,
+            });
+        }
+        let existing = transaction
+            .query_row(
+                "SELECT child_request_id FROM request_relations
+                 WHERE parent_request_id = ?1 AND relationship_kind = 'seedance_assist'",
+                [parent_request_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match existing {
+            Some(existing) if existing == child_request_id => {
+                transaction.commit()?;
+                return Ok(());
+            }
+            Some(_) => return Err(CoreError::IdempotencyConflict),
+            None => {}
+        }
+        transaction.execute(
+            "INSERT INTO request_relations
+             (parent_request_id, child_request_id, relationship_kind, created_at_ms)
+             VALUES (?1, ?2, 'seedance_assist', ?3)",
+            params![parent_request_id, child_request_id, Utc::now().timestamp_millis()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn seedance_assist_request_for_parent(
+        &self,
+        parent_request_id: &str,
+    ) -> Result<Option<String>, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        connection
+            .query_row(
+                "SELECT child_request_id FROM request_relations
+                 WHERE parent_request_id = ?1 AND relationship_kind = 'seedance_assist'",
+                [parent_request_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(CoreError::from)
+    }
+
     fn begin_request_internal(
         &self,
         input: BeginRequestInput,

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, path::PathBuf, sync::{Arc, Mutex}};
+use std::{collections::{HashMap, HashSet}, fs, path::PathBuf, sync::{Arc, Mutex}};
 
 use aiwork_core::CoreStore;
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,7 @@ pub struct StarlinkRouterState {
     pub config: RouterConfig,
     pub key_vault: Arc<KeyVault>,
     pub jobs: Arc<Mutex<HashMap<String, UserVideoJob>>>,
+    pub video_stream_observers: Arc<Mutex<HashSet<String>>>,
     pub admin_sessions: Arc<AdminSessionStore>,
     pub login_throttle: Arc<LoginThrottle>,
     pub asset_limiter: Arc<AssetLimiter>,
@@ -65,6 +66,7 @@ impl StarlinkRouterState {
             config,
             key_vault: Arc::new(key_vault),
             jobs: Arc::new(Mutex::new(jobs)),
+            video_stream_observers: Arc::new(Mutex::new(HashSet::new())),
             admin_sessions: Arc::new(AdminSessionStore::new(SESSION_TTL_MS)),
             login_throttle: Arc::new(LoginThrottle::new()),
             asset_limiter: Arc::new(AssetLimiter::from_env()),
@@ -81,7 +83,7 @@ impl StarlinkRouterState {
         config: RouterConfig,
         key_vault: KeyVault,
     ) -> Arc<Self> {
-        Arc::new(Self { store, bridge: Arc::new(Mutex::new(bridge)), config, key_vault: Arc::new(key_vault), jobs: Arc::new(Mutex::new(HashMap::new())), admin_sessions: Arc::new(AdminSessionStore::new(SESSION_TTL_MS)), login_throttle: Arc::new(LoginThrottle::new()), asset_limiter: Arc::new(AssetLimiter::from_env()) })
+        Arc::new(Self { store, bridge: Arc::new(Mutex::new(bridge)), config, key_vault: Arc::new(key_vault), jobs: Arc::new(Mutex::new(HashMap::new())), video_stream_observers: Arc::new(Mutex::new(HashSet::new())), admin_sessions: Arc::new(AdminSessionStore::new(SESSION_TTL_MS)), login_throttle: Arc::new(LoginThrottle::new()), asset_limiter: Arc::new(AssetLimiter::from_env()) })
     }
 
     pub fn replace_bridge(&self, bridge: BridgeClient) {

@@ -602,3 +602,15 @@ ALTER TABLE api_keys ADD COLUMN secret_key_version INTEGER CHECK(secret_key_vers
 pub(crate) const SCHEMA_V21: &str = r#"
 ALTER TABLE api_keys ADD COLUMN deleted_at_ms INTEGER;
 "#;
+
+pub(crate) const SCHEMA_V22: &str = r#"
+CREATE TABLE IF NOT EXISTS request_relations (
+  parent_request_id TEXT NOT NULL REFERENCES requests(id),
+  child_request_id TEXT NOT NULL UNIQUE REFERENCES requests(id),
+  relationship_kind TEXT NOT NULL CHECK(relationship_kind IN ('seedance_assist')),
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(parent_request_id, relationship_kind),
+  CHECK(parent_request_id <> child_request_id)
+);
+CREATE INDEX IF NOT EXISTS request_relations_child_idx ON request_relations(child_request_id);
+"#;

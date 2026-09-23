@@ -3,6 +3,7 @@ pub mod dto;
 pub mod auth;
 pub mod bridge_client;
 pub mod state;
+pub(crate) mod seedance_sse;
 pub mod user_routes;
 pub mod server;
 pub mod admin_auth;

@@ -524,17 +524,9 @@ async fn bridge_asset_failure_does_not_submit_video_or_keep_reservation() {
 }
 
 #[tokio::test]
-async fn seedance_chat_rejects_streaming_and_checks_asset_owner_before_forwarding() {
+async fn seedance_chat_checks_asset_owner_before_paid_upstream_calls() {
     let fixture = video_fixture();
     let asset_id = upload_png_id(&fixture.app, &fixture.key).await;
-    let streamed = post_bearer(
-        &fixture.app,
-        "/v1/chat/completions",
-        &fixture.key,
-        json!({"model":"seedance","stream":true,"messages":[{"role":"user","content":"让画面动起来"}]}),
-    )
-    .await;
-    assert_eq!(streamed.status(), StatusCode::BAD_REQUEST);
     let rejected = post_bearer(
         &fixture.app,
         "/v1/chat/completions",

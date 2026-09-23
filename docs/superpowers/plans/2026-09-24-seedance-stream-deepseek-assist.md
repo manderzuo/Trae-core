@@ -4,7 +4,7 @@
 
 **Goal:** 让公网 Core 的 `model=seedance` Chat Completions 流式请求持续返回真实视频结果，并在可核验真实积分的前提下启用后台 DeepSeek 辅助结构化。
 
-**Architecture:** 第一阶段由 Core 将流式 Chat 请求归一化为现有非流式视频提交，复用视频任务、状态、内容和回执接口，在 Core 对客户端输出 Chat SSE；AI Work 不必接收 `stream=true`。第二阶段在 AI Work 增加可开关的提示词辅助，在 Core/AI Work 之间建立同一普通 Key 下的父请求与独立子回执，不能将辅助模型成本默默并入单一视频回执。两个阶段各自可测试、可独立发布。
+**Architecture:** Core 将 Seedance Chat 请求中的 `stream=true` 转成上游非流式视频提交，再把持久化任务状态转换为客户端可解析的 Chat SSE。提交视频前，Core 通过 AI Work Chat 桥接调用默认文字模型（默认 `deepseek-v4-flash`）整理提示词；辅助请求有独立 Core request ID、报价、预留和真实回执，并与视频父请求绑定到同一普通 API Key。参考图只传 Seedance，不传辅助模型。AI Work 源码不做本次部署：GitHub 主分支与线上运行桥接路由有差异，重建覆盖存在回退风险。
 
 **Tech Stack:** Rust、Axum、Tokio、SQLite/rusqlite、SerDe、Core Bridge、AI Work Tauri API server、SSE。
 
@@ -12,12 +12,12 @@
 
 ## Global Constraints
 
-- 两仓库分别是 `D:/gpt/trae-core-design-20260924` 与 `D:/gpt/trae-maker-design-20260924` 的文档工作副本；真正实施时重新确认工作树、分支与远端，不能把本次浅克隆当生产工作树。
+- Core 与 AI Work 使用各自隔离的 D 盘 worktree；Core 目标仓库为 `https://github.com/manderzuo/Trae-core.git`，AI Work 仓库为 `https://github.com/manderzuo/trae-maker.git`。MCP 是独立仓库，本次不改。
 - 所有构建、临时数据库、Cargo target、Rustup/Cargo 下载缓存和日志放在 `D:/gpt`；测试后只清理**本任务新建且路径经确认**的临时产物，不碰用户数据或整目录。
-- 自动化测试仅用本地 Mock/fixture；不得发送真实上游请求或消耗积分。生产部署和小额度真实验收另需用户确认。
+- 自动化测试仅用本地 Mock/fixture；用户本轮已明确授权使用现有“周”Key 做一次真实公网验收。该请求会分别消耗 DeepSeek 辅助和 Seedance 视频的上游积分；结果不明时不自动重试。
 - 对外仍是 `https://api.gemstory.cn/v1` 与 Core 普通 Key；其他文字模型和 `stream=false` Seedance 现有 202 契约不变。
 - Core 只用真实上游积分回执结算，不按 token、倍率或固定 1 积分估算；未知结果保留 hold，不自动重试。
-- DeepSeek V4.1 Flash 的真实模型 ID 必须经过模型目录核验；现有源码默认 `deepseek-v4-flash` 不得冒称 V4.1。
+- 辅助模型使用 Core `default_model` 配置；空值或误指向 Seedance 时回退到 `deepseek-v4-flash`。上游可用性必须由真实报价/请求验证；辅助与视频回执独立按实际积分结算。
 - 客户端本地写文件必须由有工作区权限的本地工具/MCP执行；纯远端 API 只保证安全下载地址。
 - 普通用户 Key 不传给 AI Work，Bridge Secret 不出公网响应；素材、状态和内容均按 Core 所有者隔离。
 - 子代理如用于执行，仅允许当前模型级别及以下；不允许以更高等级模型审查。
@@ -32,7 +32,7 @@
 
 ---
 
-## 第一阶段：Core Stream 兼容，不依赖辅助模型
+## 第一阶段：Core Stream 兼容与 DeepSeek 分开记账辅助
 
 ### Task 1: 建立两仓库基线和隔离测试环境
 
@@ -43,8 +43,8 @@
 
 **Interfaces:** Consumes current `BridgeClient::forward_billed`, Core video job store, AI Work `/v1/videos/*`; produces recorded baseline test results and a validated D-drive test root.
 
-- [ ] **Step 1: 验证两仓库工作树、远端和相关入口。** 在各仓库运行 `git status --short`, `git remote -v`, `rg -n 'seedance_stream_unsupported|fn video_task|fn video_content' ...`，记录基线 SHA；若有未提交用户变更，先保留并避让。
-- [ ] **Step 2: 设置 D 盘任务专属环境。** PowerShell 示例：
+- [x] **Step 1: 验证两仓库工作树、远端和相关入口。** 在各仓库运行 `git status --short`, `git remote -v`, `rg -n 'seedance_stream_unsupported|fn video_task|fn video_content' ...`，记录基线 SHA；若有未提交用户变更，先保留并避让。
+- [x] **Step 2: 设置 D 盘任务专属环境。** PowerShell 示例：
 
 ```powershell
 $validation = 'D:\gpt\seedance-stream-validation-20260924'
@@ -57,8 +57,10 @@ $env:RUSTUP_HOME = "$validation\rustup"
 $env:CARGO_TARGET_DIR = "$validation\target"
 ```
 
-- [ ] **Step 3: 只运行现有定向 Mock 测试并记录基线。** Core：`cargo test --manifest-path starlink-dimension-router/Cargo.toml --test video_billing --offline --locked`；AI Work：`cargo test --manifest-path src-tauri/Cargo.toml seedance_chat --offline --locked`。若离线依赖缺失，先报告缺失，不让 Cargo 自动把缓存写回 C 盘。
-- [ ] **Step 4: 记录可用代理/负载均衡器的读超时、缓冲配置。** 只检查配置，不修改线上；若单个 SSE 连接不可能覆盖视频最长时长，在 Task 3 中明确“超时后后台继续 + 可恢复查询”，不宣称保持到完成。
+- [x] **Step 3: 只运行现有定向 Mock 测试并记录基线。** Core：`cargo test --manifest-path starlink-dimension-router/Cargo.toml --test video_billing --offline --locked`；AI Work：`cargo test --manifest-path src-tauri/Cargo.toml seedance_chat --offline --locked`。若离线依赖缺失，先报告缺失，不让 Cargo 自动把缓存写回 C 盘。
+- [x] **Step 4: 记录可用代理/负载均衡器的读超时、缓冲配置。** 只检查配置，不修改线上；若单个 SSE 连接不可能覆盖视频最长时长，在 Task 3 中明确“超时后后台继续 + 可恢复查询”，不宣称保持到完成。
+
+- [x] **Step 5: 对齐线上桥接路由与 AI Work 仓库基线。** 只读探测发现线上桥接路径受保护但 GitHub 主分支缺少路由注册，同时 AI Work 主分支存在 Rust 编译错误。发布前必须先补齐并验证仓库基线，不能用不可构建源码覆盖线上桥接。
 
 **Acceptance:** 基线与失败项有记录，测试 I/O 全在 D 盘，未触达真实上游。
 
@@ -71,9 +73,9 @@ $env:CARGO_TARGET_DIR = "$validation\target"
 
 **Interfaces:** Produces `pub(crate) enum VideoStreamEvent { Progress(String), Completed { task_id: String, content_url: String, request_id: String }, Failed { code: String, request_id: String } }` and `pub(crate) fn encode_event(id: &str, event: VideoStreamEvent) -> Vec<u8>`; Core route consumes it in Task 3. Keep-alive encoder is `pub(crate) fn keep_alive() -> &'static [u8]`.
 
-- [ ] **Step 1: 先写失败测试。** 断言 `encode_event` 的 `object` 是 `chat.completion.chunk`，`choices[0].delta.content` 有用户可见结果；`Completed` 包含完整 HTTPS 内容地址但不包含 Bridge Secret；`Failed` 绝不包含成功字样；终态只发一次 `[DONE]`；心跳是 `: keep-alive\n\n`。将 HTTP fixture 留到 Task 3，与路由实现同一提交。
-- [ ] **Step 2: 跑新测试确认因缺少行为失败。** `cargo test --manifest-path starlink-dimension-router/Cargo.toml --test seedance_stream --offline --locked`；预期失败在新编码器不存在，而非 fixture 缺依赖。
-- [ ] **Step 3: 编写最小编码器。** 结构示例（序列化必须用 `serde_json::json!`，不要拼接用户文字）：
+- [x] **Step 1: 先写失败测试。** 断言 `encode_event` 的 `object` 是 `chat.completion.chunk`，`choices[0].delta.content` 有用户可见结果；`Completed` 包含完整 HTTPS 内容地址但不包含 Bridge Secret；`Failed` 绝不包含成功字样；终态只发一次 `[DONE]`；心跳是 `: keep-alive\n\n`。将 HTTP fixture 留到 Task 3，与路由实现同一提交。
+- [x] **Step 2: 跑新测试确认因缺少行为失败。** `cargo test --manifest-path starlink-dimension-router/Cargo.toml --test seedance_stream --offline --locked`；预期失败在新编码器不存在，而非 fixture 缺依赖。
+- [x] **Step 3: 编写最小编码器。** 结构示例（序列化必须用 `serde_json::json!`，不要拼接用户文字）：
 
 ```rust
 pub(crate) fn keep_alive() -> &'static [u8] { b": keep-alive\n\n" }
@@ -82,7 +84,7 @@ fn frame(value: serde_json::Value) -> Vec<u8> {
 }
 ```
 
-- [ ] **Step 4: 跑编码器单测。** 测试通过后提交编码器及测试，不提交测试缓存。
+- [x] **Step 4: 跑编码器单测。** 测试通过后提交编码器及测试，不提交测试缓存。
 
 **Acceptance:** SSE 帧可被通用 Chat SSE 解析器读取；所有文案与链接来自验证过的状态，输出无密钥。
 
@@ -96,9 +98,9 @@ fn frame(value: serde_json::Value) -> Vec<u8> {
 
 **Interfaces:** Consumes Task 2 `VideoStreamEvent/encode_event/keep_alive`; continues using `BridgeClient::forward_billed("POST", "/v1/chat/completions", ...)`, existing `reconcile_video_job_once`, `/v1/videos/{task_id}` and `/content`. Produces `stream_seedance_video_response(state: Arc<StarlinkRouterState>, principal: Principal, job_id: String, request_id: String) -> Response` after task acceptance.
 
-- [ ] **Step 1: 增加 Mock 失败测试。** `stream=true` + 合法视频权限/幂等键/参考图应只调用一次 `forward_billed`，上游请求体强制 `"stream":false`；核对报价 `request_fingerprint` 与桥接对请求体的校验仍一致；queued/running 产生心跳，completed + 可读产物 + 真实最终回执才输出成功终帧和 `[DONE]`；failed、unknown、回执不明、产物 404 分别输出非成功结果。`stream=false` 仍返回 202，不同 Key 的任务读取 404。
-- [ ] **Step 2: 运行失败测试。** `cargo test --manifest-path starlink-dimension-router/Cargo.toml --test seedance_stream --offline --locked`，确认是当前 400 或缺少 SSE 生命周期行为。
-- [ ] **Step 3: 最小改动路由。** 先鉴权并做原有视频准入/额度预占；`seedance && stream` 时，仅对桥接副本改为 `stream=false`，保留原请求哈希与 `Idempotency-Key` 的归属。若 AI Work 实际校验转发体与报价指纹，必须明确升级桥接 quote/投影协议并同时测试，不能绕过校验；拿到 task ID 后持久化 job，再创建观察 SSE。不得在 AI Work 上再次用 `stream=true` 调用旧入口；不要把视频任务作为普通文字 `stream_chat_response` 处理。
+- [x] **Step 1: 增加 Mock 失败测试。** 覆盖 `stream=true` 图片参考、桥接只提交一次且 `stream=false`、成功需任务/真实回执/HEAD 产物共同确认、未确认回执与内容 404 均不能成功、缺幂等键不发上游、`stream=false` 维持 202、不同 Key 不能读取。详见 `D:\gpt\seedance-stream-validation-20260924\logs\task-3-red.log`。
+- [x] **Step 2: 运行失败测试。** 原始行为按预期失败：成功流返回 400、缺幂等键无错误码、未知回执缺非成功终帧、同用户第二 Key 可读视频。记录于 task-3-red.log。
+- [x] **Step 3: 最小改动路由。** Seedance 只在桥接副本设置 `stream=false`，保留原始 body 的 request fingerprint 和 Idempotency-Key；持久化上游 task 后建立受限 SSE 观察器。成功需真实回执结算后 HEAD 内容确认。普通 Key、桥接密钥不进入 SSE URL。
 
 ```rust
 let client_wants_stream = seedance
@@ -108,12 +110,12 @@ if client_wants_stream {
 }
 ```
 
-- [ ] **Step 4: 将观察器与 HTTP 生命周期解耦。** 每任务唯一的后台状态观察由持久化 job 与现有 reconciler 驱动；SSE 只订阅状态、限制观察者数量及内存队列，发送失败不触发取消/退款/重试。心跳频率和最长等待低于已测代理限制；超时返回非成功终帧与 `request_id`，后台继续运行。
-- [ ] **Step 5: 跑定向测试并提交。** 包括“断开 SSE 后任务仍可查询”“同幂等键只提交一次”“`stream=false` 原 202 未变”“图片归属不串 Key”。
+- [x] **Step 4: 将观察器与 HTTP 生命周期解耦。** SSE 观察单任务仅限 1 个、全局最多 128 个；轮询与 10 秒心跳通过 SSE 推送，最长等待 14 分钟。连接断开不撤销持久化 job，现有后台 reconciler 继续查询。
+- [x] **Step 5: 跑定向测试。** 最终 `seedance_stream` 为 12/12，通过幂等续接、两笔回执分开入账、图片仅给 Seedance 和未知辅助回执不提交视频。结果见 `D:\gpt\seedance-stream-validation-20260924\logs\seedance-stream-billing-green.log`。全量回归与发布仍待后续任务。
 
 **Acceptance:** Core 流式入口不再出现 `seedance_stream_unsupported`；成功终帧只在实际任务与可信回执都就绪时出现。
 
-### Task 4: 故障恢复、代理约束与第一阶段端到端 Mock
+### Task 4: 故障恢复、代理约束与端到端 Mock
 
 **Files:**
 - Extend: `Trae-core/starlink-dimension-router/tests/seedance_stream.rs`, `tests/video_billing.rs`
@@ -122,14 +124,16 @@ if client_wants_stream {
 
 **Interfaces:** Uses Task 3 persistent job/observer; no new public endpoint.
 
-- [ ] **Step 1: 先写重启与故障测试。** 服务重启后的 job 仍可由原 Key 查询；上游已接受但 task ID 丢失维持 `reconcile_required`；真实回执重复只结算一次；完成任务但下载内容不可读不发成功；同一请求的重放不得再发上游。
-- [ ] **Step 2: 跑失败测试，再补最小恢复代码。** 必须依据持久化 job 恢复观察，不能在内存广播器丢失后自动重新提交。Mock 中插入客户端断线、桥接超时、服务重启三个注入点。
-- [ ] **Step 3: 验证 SSE HTTP 头与代理。** 断言 `content-type=text/event-stream`、`cache-control=no-cache`、`x-accel-buffering=no`；在本地代理 fixture 验证心跳不会被缓冲。线上代理超时若低于生成上限，文档和终帧必须说明按 request ID 恢复查询。
-- [ ] **Step 4: 跑 Core 全量离线测试和 AI Work 现有 Seedance 测试。** `cargo test --manifest-path src-core/Cargo.toml --offline --locked`；`cargo test --manifest-path starlink-dimension-router/Cargo.toml --offline --locked`；AI Work 同步运行定向 `seedance_chat` 测试。提交第一阶段可独立发布的代码。
+- [x] **Step 1: 写故障测试。** 覆盖幂等重连、客户端断开后台继续、不同 Key 读隔离、未知视频回执/缺少 MP4 不发成功，以及辅助回执不明时不提交视频。
+- [x] **Step 2: 验证父子账务。** schema v22 持久化同 Key 父子关系；测试分别核验助手与视频 request ID、真实 receipt 和精确余额；未知助手回执保留 hold，释放未提交视频额度。
+- [x] **Step 3: 验证 SSE HTTP 头和代理设置。** 测试断言 `text/event-stream`、`cache-control=no-cache, no-transform`、`x-accel-buffering=no`；线上 Nginx 关闭缓冲且 10 秒心跳可穿透。
+- [x] **Step 4: 跑 Core 完整离线测试。** `src-core` 与 `starlink-dimension-router` 完整测试均通过；输出保存在 `D:\gpt\seedance-stream-validation-20260924\logs\core-src-core-full-final.log` 与 `core-router-full-final.log`。随后进入 GitHub、服务器部署和一次真实公网验收。
 
 **Acceptance:** 客户端断开或代理超时不改变视频与账本状态；无真实请求、无伪成功。
 
-## 第二阶段：可关闭的 DeepSeek 辅助与真实子回执
+## 原计划 AI Work 改造阶段（已被 Core 实现路径取代）
+
+> 实施中复核发现：公网运行的 AI Work 桥接路由在当前 GitHub `main` 源码中不存在，直接编译部署会覆盖线上功能。本次改为由 Core 通过已存在的 AI Work Chat 桥接完成提示词辅助与独立结算，所以本节原 Task 5–7 的 AI Work 文件改动、可关闭开关和复合回执协议均不再执行。对应 Core 实现与测试已纳入 Task 3/4；AI Work 主机二进制本次不构建、不替换。
 
 ### Task 5: 确认模型 ID、辅助配置和纯文本结构化接口
 
@@ -141,7 +145,7 @@ if client_wants_stream {
 
 **Interfaces:** Produces `AssistSettings { enabled: bool, model_id: String, timeout_ms: u64, max_output_bytes: usize, version: u32 }`, `AssistDraft { prompt: String, duration: Option<u32>, resolution: Option<String>, ratio: Option<String> }`, and `merge_explicit_video_fields(original: &serde_json::Value, draft: AssistDraft) -> Result<serde_json::Value, SeedanceChatError>`. No network call in this task.
 
-- [ ] **Step 1: 用 AI Work 当前模型目录和桥接 `/internal/bridge/models` 核验目标 ID。** 若仅见 `deepseek-v4-flash`，明确在配置中标记“V4.1 未确认”，功能保持 `enabled=false`。不得将显示名当 API ID。
+- [ ] **Step 1: 用 AI Work 当前模型目录和桥接 `/internal/bridge/models` 核验目标 ID。** DeepSeek 官方 ID 是 `deepseek-flash`，当前仓库预设 `deepseek-v4-flash`；由于 AI Work 通过自己的账号池转发，不直接等价于官方端点，只有真实 AI Work 目录确认并经 Mock 路由测试后才能启用；若不接受官方 ID，配置其明确目录映射，不能只改显示名。
 - [ ] **Step 2: 先写纯函数失败测试。** 用户明确给的 `duration=5`、`ratio=16:9`、素材 ID 不被模型输出覆盖；模型输出过长、非法枚举、空提示词一律拒绝；原始图片字节与 data URL 不进入辅助输入。
 - [ ] **Step 3: 跑失败测试。** `cargo test --manifest-path src-tauri/Cargo.toml seedance_assist --offline --locked`，确认失败原因是新结构化接口缺失。
 - [ ] **Step 4: 实现并保存配置。** 复用 `gateway_settings.rs` 的原子配置保存约定；默认 `enabled=false`，`model_id` 只能填实测可用 ID。对普通 API 用户不开放修改。参数合并核心代码：
@@ -240,7 +244,7 @@ pub(crate) async fn prepare_video_input(
 
 **Acceptance:** 开关关闭时与第一阶段完全一致；开关开启时按指定可用模型只调一次，最终视频结果与真实积分都可追踪。
 
-### Task 8: 客户端矩阵、发布、回滚与真实验收准备
+### Task 8: 测试、GitHub 发布、服务器部署与真实验收
 
 **Files:**
 - Create: `Trae-core/docs/seedance-client-compatibility.md`（实测矩阵和配置示例）
@@ -251,9 +255,9 @@ pub(crate) async fn prepare_video_input(
 
 - [ ] **Step 1: Mock 客户端矩阵。** 覆盖 Chat SSE 解析器、参考图 data URL、`/v1/assets`、`Idempotency-Key` 可配置性；Codex/Claude Code 的 MCP 自动保存工作区能力单列，Trae Work CN/Qoder Work/WorkBuddy/DeepSeek harness 逐个标注“仅可读 URL”或“可调用本地下载工具”，不能凭多模态输入能力推断文件写入能力。
 - [ ] **Step 2: 加无头客户端测试。** `model=seedance` + `stream=true` + 无 `Idempotency-Key` 仍返回明确 400，不发送上游；文档给出 MCP 或客户端自定义头解决方式。
-- [ ] **Step 3: 按兼容顺序准备发布。** 先发布 AI Work 可读取旧非流式提交/状态/内容的版本，再发布 Core 第一阶段；第二阶段独立配置开启。发布前备份配置与账本，确认代理不缓冲 SSE、心跳可穿透、下载地址公开域名正确、视频计费闸门健康。
-- [ ] **Step 4: 限流灰度与回滚演练。** 先仅允许测试 Key；发现 SSE 异常关闭 Core 流式功能标志，保留已创建视频任务与 hold；发现辅助异常关闭 `AssistSettings.enabled`，不删除任何子回执。检查旧 `stream=false` 及普通文字模型。
-- [ ] **Step 5: 书面列出真实验收请求。** 需用户另外明确批准消耗多少真实积分、使用哪个测试 Key 与是否保存产物；获批后只做 1 次小额度公网生成，并对照父/子 request ID、AI Work 原始回执、Core 实际扣分、Key 余额及 MP4 下载结果。未获批不发送。
+- [ ] **Step 3: 发布前确认远端与线上文件。** 测试通过后提交并推送 Core；检查 GitHub 远端无并行改动。只备份并替换已确认的 Core 发布文件，不覆盖未知目录、数据库或 AI Work 线上二进制。
+- [ ] **Step 4: 先部署 Core，再做 1 次真实公网生成。** 使用现有“周”Key，先查余额与计费闸门，不新建 Key、不改额度。线上闸门当前为“已暂停”；若必须登记精确到 Key 与请求哈希的一次性诊断放行，提交前先向用户确认。核验辅助、视频两笔真实回执、Core 实际扣分、Key 余额与 MP4 内容地址。结果不明时停止，不自动重试。
+- [ ] **Step 5: 推送对应仓库。** Core 推送 `Trae-core`；只有确认 AI Work 源码改动必要且测试通过时才独立推 `trae-maker`；不得混推 MCP 仓库。本次预期只发布 Core。
 
 **Acceptance:** 两阶段各有可回滚开关、测试记录和客户端能力表；不会向用户宣称“所有客户端自动下载”。
 
@@ -262,4 +266,4 @@ pub(crate) async fn prepare_video_input(
 - [ ] 逐条对照规格：流式成功/失败、视频素材、权限隔离、真实积分、断线恢复、辅助模型 ID、工作区保存边界都有测试和运维说明。
 - [ ] 在 D 盘运行所有相关定向/全量 Mock 测试，保存结果摘要；检查 `git diff --check`、密钥扫描、构建产物路径与两仓库 `git status --short`。
 - [ ] 测试完成后仅清理本轮任务专属 D 盘临时测试目录（确认绝对路径与是否仍被进程占用）；浅克隆源码与文档保留给用户审阅。
-- [ ] 用户确认后再执行代码改造；生产发布与真实积分验收需分别确认。文档完成本身不等于功能已上线。
+- [ ] 真实回执与视频内容均经核验后，再把该计划标记完成。Mock 通过或源码推送不等于已公网部署。

@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, HashMap}, io, pin::Pin, sync::Arc, task::{Context, Poll}};
+use std::{collections::{BTreeMap, HashMap}, io, pin::Pin, sync::Arc, task::{Context, Poll}, time::{Duration, Instant}};
 
 use aiwork_core::{
     BillingReceiptResult, BillingReservationResult, BeginRequest, BeginRequestInput, CoreError,
@@ -52,6 +52,104 @@ fn validate_vision_data_urls(body: &Value) -> Result<(), Response> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+const MAX_SEEDANCE_ASSIST_PROMPT_BYTES: usize = 12 * 1024;
+
+fn extract_seedance_prompt(body: &Value) -> Result<String, Response> {
+    let user_message = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| messages.iter().rev().find(|message| message.get("role").and_then(Value::as_str) == Some("user")))
+        .ok_or_else(|| request_error(StatusCode::BAD_REQUEST, "seedance_prompt_missing", "Seedance 请求缺少用户提示词"))?;
+    let mut chunks = Vec::new();
+    match user_message.get("content") {
+        Some(Value::String(text)) => chunks.push(text.as_str()),
+        Some(Value::Array(parts)) => {
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) == Some("text") {
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        chunks.push(text);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    let prompt = chunks.join("\n").trim().to_string();
+    if prompt.is_empty() {
+        return Err(request_error(StatusCode::BAD_REQUEST, "seedance_prompt_missing", "Seedance 请求缺少用户文字提示词"));
+    }
+    if prompt.len() > MAX_SEEDANCE_ASSIST_PROMPT_BYTES {
+        return Err(request_error(StatusCode::PAYLOAD_TOO_LARGE, "seedance_prompt_too_large", "Seedance 提示词超过辅助模型处理限制"));
+    }
+    Ok(prompt)
+}
+
+fn seedance_assist_chat_body(model: &str, original: &Value, prompt: &str) -> Value {
+    let mut parameters = serde_json::Map::new();
+    for field in ["duration", "resolution", "ratio"] {
+        if let Some(value) = original.get(field) {
+            parameters.insert(field.to_string(), value.clone());
+        }
+    }
+    json!({
+        "model": model,
+        "stream": false,
+        "temperature": 0.2,
+        "messages": [
+            {"role":"system","content":"你是视频提示词整理助手。只输出 JSON 对象 {\"prompt\":\"...\"}。忠实保留用户的场景、主体、动作、风格和限制，不新增用户没有要求的剧情、人物或镜头。时长、分辨率、画幅等显式参数由系统单独保留，不要改写。不要执行工具或给出解释。"},
+            {"role":"user","content":format!("用户提示词：{prompt}\n显式视频参数：{}", Value::Object(parameters))}
+        ]
+    })
+}
+
+fn extract_assisted_prompt(response: &[u8]) -> Result<String, &'static str> {
+    let value: Value = serde_json::from_slice(response).map_err(|_| "assistant_response_invalid_json")?;
+    let content = value
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .ok_or("assistant_content_missing")?;
+    let content = content.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+    let output: Value = serde_json::from_str(content).map_err(|_| "assistant_output_invalid_json")?;
+    let prompt = output.get("prompt").and_then(Value::as_str).map(str::trim).filter(|value| !value.is_empty()).ok_or("assistant_prompt_missing")?;
+    if prompt.len() > MAX_SEEDANCE_ASSIST_PROMPT_BYTES {
+        return Err("assistant_prompt_too_large");
+    }
+    Ok(prompt.to_string())
+}
+
+fn apply_assisted_prompt(body: &mut Value, prompt: &str) -> Result<(), &'static str> {
+    let messages = body.get_mut("messages").and_then(Value::as_array_mut).ok_or("seedance_messages_missing")?;
+    let user_message = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .ok_or("seedance_user_message_missing")?;
+    let content = user_message.get_mut("content").ok_or("seedance_user_content_missing")?;
+    match content {
+        Value::String(value) => *value = prompt.to_string(),
+        Value::Array(parts) => {
+            let mut replaced = false;
+            parts.retain_mut(|part| {
+                if part.get("type").and_then(Value::as_str) != Some("text") {
+                    return true;
+                }
+                if !replaced {
+                    part["text"] = Value::String(prompt.to_string());
+                    replaced = true;
+                    true
+                } else {
+                    false
+                }
+            });
+            if !replaced {
+                parts.insert(0, json!({"type":"text","text":prompt}));
+            }
+        }
+        _ => return Err("seedance_user_content_unsupported"),
     }
     Ok(())
 }
@@ -610,6 +708,92 @@ fn settle_chat_response(state: &StarlinkRouterState, request_id: &str) -> bool {
     )
 }
 
+fn run_seedance_assist(
+    state: &StarlinkRouterState,
+    principal: &Principal,
+    parent_request_id: &str,
+    original: &Value,
+) -> Result<String, Response> {
+    let prompt = extract_seedance_prompt(original)?;
+    let model = if state.config.default_model.trim().is_empty() || is_seedance_model(&state.config.default_model) {
+        "deepseek-v4-flash"
+    } else {
+        state.config.default_model.trim()
+    };
+    let assist_body = seedance_assist_chat_body(model, original, &prompt);
+    let assist_idempotency = format!("{parent_request_id}:seedance-assist-v1");
+    let request = match begin_billed_request(
+        &state.store,
+        principal,
+        "chat",
+        model,
+        assist_idempotency,
+        &assist_body,
+    ) {
+        Ok(BeginRequest::Created(request)) => request,
+        Ok(BeginRequest::Existing(_)) => return Err(request_error(
+            StatusCode::CONFLICT,
+            "seedance_assist_already_processed",
+            "该请求的提示词辅助步骤已处理，已阻止重复调用",
+        )),
+        Ok(BeginRequest::Conflict) => return Err(request_error(
+            StatusCode::CONFLICT,
+            "seedance_assist_idempotency_conflict",
+            "提示词辅助请求与已有请求冲突",
+        )),
+        Err(response) => return Err(response),
+    };
+    let child_request_id = request.id.clone();
+    state.store.link_seedance_assist_request(parent_request_id, &child_request_id)
+        .map_err(|error| request_error(StatusCode::INTERNAL_SERVER_ERROR, "request_relation_failed", error.to_string()))?;
+    let (quote_id, reservation_id) = quote_and_reserve(state, &child_request_id, "chat", model)?;
+    if let Err(error) = mark_request_dispatched(state, &child_request_id) {
+        release_before_dispatch(state, principal, &reservation_id, 500, "request_state_transition_failed");
+        return Err(request_error(StatusCode::INTERNAL_SERVER_ERROR, "core_error", error));
+    }
+    let body = serde_json::to_vec(&assist_body).unwrap_or_default();
+    let headers = BTreeMap::from([("content-type".into(), "application/json".into())]);
+    let upstream = state.bridge.lock().unwrap_or_else(|error| error.into_inner()).forward_billed(
+        "POST",
+        "/v1/chat/completions",
+        &body,
+        &headers,
+        &child_request_id,
+        &quote_id,
+    );
+    let response = match upstream {
+        Ok(response) => response,
+        Err(error) => {
+            mark_request_unknown(state, &child_request_id, "seedance_assist_result_unknown");
+            let settled = matches!(
+                reconcile_billing_request_once(state, &child_request_id),
+                Ok(result) if receipt_is_settled(&result)
+            );
+            return if settled {
+                Err(request_error(StatusCode::BAD_GATEWAY, "seedance_assist_result_unavailable", format!("DeepSeek 辅助请求结果不可用；request_id={child_request_id}。{error}")))
+            } else {
+                Err(reconcile_required(&child_request_id))
+            };
+        }
+    };
+    if !(200..300).contains(&response.status) {
+        if settle_chat_response(state, &child_request_id) {
+            return Err(request_error(StatusCode::BAD_GATEWAY, "seedance_assist_upstream_error", format!("DeepSeek 辅助请求返回 HTTP {}；request_id={child_request_id}", response.status)));
+        }
+        return Err(reconcile_required(&child_request_id));
+    }
+    if !settle_chat_response(state, &child_request_id) {
+        return Err(reconcile_required(&child_request_id));
+    }
+    extract_assisted_prompt(&response.body).map_err(|code| {
+        request_error(
+            StatusCode::BAD_GATEWAY,
+            "seedance_assist_invalid_response",
+            format!("DeepSeek 辅助结果无法解析（{code}）；request_id={child_request_id}"),
+        )
+    })
+}
+
 struct BridgeBodyStream(tokio::sync::mpsc::Receiver<Result<Bytes, io::Error>>);
 
 impl Stream for BridgeBodyStream {
@@ -721,6 +905,180 @@ fn send_stream_bytes(
     }
 }
 
+fn stream_seedance_video_response(
+    state: Arc<StarlinkRouterState>,
+    principal: Principal,
+    job_id: String,
+) -> Response {
+    const MAX_OBSERVERS: usize = 128;
+    const MAX_WAIT: Duration = Duration::from_secs(14 * 60);
+    const POLL_INTERVAL: Duration = Duration::from_secs(2);
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+    let job = match state.jobs.lock().unwrap_or_else(|error| error.into_inner()).get(&job_id).cloned() {
+        Some(job) if job.user_id == principal.user_id && job.api_key_id == principal.key_id => job,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    {
+        let mut observers = state.video_stream_observers.lock().unwrap_or_else(|error| error.into_inner());
+        if observers.contains(&job_id) {
+            return request_error(StatusCode::CONFLICT, "stream_already_observed", "该视频任务已有一个流式观察连接；可用同一 Key 查询任务状态");
+        }
+        if observers.len() >= MAX_OBSERVERS {
+            return request_error(StatusCode::TOO_MANY_REQUESTS, "stream_observer_limit", "当前流式观察连接已达上限");
+        }
+        observers.insert(job_id.clone());
+    }
+
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let mut response = Response::new(Body::from_stream(BridgeBodyStream(receiver)));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert("content-type", "text/event-stream; charset=utf-8".parse().unwrap());
+    response.headers_mut().insert("cache-control", "no-cache, no-transform".parse().unwrap());
+    response.headers_mut().insert("x-accel-buffering", "no".parse().unwrap());
+    response.headers_mut().insert("x-content-type-options", "nosniff".parse().unwrap());
+
+    let stream_state = state.clone();
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let mut last_heartbeat = Instant::now();
+        let mut last_status = String::new();
+        let initial = crate::seedance_sse::encode_event(
+            &job.request_id,
+            crate::seedance_sse::VideoStreamEvent::Progress("视频任务已提交，正在生成".into()),
+        );
+        if sender.send(Ok(Bytes::from(initial))).await.is_err() {
+            stream_state.video_stream_observers.lock().unwrap_or_else(|error| error.into_inner()).remove(&job_id);
+            return;
+        }
+
+        loop {
+            if started.elapsed() >= MAX_WAIT {
+                let terminal = crate::seedance_sse::encode_event(
+                    &job.request_id,
+                    crate::seedance_sse::VideoStreamEvent::Failed {
+                        code: "stream_wait_timeout".into(),
+                        request_id: job.request_id.clone(),
+                    },
+                );
+                let _ = sender.send(Ok(Bytes::from(terminal))).await;
+                break;
+            }
+
+            let poll_state = stream_state.clone();
+            let poll_job_id = job_id.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = reconcile_video_job_once(&poll_state, &poll_job_id);
+            }).await;
+
+            let current = stream_state.jobs.lock().unwrap_or_else(|error| error.into_inner()).get(&job_id).cloned();
+            let Some(current) = current else {
+                let terminal = crate::seedance_sse::encode_event(
+                    &job.request_id,
+                    crate::seedance_sse::VideoStreamEvent::Failed {
+                        code: "video_job_missing".into(),
+                        request_id: job.request_id.clone(),
+                    },
+                );
+                let _ = sender.send(Ok(Bytes::from(terminal))).await;
+                break;
+            };
+
+            if current.billing_state == "settled" || current.billing_state == "released" {
+                let completed = matches!(current.status.as_str(), "completed" | "succeeded" | "success");
+                if completed && current.billing_state == "settled" {
+                    let content_path = format!("/v1/videos/{}/content", current.upstream_id.as_deref().unwrap_or(&current.id));
+                    let content_state = stream_state.clone();
+                    let request_id = current.request_id.clone();
+                    let probe = tokio::task::spawn_blocking(move || {
+                        content_state.bridge.lock().unwrap_or_else(|error| error.into_inner()).forward(
+                            "HEAD", &content_path, &[], &BTreeMap::new(), &request_id,
+                        )
+                    }).await;
+                    match probe {
+                        Ok(Ok(content)) if (200..300).contains(&content.status) => {
+                            let public_base = stream_state.config.public_base_url.trim().trim_end_matches('/');
+                            let content_url = if public_base.is_empty() {
+                                format!("/v1/videos/{}/content", current.id)
+                            } else {
+                                format!("{public_base}/v1/videos/{}/content", current.id)
+                            };
+                            let terminal = crate::seedance_sse::encode_event(
+                                &current.request_id,
+                                crate::seedance_sse::VideoStreamEvent::Completed {
+                                    task_id: current.id.clone(),
+                                    content_url,
+                                    request_id: current.request_id.clone(),
+                                },
+                            );
+                            let _ = sender.send(Ok(Bytes::from(terminal))).await;
+                        }
+                        _ => {
+                            let terminal = crate::seedance_sse::encode_event(
+                                &current.request_id,
+                                crate::seedance_sse::VideoStreamEvent::Failed {
+                                    code: "video_content_unavailable".into(),
+                                    request_id: current.request_id.clone(),
+                                },
+                            );
+                            let _ = sender.send(Ok(Bytes::from(terminal))).await;
+                        }
+                    }
+                } else {
+                    let terminal = crate::seedance_sse::encode_event(
+                        &current.request_id,
+                        crate::seedance_sse::VideoStreamEvent::Failed {
+                            code: current.error_code.clone().unwrap_or_else(|| "video_generation_failed".into()),
+                            request_id: current.request_id.clone(),
+                        },
+                    );
+                    let _ = sender.send(Ok(Bytes::from(terminal))).await;
+                }
+                break;
+            }
+
+            if current.reconcile_required || current.billing_state == "reconcile_required" {
+                let terminal = crate::seedance_sse::encode_event(
+                    &current.request_id,
+                    crate::seedance_sse::VideoStreamEvent::Failed {
+                        code: current.error_code.clone().unwrap_or_else(|| "billing_reconcile_required".into()),
+                        request_id: current.request_id.clone(),
+                    },
+                );
+                let _ = sender.send(Ok(Bytes::from(terminal))).await;
+                break;
+            }
+
+            if current.status != last_status {
+                last_status = current.status.clone();
+                let message = match current.status.as_str() {
+                    "queued" => "视频任务排队中".to_string(),
+                    "running" | "processing" => "视频正在生成".to_string(),
+                    _ => "视频任务处理中".to_string(),
+                };
+                let progress = crate::seedance_sse::encode_event(
+                    &current.request_id,
+                    crate::seedance_sse::VideoStreamEvent::Progress(message),
+                );
+                if sender.send(Ok(Bytes::from(progress))).await.is_err() {
+                    break;
+                }
+            }
+
+            if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                if sender.send(Ok(Bytes::from_static(crate::seedance_sse::keep_alive()))).await.is_err() {
+                    break;
+                }
+                last_heartbeat = Instant::now();
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+
+        stream_state.video_stream_observers.lock().unwrap_or_else(|error| error.into_inner()).remove(&job_id);
+    });
+    response
+}
+
 pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, headers: HeaderMap, Extension(principal): Extension<Principal>, body: Bytes) -> Response {
     let value: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
@@ -728,8 +1086,9 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
     };
     let model = value.get("model").and_then(Value::as_str).unwrap_or(&state.config.default_model).to_string();
     let seedance = is_seedance_model(&model);
-    if seedance && value.get("stream").and_then(Value::as_bool).unwrap_or(false) {
-        return request_error(StatusCode::BAD_REQUEST, "seedance_stream_unsupported", "Seedance Chat 兼容入口暂不支持 stream=true，请使用非流式请求");
+    let seedance_stream = seedance && value.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if seedance_stream && headers.get("idempotency-key").and_then(|value| value.to_str().ok()).is_none_or(|value| value.trim().is_empty()) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": {"type": "invalid_request_error", "code": "idempotency_key_required", "message": "Seedance 流式请求必须提供 Idempotency-Key，确保断线重连不会重复生成或扣费"}}))).into_response();
     }
     if let Err(response) = authorize_scope(&principal, if seedance { "videos:submit" } else { "chat:invoke" }) { return response; }
     if seedance {
@@ -750,7 +1109,12 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
         Ok(BeginRequest::Conflict) => return (StatusCode::CONFLICT, Json(json!({"error": {"type": "idempotency_conflict", "message": "Idempotency-Key 与历史请求内容不一致"}}))).into_response(),
         Ok(BeginRequest::Existing(request)) => {
             if seedance {
-                let job = state.jobs.lock().unwrap().values().find(|job| job.request_id == request.id && job.user_id == principal.user_id).cloned();
+                let job = state.jobs.lock().unwrap().values().find(|job| job.request_id == request.id && job.user_id == principal.user_id && job.api_key_id == principal.key_id).cloned();
+                if seedance_stream {
+                    if let Some(job) = job.as_ref() {
+                        return stream_seedance_video_response(state, principal, job.id.clone());
+                    }
+                }
                 if let Some(job) = job.filter(|job| !job.reconcile_required && job.upstream_id.is_some()) {
                     return Json(json!({"task": {"id": job.id, "status": job.status}, "core_replay": true})).into_response();
                 }
@@ -765,8 +1129,8 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
         Err(response) => return response,
     };
     let mut forward_value = value;
-    let has_asset_ids = forward_value.get("image_asset_ids").is_some() || forward_value.get("video_asset_ids").is_some();
     if seedance {
+        let has_asset_ids = forward_value.get("image_asset_ids").is_some() || forward_value.get("video_asset_ids").is_some();
         if has_asset_ids {
             if let Err(response) = materialize_bridge_assets(&state, &principal, &mut forward_value, &request_id).await {
                 release_before_dispatch(&state, &principal, &reservation_id, response.status().as_u16(), "asset_materialization_failed");
@@ -777,7 +1141,22 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
             release_before_dispatch(&state, &principal, &reservation_id, response.status().as_u16(), "vision_input_invalid");
             return response;
         }
-    } else {
+        let assisted_prompt = match run_seedance_assist(&state, &principal, &request_id, &forward_value) {
+            Ok(prompt) => prompt,
+            Err(response) => {
+                release_before_dispatch(&state, &principal, &reservation_id, response.status().as_u16(), "seedance_assist_failed");
+                return response;
+            }
+        };
+        if let Err(error) = apply_assisted_prompt(&mut forward_value, &assisted_prompt) {
+            release_before_dispatch(&state, &principal, &reservation_id, 502, "seedance_assist_invalid_response");
+            return request_error(StatusCode::BAD_GATEWAY, "seedance_assist_invalid_response", error);
+        }
+    }
+    if seedance_stream {
+        forward_value["stream"] = Value::Bool(false);
+    }
+    if !seedance {
         if let Err(response) = materialize_text_asset_ids(&state, &principal, &mut forward_value) {
             release_before_dispatch(&state, &principal, &reservation_id, response.status().as_u16(), "vision_input_invalid");
             return response;
@@ -880,6 +1259,9 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
                 };
                 state.jobs.lock().unwrap().insert(task_id.clone(), accepted_video_job(&principal, &request_id, task_id, Some(reservation_id.clone()), extract_upstream_task_status(&value).as_deref().unwrap_or("queued"), None));
                 state.persist_jobs();
+                if seedance_stream {
+                    return stream_seedance_video_response(state, principal, extract_upstream_task_id(&value).unwrap_or_default());
+                }
                 proxy(response.status, response.headers, response.body)
             }
             Ok(response) => {
@@ -1013,7 +1395,7 @@ pub async fn video_generations(State(state): State<Arc<StarlinkRouterState>>, he
 }
 
 pub async fn video_task(State(state): State<Arc<StarlinkRouterState>>, Path(task_id): Path<String>, headers: HeaderMap, Extension(principal): Extension<Principal>) -> Response {
-    let job = match state.jobs.lock().unwrap().get(&task_id).cloned() { Some(job) if job.user_id == principal.user_id => job, Some(_) => return StatusCode::NOT_FOUND.into_response(), None => return StatusCode::NOT_FOUND.into_response() };
+    let job = match state.jobs.lock().unwrap().get(&task_id).cloned() { Some(job) if job.user_id == principal.user_id && job.api_key_id == principal.key_id => job, Some(_) => return StatusCode::NOT_FOUND.into_response(), None => return StatusCode::NOT_FOUND.into_response() };
     let upstream_id = job.upstream_id.as_deref().unwrap_or(&task_id);
     let path = format!("/v1/videos/{upstream_id}");
     let result = state.bridge.lock().unwrap().forward("GET", &path, &[], &header_map(&headers), &job.request_id);
@@ -1037,7 +1419,7 @@ pub async fn video_task(State(state): State<Arc<StarlinkRouterState>>, Path(task
 }
 
 pub async fn video_content(State(state): State<Arc<StarlinkRouterState>>, Path(task_id): Path<String>, headers: HeaderMap, Extension(principal): Extension<Principal>) -> Response {
-    let job = match state.jobs.lock().unwrap().get(&task_id).cloned() { Some(job) if job.user_id == principal.user_id => job, Some(_) => return StatusCode::NOT_FOUND.into_response(), None => return StatusCode::NOT_FOUND.into_response() };
+    let job = match state.jobs.lock().unwrap().get(&task_id).cloned() { Some(job) if job.user_id == principal.user_id && job.api_key_id == principal.key_id => job, Some(_) => return StatusCode::NOT_FOUND.into_response(), None => return StatusCode::NOT_FOUND.into_response() };
     let upstream_id = job.upstream_id.as_deref().unwrap_or(&task_id);
     let path = format!("/v1/videos/{upstream_id}/content");
     match state.bridge.lock().unwrap().forward("GET", &path, &[], &header_map(&headers), &job.request_id) { Ok(response) => proxy(response.status, response.headers, response.body), Err(error) => (StatusCode::BAD_GATEWAY, Json(json!({"error": {"type": "bridge_error", "message": error}}))).into_response() }
@@ -1334,14 +1716,50 @@ fn proxy(status: u16, headers: BTreeMap<String, String>, body: Vec<u8>) -> Respo
 
 #[cfg(test)]
 mod tests {
-    use super::authorize_scope;
+    use super::{apply_assisted_prompt, authorize_scope, extract_assisted_prompt, extract_seedance_prompt, seedance_assist_chat_body};
     use aiwork_core::Principal;
     use std::collections::BTreeSet;
+    use serde_json::json;
 
     #[test]
     fn ordinary_user_scope_is_checked_before_forwarding() {
         let principal = Principal { user_id: "u".into(), key_id: "k".into(), scopes: BTreeSet::from(["chat:invoke".into()]) };
         assert!(authorize_scope(&principal, "videos:submit").is_err());
         assert!(authorize_scope(&principal, "chat:invoke").is_ok());
+    }
+
+    #[test]
+    fn seedance_assist_receives_text_only_and_preserves_reference_image_and_explicit_parameters() {
+        let mut video = json!({
+            "model":"seedance",
+            "duration":5,
+            "resolution":"720p",
+            "ratio":"16:9",
+            "messages":[{"role":"user","content":[
+                {"type":"text","text":"生成一只橘猫"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,private-image-bytes"}}
+            ]}]
+        });
+        let prompt = extract_seedance_prompt(&video).unwrap();
+        assert_eq!(prompt, "生成一只橘猫");
+        let helper = seedance_assist_chat_body("deepseek-v4-flash", &video, &prompt);
+        let helper_text = helper.to_string();
+        assert!(helper_text.contains("deepseek-v4-flash"));
+        assert!(helper_text.contains("720p"));
+        assert!(!helper_text.contains("private-image-bytes"));
+
+        let response = r#"{"choices":[{"message":{"content":"{\"prompt\":\"一只橘猫在窗边自然伸懒腰\"}"}}]}"#;
+        let assisted = extract_assisted_prompt(response.as_bytes()).unwrap();
+        apply_assisted_prompt(&mut video, &assisted).unwrap();
+        assert_eq!(video["duration"], 5);
+        assert_eq!(video["resolution"], "720p");
+        assert_eq!(video["ratio"], "16:9");
+        assert_eq!(video["messages"][0]["content"][0]["text"], assisted);
+        assert_eq!(video["messages"][0]["content"][1]["image_url"]["url"], "data:image/png;base64,private-image-bytes");
+    }
+
+    #[test]
+    fn malformed_seedance_assist_json_fails_closed() {
+        assert!(extract_assisted_prompt(br#"{"choices":[{"message":{"content":"not-json"}}]}"#).is_err());
     }
 }
