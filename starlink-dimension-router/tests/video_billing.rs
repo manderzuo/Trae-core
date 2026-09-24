@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use axum::{body::Body, http::{Request, Response, StatusCode}, Router};
+use axum::{body::{to_bytes, Body}, http::{Request, Response, StatusCode}, Router};
 use serde_json::{json, Value};
 use starlink_dimension_router::{
     bridge_client::{BridgeClient, BridgeResponse, BridgeTransport},
@@ -492,7 +492,7 @@ async fn approved_one_shot_quote_fallback_reserves_the_entire_key_balance_once()
 }
 
 #[tokio::test]
-async fn one_shot_does_not_bypass_unrelated_quote_errors() {
+async fn one_shot_unrelated_quote_error_fails_unreserved_video_request() {
     let fixture = fixture("one-shot-other-quote-error");
     fixture.bridge.set_quote_unavailable(true);
     fixture.bridge.set_quote_unavailable_code("quote_timeout");
@@ -502,8 +502,25 @@ async fn one_shot_does_not_bypass_unrelated_quote_errors() {
 
     let response = post_video(&fixture).await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    let request_id = body["error"]["request_id"].as_str().unwrap();
+    assert_eq!(fixture.store.request_state(request_id).unwrap(), aiwork_core::RequestState::Failed);
     assert_eq!(quota(&fixture).balances[0].held, 0);
     assert_eq!(fixture.bridge.request_count("/v1/videos/generations"), 0);
+}
+
+#[tokio::test]
+async fn active_seedance_chat_without_quote_fails_unreserved_parent_request() {
+    let fixture = fixture("active-seedance-unquoted");
+    fixture.bridge.set_quote_unavailable(true);
+
+    let response = post_seedance_chat(&fixture).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    let request_id = body["error"]["request_id"].as_str().unwrap();
+    assert_eq!(fixture.store.request_state(request_id).unwrap(), aiwork_core::RequestState::Failed);
+    assert_eq!(quota(&fixture).balances[0].held, 0);
+    assert_eq!(fixture.bridge.request_count("/v1/chat/completions"), 0);
 }
 
 #[tokio::test]

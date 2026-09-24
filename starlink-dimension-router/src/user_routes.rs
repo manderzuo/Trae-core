@@ -740,6 +740,27 @@ fn fail_unreserved_pre_dispatch_request(
         .map_err(|error| error.to_string())
 }
 
+fn finish_failed_quote_request(
+    state: &StarlinkRouterState,
+    request_id: &str,
+    response: Response,
+) -> Response {
+    let status = response.status().as_u16();
+    match fail_unreserved_pre_dispatch_request(
+        state,
+        request_id,
+        status,
+        "billing_pre_dispatch_failed",
+    ) {
+        Ok(()) => response,
+        Err(error) => request_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "request_cleanup_failed",
+            format!("请求在付费派发前被拒绝，但状态清理失败：{error}"),
+        ),
+    }
+}
+
 fn mark_request_unknown(state: &StarlinkRouterState, request_id: &str, error_code: &str) {
     if let Ok(current) = state.store.request_state(request_id) {
         if current != RequestState::Unknown {
@@ -1469,12 +1490,12 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
             video_admission == VideoAdmission::DiagnosticClaimed,
         ) {
             Ok(reservation) => reservation,
-            Err(response) => return response,
+            Err(response) => return finish_failed_quote_request(&state, &request_id, response),
         }
     } else {
         match quote_and_reserve(&state, &request_id, endpoint, &model) {
             Ok((quote_id, reservation_id)) => (quote_id, reservation_id, false),
-            Err(response) => return response,
+            Err(response) => return finish_failed_quote_request(&state, &request_id, response),
         }
     };
     if seedance && !assisted_before_reservation {
@@ -1707,7 +1728,7 @@ pub async fn video_generations(State(state): State<Arc<StarlinkRouterState>>, he
         video_admission == VideoAdmission::DiagnosticClaimed,
     ) {
         Ok(reservation) => reservation,
-        Err(response) => return response,
+        Err(response) => return finish_failed_quote_request(&state, &request_id, response),
     };
     let mut forward_value = value;
     let has_asset_ids = forward_value.get("image_asset_ids").is_some() || forward_value.get("video_asset_ids").is_some();

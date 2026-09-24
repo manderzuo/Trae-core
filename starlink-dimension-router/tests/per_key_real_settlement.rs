@@ -479,7 +479,7 @@ fn fixture() -> Fixture {
 }
 
 #[tokio::test]
-async fn unavailable_quote_blocks_paid_chat_before_forwarding_and_never_charges() {
+async fn unavailable_quote_fails_unreserved_chat_request_without_upstream_charge() {
     let fixture = fixture();
     let client_request_id = "client-forged-request-id";
     let idempotency_key = "quote-unavailable-chat";
@@ -551,6 +551,7 @@ async fn unavailable_quote_blocks_paid_chat_before_forwarding_and_never_charges(
         other => panic!("expected persisted Core request, got {other:?}"),
     };
     assert_eq!(request.id, request_id);
+    assert_eq!(fixture.store.request_state(request_id).unwrap(), aiwork_core::RequestState::Failed);
     assert!(fixture.store.reservation_for_request(request_id).unwrap().is_none());
     let principal = fixture.store.authenticate_api_key(&fixture.key).unwrap();
     let quota = fixture
