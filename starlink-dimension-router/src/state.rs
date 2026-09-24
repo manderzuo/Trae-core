@@ -62,6 +62,9 @@ impl StarlinkRouterState {
         store
             .recover_abandoned_seedance_assist_requests()
             .map_err(|error| format!("恢复已结束 Seedance 请求失败: {error}"))?;
+        store
+            .recover_abandoned_pre_dispatch_requests()
+            .map_err(|error| format!("恢复未发送请求失败: {error}"))?;
         let initial_password = std::env::var("STARLINK_ADMIN_INITIAL_PASSWORD").ok();
         ensure_initial_admin_credential(&store, initial_password.as_deref()).map_err(|e| e.to_string())?;
         let jobs = load_jobs(&config.data_dir);

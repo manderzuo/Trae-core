@@ -1100,6 +1100,76 @@ impl CoreStore {
         Ok(recovered)
     }
 
+    /// At startup, free concurrency occupied by old requests that never reached
+    /// reservation or dispatch. A reservation, job, lease, or request relation
+    /// makes the request ineligible; those cases need their normal reconciliation.
+    pub fn recover_abandoned_pre_dispatch_requests(&self) -> Result<usize, CoreError> {
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = Utc::now().timestamp_millis();
+        let cutoff = now.saturating_sub(5 * 60 * 1_000);
+        let candidates = {
+            let mut statement = transaction.prepare(
+                "SELECT request.id, request.state, request.endpoint
+                 FROM requests request
+                 WHERE request.state IN ('received', 'validating')
+                   AND request.updated_at_ms < ?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM quota_reservations reservation
+                     WHERE reservation.request_id = request.id
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM jobs job WHERE job.request_id = request.id
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM upstream_leases lease WHERE lease.request_id = request.id
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM request_relations relation
+                     WHERE relation.parent_request_id = request.id OR relation.child_request_id = request.id
+                   )",
+            )?;
+            let rows = statement.query_map([cutoff], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        for (request_id, state, endpoint) in &candidates {
+            let current = RequestState::from_db(state).ok_or_else(|| CoreError::InvalidConfiguration {
+                key: "requests.state".into(),
+                value: state.clone(),
+            })?;
+            if current == RequestState::Received {
+                Self::transition_request_on_connection(
+                    &transaction, request_id, RequestState::Received,
+                    RequestState::Validating, None, now,
+                )?;
+            }
+            Self::transition_request_on_connection(
+                &transaction, request_id, RequestState::Validating,
+                RequestState::Failed,
+                Some(RequestResult {
+                    status: None,
+                    error_code: Some("abandoned_pre_dispatch_recovered".into()),
+                }),
+                now,
+            )?;
+            Self::insert_audit_event(
+                &transaction, "system", "request.abandoned_pre_dispatch_recovered",
+                "request", request_id,
+                serde_json::json!({ "previous_state": state, "endpoint": endpoint }),
+                now,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(candidates.len())
+    }
+
     fn begin_request_internal(
         &self,
         input: BeginRequestInput,
