@@ -5,7 +5,7 @@ use aiwork_core::{
     UPSTREAM_CREDIT_SNAPSHOT_MAX_AGE_MS,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 #[derive(Clone, Debug)]
@@ -175,6 +175,20 @@ pub struct BridgeClient {
     base_url: String,
     bridge_secret: String,
     transport: Arc<dyn BridgeTransport>,
+    background_registry_sync: bool,
+}
+
+#[derive(Serialize)]
+struct CoreKeyRegistryKey {
+    id: String,
+    display_name: String,
+    active: bool,
+}
+
+#[derive(Serialize)]
+struct CoreKeyRegistrySnapshot {
+    version: i64,
+    keys: Vec<CoreKeyRegistryKey>,
 }
 
 impl BridgeClient {
@@ -183,6 +197,7 @@ impl BridgeClient {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             bridge_secret: bridge_secret.into(),
             transport: Arc::new(HttpBridgeTransport),
+            background_registry_sync: true,
         }
     }
 
@@ -195,10 +210,17 @@ impl BridgeClient {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             bridge_secret: bridge_secret.into(),
             transport,
+            background_registry_sync: false,
         }
     }
 
     pub fn base_url(&self) -> &str { &self.base_url }
+
+    pub fn background_registry_sync_enabled(&self) -> bool {
+        self.background_registry_sync
+            && !self.base_url.trim().is_empty()
+            && !self.bridge_secret.trim().is_empty()
+    }
 
     pub fn test(&self) -> Result<Value, String> {
         self.json_request("GET", "/internal/bridge/status", &[], None)
@@ -210,6 +232,40 @@ impl BridgeClient {
 
     pub fn summary(&self) -> Result<Value, String> {
         self.json_request("GET", "/internal/bridge/summary", &[], None)
+    }
+
+    pub fn sync_core_key_registry(
+        &self,
+        version: i64,
+        keys: Vec<(String, String, bool)>,
+    ) -> Result<Value, String> {
+        if version <= 0 || keys.len() > 10_000 {
+            return Err("Core Key registry snapshot is outside the allowed bounds".into());
+        }
+        let snapshot = CoreKeyRegistrySnapshot {
+            version,
+            keys: keys.into_iter().map(|(id, display_name, active)| CoreKeyRegistryKey {
+                id,
+                display_name,
+                active,
+            }).collect(),
+        };
+        let body = serde_json::to_vec(&snapshot)
+            .map_err(|error| format!("Core Key registry encoding failed: {error}"))?;
+        let mut headers = BTreeMap::new();
+        headers.insert("content-type".into(), "application/json".into());
+        let response = self.forward(
+            "PUT",
+            "/internal/bridge/key-registry",
+            &body,
+            &headers,
+            "core-key-registry-sync",
+        )?;
+        if !(200..300).contains(&response.status) {
+            return Err(format!("AI Work Key registry sync returned HTTP {}", response.status));
+        }
+        serde_json::from_slice(&response.body)
+            .map_err(|error| format!("AI Work Key registry response is invalid: {error}"))
     }
 
     pub fn upstream_credit_snapshot(&self) -> Result<UpstreamCreditSnapshot, String> {
@@ -346,6 +402,34 @@ impl BridgeClient {
     pub fn billing(&self, request_id: &str) -> Result<BridgeBillingResult, String> {
         let path = format!("/internal/bridge/requests/{request_id}/billing");
         let response = self.forward("GET", &path, &[], &BTreeMap::new(), request_id)?;
+        Self::decode_billing_response(response, request_id, None)
+    }
+
+    pub fn finalize_chat_billing(&self, request_id: &str) -> Result<BridgeBillingResult, String> {
+        let path = format!("/internal/bridge/requests/{request_id}/billing/finalize-chat");
+        let response = self.forward("POST", &path, &[], &BTreeMap::new(), request_id)?;
+        Self::decode_billing_response(response, request_id, None)
+    }
+
+    pub fn finalize_video_billing(
+        &self,
+        request_id: &str,
+        task_ref: &str,
+    ) -> Result<BridgeBillingResult, String> {
+        let path = format!("/internal/bridge/requests/{request_id}/billing/finalize");
+        let body = serde_json::to_vec(&json!({"task_ref": task_ref}))
+            .map_err(|error| format!("编码视频计费最终确认请求失败: {error}"))?;
+        let mut headers = BTreeMap::new();
+        headers.insert("content-type".into(), "application/json".into());
+        let response = self.forward("POST", &path, &body, &headers, request_id)?;
+        Self::decode_billing_response(response, request_id, Some(task_ref))
+    }
+
+    fn decode_billing_response(
+        response: BridgeResponse,
+        request_id: &str,
+        expected_task_ref: Option<&str>,
+    ) -> Result<BridgeBillingResult, String> {
         if !(200..300).contains(&response.status) {
             return Err(format!("AI Work 计费查询返回 HTTP {}", response.status));
         }
@@ -360,6 +444,13 @@ impl BridgeClient {
             .source_ref
             .filter(|value| !value.trim().is_empty());
         let source_is_verified = source_ref.is_some() && receipt.observed_at_ms > 0;
+        if let Some(expected_task_ref) = expected_task_ref {
+            if receipt.task_ref.as_deref() != Some(expected_task_ref)
+                || !source_ref.as_deref().is_some_and(|value| value.starts_with("trae-usage-session:"))
+            {
+                return Ok(BridgeBillingResult::Unresolved);
+            }
+        }
         let status = match receipt.status.as_str() {
             "final" if unit_is_credits && source_is_verified && receipt.actual_credits.is_some() => {
                 BillingReceiptStatus::Final
@@ -399,6 +490,7 @@ impl BridgeClient {
             incoming_headers,
             request_id,
             None,
+            None,
         )
     }
 
@@ -421,6 +513,31 @@ impl BridgeClient {
             incoming_headers,
             request_id,
             Some(quote_id),
+            None,
+        )
+    }
+
+    pub fn forward_billed_for_key(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        incoming_headers: &BTreeMap<String, String>,
+        request_id: &str,
+        quote_id: &str,
+        core_key_id: &str,
+    ) -> Result<BridgeResponse, String> {
+        if quote_id.trim().is_empty() || core_key_id.trim().is_empty() {
+            return Err("Core billing quote or API Key identity is missing".into());
+        }
+        self.forward_with_quote(
+            method,
+            path,
+            body,
+            incoming_headers,
+            request_id,
+            Some(quote_id),
+            Some(core_key_id),
         )
     }
 
@@ -433,6 +550,40 @@ impl BridgeClient {
         request_id: &str,
         quote_id: &str,
     ) -> Result<BridgeStreamingResponse, String> {
+        self.forward_billed_stream_inner(method, path, body, incoming_headers, request_id, quote_id, None)
+    }
+
+    pub fn forward_billed_stream_for_key(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        incoming_headers: &BTreeMap<String, String>,
+        request_id: &str,
+        quote_id: &str,
+        core_key_id: &str,
+    ) -> Result<BridgeStreamingResponse, String> {
+        self.forward_billed_stream_inner(
+            method,
+            path,
+            body,
+            incoming_headers,
+            request_id,
+            quote_id,
+            Some(core_key_id),
+        )
+    }
+
+    fn forward_billed_stream_inner(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        incoming_headers: &BTreeMap<String, String>,
+        request_id: &str,
+        quote_id: &str,
+        core_key_id: Option<&str>,
+    ) -> Result<BridgeStreamingResponse, String> {
         if quote_id.trim().is_empty() {
             return Err("Core 报价编号缺失；拒绝转发付费请求".into());
         }
@@ -440,6 +591,9 @@ impl BridgeClient {
         headers.insert("authorization".into(), format!("Bearer {}", self.bridge_secret));
         headers.insert("x-core-request-id".into(), request_id.to_string());
         headers.insert("x-core-quote-id".into(), quote_id.to_string());
+        if let Some(core_key_id) = core_key_id.filter(|value| !value.trim().is_empty()) {
+            headers.insert("x-core-key-id".into(), core_key_id.to_string());
+        }
         headers.remove("x-user-id");
         headers.remove("x-api-key");
         let url = format!("{}{}", self.base_url, normalize_path(path));
@@ -454,6 +608,7 @@ impl BridgeClient {
         incoming_headers: &BTreeMap<String, String>,
         request_id: &str,
         quote_id: Option<&str>,
+        core_key_id: Option<&str>,
     ) -> Result<BridgeResponse, String> {
         let mut headers = safe_headers(incoming_headers);
         // Core 用户 Key 永远不会透传给 AI Work；桥接密钥在这一层覆盖。
@@ -461,6 +616,9 @@ impl BridgeClient {
         headers.insert("x-core-request-id".into(), request_id.to_string());
         if let Some(quote_id) = quote_id {
             headers.insert("x-core-quote-id".into(), quote_id.to_string());
+        }
+        if let Some(core_key_id) = core_key_id.filter(|value| !value.trim().is_empty()) {
+            headers.insert("x-core-key-id".into(), core_key_id.to_string());
         }
         headers.remove("x-user-id");
         headers.remove("x-api-key");
@@ -758,6 +916,39 @@ mod tests {
         assert_eq!(captured.get("authorization"), Some(&"Bearer bridge-secret".to_string()));
         assert!(!captured.contains_key("x-api-key"));
         assert_eq!(captured.get("x-core-request-id"), Some(&"server-request".to_string()));
+    }
+
+    #[test]
+    fn billed_forward_overwrites_untrusted_key_id_and_keeps_user_secret_out() {
+        let recording = Arc::new(RecordingBridge::default());
+        let client = BridgeClient::from_transport("http://bridge", "bridge-secret", recording.clone());
+        let mut headers = BTreeMap::new();
+        headers.insert("x-core-key-id".into(), "client-forged-key".into());
+        headers.insert("authorization".into(), "Bearer aw_live_never_forward".into());
+        client.forward_billed_for_key(
+            "POST", "/v1/chat/completions", b"{}", &headers,
+            "server-request", "server-quote", "key_server_owned",
+        ).unwrap();
+        let captured = recording.last_headers();
+        assert_eq!(captured.get("x-core-request-id").map(String::as_str), Some("server-request"));
+        assert_eq!(captured.get("x-core-key-id").map(String::as_str), Some("key_server_owned"));
+        assert_eq!(captured.get("authorization").map(String::as_str), Some("Bearer bridge-secret"));
+        assert!(!captured.values().any(|value| value.contains("aw_live_never_forward")));
+    }
+
+    #[test]
+    fn key_registry_sync_sends_only_safe_metadata_to_the_bridge() {
+        let recording = Arc::new(RecordingBridge::responding_with_body(200, br#"{"status":"applied"}"#));
+        let client = BridgeClient::from_transport("http://bridge", "bridge-secret", recording.clone());
+        client.sync_core_key_registry(42, vec![("key_opaque".into(), "周的电脑".into(), true)]).unwrap();
+        let body = recording.last_body_string();
+        assert!(body.contains("key_opaque"));
+        assert!(body.contains("周的电脑"));
+        assert!(!body.contains("aw_live_"));
+        assert!(!body.contains("prefix"));
+        assert!(!body.contains("user_id"));
+        let headers = recording.last_headers();
+        assert_eq!(headers.get("authorization").map(String::as_str), Some("Bearer bridge-secret"));
     }
 
     #[test]

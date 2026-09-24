@@ -54,7 +54,12 @@ struct FakeBridge {
     status_body: Mutex<Value>,
     upstream_summary: Mutex<Value>,
     submit_status: Mutex<u16>,
+    quote_unavailable: Mutex<bool>,
+    quote_unavailable_endpoint: Mutex<Option<String>>,
+    quote_unavailable_code: Mutex<Option<String>>,
     requests: Mutex<Vec<String>>,
+    chat_request_ids: Mutex<Vec<String>>,
+    chat_receipt: Mutex<Value>,
     quote_max_credits: Mutex<String>,
     receipt: Mutex<Value>,
 }
@@ -77,7 +82,19 @@ impl FakeBridge {
                 }
             })),
             submit_status: Mutex::new(202),
+            quote_unavailable: Mutex::new(false),
+            quote_unavailable_endpoint: Mutex::new(None),
+            quote_unavailable_code: Mutex::new(None),
             requests: Mutex::new(Vec::new()),
+            chat_request_ids: Mutex::new(Vec::new()),
+            chat_receipt: Mutex::new(json!({
+                "status":"final",
+                "actual_credits":"1.000000",
+                "unit":"credits",
+                "source_ref":"trae-usage-session:seedance-assist",
+                "task_ref":null,
+                "observed_at_ms":chrono::Utc::now().timestamp_millis()
+            })),
             quote_max_credits: Mutex::new("20.000000".into()),
             receipt: Mutex::new(json!({
                 "status":"unknown",
@@ -102,12 +119,24 @@ impl FakeBridge {
         *self.submit_status.lock().unwrap() = status;
     }
 
+    fn set_quote_unavailable(&self, unavailable: bool) {
+        *self.quote_unavailable.lock().unwrap() = unavailable;
+    }
+
+    fn set_quote_unavailable_for(&self, endpoint: &str) {
+        *self.quote_unavailable_endpoint.lock().unwrap() = Some(endpoint.into());
+    }
+
+    fn set_quote_unavailable_code(&self, code: &str) {
+        *self.quote_unavailable_code.lock().unwrap() = Some(code.into());
+    }
+
     fn set_receipt(&self, status: &str, amount: Option<&str>, unit: &str, task_ref: Option<&str>) {
         *self.receipt.lock().unwrap() = json!({
             "status":status,
             "actual_credits":amount,
             "unit":unit,
-            "source_ref":"video-billing-test-receipt",
+            "source_ref":"trae-usage-session:video-billing-test",
             "task_ref":task_ref,
             "observed_at_ms":chrono::Utc::now().timestamp_millis()
         });
@@ -115,6 +144,10 @@ impl FakeBridge {
 
     fn request_count(&self, path: &str) -> usize {
         self.requests.lock().unwrap().iter().filter(|item| item.as_str() == path).count()
+    }
+
+    fn request_count_prefix(&self, prefix: &str) -> usize {
+        self.requests.lock().unwrap().iter().filter(|item| item.starts_with(prefix)).count()
     }
 }
 
@@ -137,26 +170,61 @@ impl BridgeTransport for FakeBridge {
             },
             ("POST", "/internal/bridge/quotes") => {
                 let request_id = request_body["request_id"].as_str().unwrap_or_default();
+                let endpoint = request_body["endpoint"].as_str().unwrap_or_default();
+                if endpoint == "chat" {
+                    self.chat_request_ids.lock().unwrap().push(request_id.to_string());
+                }
+                let endpoint_unavailable = self.quote_unavailable_endpoint.lock().unwrap().as_deref() == Some(endpoint);
+                if *self.quote_unavailable.lock().unwrap() || endpoint_unavailable {
+                    let error_code = self.quote_unavailable_code.lock().unwrap().clone()
+                        .unwrap_or_else(|| "quote_unavailable".into());
+                    BridgeResponse {
+                        status: 503,
+                        headers: BTreeMap::new(),
+                        body: serde_json::to_vec(&json!({
+                            "request_id":request_id,
+                            "status":"unavailable",
+                            "error_code":error_code
+                        })).unwrap(),
+                    }
+                } else {
+                    BridgeResponse {
+                        status: 200,
+                        headers: BTreeMap::new(),
+                        body: serde_json::to_vec(&json!({
+                            "request_id":request_id,
+                            "status":"quoted",
+                            "quote_id":format!("quote-{request_id}"),
+                            "request_fingerprint":request_body["request_fingerprint"],
+                            "endpoint":request_body["endpoint"],
+                            "model":request_body["model"],
+                            "max_credits":self.quote_max_credits.lock().unwrap().clone(),
+                            "unit":"credits",
+                            "expires_at_ms":chrono::Utc::now().timestamp_millis()+60_000,
+                            "source_ref":"video-billing-test-quote"
+                        })).unwrap(),
+                    }
+                }
+            }
+            ("POST", path) if path.starts_with("/internal/bridge/requests/") && path.ends_with("/billing/finalize") => {
+                let request_id = path.trim_start_matches("/internal/bridge/requests/").trim_end_matches("/billing/finalize");
+                let mut receipt = self.receipt.lock().unwrap().clone();
+                receipt["request_id"] = json!(request_id);
+                receipt["task_ref"] = request_body["task_ref"].clone();
                 BridgeResponse {
                     status: 200,
                     headers: BTreeMap::new(),
-                    body: serde_json::to_vec(&json!({
-                        "request_id":request_id,
-                        "status":"quoted",
-                        "quote_id":format!("quote-{request_id}"),
-                        "request_fingerprint":request_body["request_fingerprint"],
-                        "endpoint":request_body["endpoint"],
-                        "model":request_body["model"],
-                        "max_credits":self.quote_max_credits.lock().unwrap().clone(),
-                        "unit":"credits",
-                        "expires_at_ms":chrono::Utc::now().timestamp_millis()+60_000,
-                        "source_ref":"video-billing-test-quote"
-                    })).unwrap(),
+                    body: serde_json::to_vec(&receipt).unwrap(),
                 }
             }
             ("GET", path) if path.starts_with("/internal/bridge/requests/") && path.ends_with("/billing") => {
                 let request_id = path.trim_start_matches("/internal/bridge/requests/").trim_end_matches("/billing");
-                let mut receipt = self.receipt.lock().unwrap().clone();
+                let is_chat_request = self.chat_request_ids.lock().unwrap().iter().any(|item| item == request_id);
+                let mut receipt = if is_chat_request {
+                    self.chat_receipt.lock().unwrap().clone()
+                } else {
+                    self.receipt.lock().unwrap().clone()
+                };
                 receipt["request_id"] = json!(request_id);
                 BridgeResponse {
                     status: 200,
@@ -168,6 +236,16 @@ impl BridgeTransport for FakeBridge {
                 status: *self.submit_status.lock().unwrap(),
                 headers: BTreeMap::new(),
                 body: br#"{"task":{"id":"video-test","status":"queued"}}"#.to_vec(),
+            },
+            ("POST", "/v1/chat/completions") if request_body["model"] == "seedance" => BridgeResponse {
+                status: 200,
+                headers: BTreeMap::new(),
+                body: br#"{"task":{"id":"video-test","status":"queued"}}"#.to_vec(),
+            },
+            ("POST", "/v1/chat/completions") => BridgeResponse {
+                status: 200,
+                headers: BTreeMap::new(),
+                body: br#"{"choices":[{"message":{"role":"assistant","content":"{\"prompt\":\"assisted prompt\"}"}}]}"#.to_vec(),
             },
             ("GET", "/v1/videos/video-test") => BridgeResponse {
                 status: 200,
@@ -276,7 +354,7 @@ async fn upstream_balance_below_key_commitments_blocks_video_reservation_and_sub
         &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
     )
     .unwrap();
-    assert_eq!(body["error"]["code"], "upstream_commitments_exceed_balance");
+    assert_eq!(body["error"]["code"], "upstream_commitments_exceed_balance", "body: {body}");
     assert_eq!(fixture.bridge.request_count("/internal/bridge/quotes"), 1);
     assert_eq!(fixture.bridge.request_count("/v1/videos/generations"), 0);
 }
@@ -356,6 +434,147 @@ async fn diagnostic_claim_allows_one_matching_request_then_pauses_again() {
     assert_eq!(post_video(&fixture).await.status(), StatusCode::ACCEPTED);
     assert_eq!(post_video(&fixture).await.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(quota(&fixture).balances[0].held, 20_000_000);
+}
+
+#[tokio::test]
+async fn diagnostic_next_request_is_bound_to_the_key_and_consumed_once() {
+    let fixture = fixture("diagnostic-next");
+    let body = json!({"model":"seedance","prompt":"a different request body"});
+    fixture.store.set_video_billing_control(aiwork_core::VideoBillingControlInput::diagnostic(
+        &fixture.key_id, &"0".repeat(64), "本地下一请求一次性验收",
+    )).unwrap();
+    let principal = fixture.store.authenticate_api_key(&fixture.key).unwrap();
+    let other_key = aiwork_core::Principal {
+        user_id: principal.user_id.clone(),
+        key_id: "different-key".into(),
+        scopes: BTreeSet::new(),
+    };
+
+    assert_eq!(
+        starlink_dimension_router::video_billing::admit_video_request(
+            &fixture.store, &other_key, "seedance", &body,
+        ).unwrap(),
+        starlink_dimension_router::video_billing::VideoAdmission::Paused,
+    );
+
+    assert_eq!(
+        starlink_dimension_router::video_billing::admit_video_request(
+            &fixture.store, &principal, "seedance", &body,
+        ).unwrap(),
+        starlink_dimension_router::video_billing::VideoAdmission::DiagnosticClaimed,
+    );
+    assert_eq!(
+        starlink_dimension_router::video_billing::admit_video_request(
+            &fixture.store, &principal, "seedance", &body,
+        ).unwrap(),
+        starlink_dimension_router::video_billing::VideoAdmission::Paused,
+    );
+}
+
+#[tokio::test]
+async fn approved_one_shot_quote_fallback_reserves_the_entire_key_balance_once() {
+    let fixture = fixture("one-shot-unquoted");
+    fixture.bridge.set_quote_unavailable(true);
+    fixture.store.set_video_billing_control(aiwork_core::VideoBillingControlInput::diagnostic(
+        &fixture.key_id, &"0".repeat(64), "本地下一请求一次性验收",
+    )).unwrap();
+
+    let response = post_video(&fixture).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let job = fixture.state.jobs.lock().unwrap()["video-test"].clone();
+    let reservation = fixture.store.reservation_for_request(&job.request_id).unwrap().unwrap();
+    assert_eq!(reservation.amount, 100_000_000);
+    assert_eq!(reservation.state, aiwork_core::ReservationState::Held);
+    assert_eq!(quota(&fixture).balances[0].held, 100_000_000);
+
+    assert_eq!(post_video(&fixture).await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(fixture.bridge.request_count("/v1/videos/generations"), 1);
+}
+
+#[tokio::test]
+async fn one_shot_does_not_bypass_unrelated_quote_errors() {
+    let fixture = fixture("one-shot-other-quote-error");
+    fixture.bridge.set_quote_unavailable(true);
+    fixture.bridge.set_quote_unavailable_code("quote_timeout");
+    fixture.store.set_video_billing_control(aiwork_core::VideoBillingControlInput::diagnostic(
+        &fixture.key_id, &"0".repeat(64), "本地下一请求一次性验收",
+    )).unwrap();
+
+    let response = post_video(&fixture).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(quota(&fixture).balances[0].held, 0);
+    assert_eq!(fixture.bridge.request_count("/v1/videos/generations"), 0);
+}
+
+#[tokio::test]
+async fn one_shot_seedance_chat_keeps_the_assist_quote_separate_from_the_video_hold() {
+    let fixture = fixture("one-shot-chat");
+    fixture.bridge.set_quote_unavailable_for("videos");
+    fixture.store.set_video_billing_control(aiwork_core::VideoBillingControlInput::diagnostic(
+        &fixture.key_id, &"0".repeat(64), "本地下一请求一次性验收",
+    )).unwrap();
+
+    let response = post_seedance_chat(&fixture).await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let job = fixture.state.jobs.lock().unwrap()["video-test"].clone();
+    assert!(job.one_shot_test);
+    assert_eq!(quota(&fixture).balances[0].held, 99_000_000);
+    assert_eq!(quota(&fixture).balances[0].settled, 1_000_000);
+
+    assert_eq!(post_seedance_chat(&fixture).await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(fixture.bridge.request_count("/v1/chat/completions"), 2);
+}
+
+#[tokio::test]
+async fn one_shot_video_settlement_uses_request_scoped_aiwork_finalization() {
+    let fixture = fixture("one-shot-finalize");
+    fixture.bridge.set_quote_unavailable(true);
+    fixture.store.set_video_billing_control(aiwork_core::VideoBillingControlInput::diagnostic(
+        &fixture.key_id, &"0".repeat(64), "本地下一请求一次性验收",
+    )).unwrap();
+    assert_eq!(post_video(&fixture).await.status(), StatusCode::ACCEPTED);
+    let job = fixture.state.jobs.lock().unwrap()["video-test"].clone();
+    assert!(job.one_shot_test);
+
+    fixture.bridge.set_receipt("final", Some("120.000000"), "credits", Some("video-test"));
+    fixture.bridge.set_status(json!({"task":{"id":"video-test","status":"completed"}}));
+    assert_eq!(poll_video(&fixture).await.status(), StatusCode::OK);
+    assert_eq!(fixture.bridge.request_count_prefix(&format!("/internal/bridge/requests/{}/billing/finalize", job.request_id)), 1);
+    assert_eq!(quota(&fixture).balances[0].held, 0);
+    assert_eq!(quota(&fixture).balances[0].settled, 120_000_000);
+    let admin = aiwork_core::Principal {
+        user_id: "admin".into(),
+        key_id: "admin_session:test".into(),
+        scopes: BTreeSet::from(["admin:*".into()]),
+    };
+    let key = fixture.store.list_api_keys_as_admin(&admin, None).unwrap()
+        .into_iter().find(|key| key.id == fixture.key_id).unwrap();
+    assert!(key.billing_blocked, "over-balance actual settlement must freeze this key");
+}
+
+#[tokio::test]
+async fn one_shot_unknown_receipt_keeps_the_full_hold_and_does_not_settle() {
+    let fixture = fixture("one-shot-unknown-receipt");
+    fixture.bridge.set_quote_unavailable(true);
+    fixture.store.set_video_billing_control(aiwork_core::VideoBillingControlInput::diagnostic(
+        &fixture.key_id, &"0".repeat(64), "本地下一请求一次性验收",
+    )).unwrap();
+    assert_eq!(post_video(&fixture).await.status(), StatusCode::ACCEPTED);
+    fixture.bridge.set_status(json!({"task":{"id":"video-test","status":"completed"}}));
+
+    assert_eq!(poll_video(&fixture).await.status(), StatusCode::OK);
+    let job = fixture.state.jobs.lock().unwrap()["video-test"].clone();
+    assert_eq!(job.billing_state, "reconcile_required");
+    assert_eq!(job.error_code.as_deref(), Some("billing_receipt_unresolved"));
+    assert_eq!(quota(&fixture).balances[0].held, 100_000_000);
+    assert_eq!(quota(&fixture).balances[0].settled, 0);
+    assert_eq!(fixture.bridge.request_count_prefix(&format!(
+        "/internal/bridge/requests/{}/billing/finalize", job.request_id
+    )), 1);
+    assert_eq!(post_video(&fixture).await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(fixture.bridge.request_count("/v1/videos/generations"), 1);
 }
 
 #[tokio::test]

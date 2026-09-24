@@ -43,7 +43,7 @@ pub use ports::{
 pub use requests::canonical_json_hash;
 pub use store::{CoreStore, CORE_DB_FILE, CURRENT_SCHEMA_VERSION};
 pub use usage_trend::UsageTrendPoint;
-pub use video_billing::{VideoBillingControl, VideoBillingControlInput, VideoBillingMode, VideoDiagnosticClaim};
+pub use video_billing::{VideoBillingControl, VideoBillingControlInput, VideoBillingMode, VideoDiagnosticClaim, VIDEO_DIAGNOSTIC_NEXT_REQUEST_HASH};
 pub use admin_summary::CoreAdminSummary;
 pub use admin_credentials::{AdminCredentialRecord, NewAdminCredential};
 pub use upstream::{

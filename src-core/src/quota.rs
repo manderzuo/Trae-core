@@ -2292,6 +2292,15 @@ impl CoreStore {
             None,
             now,
         )?;
+        if final_state == RequestState::Succeeded {
+            // A delayed final receipt supersedes a temporary reconciliation
+            // error. Preserve the receipt/settlement audit rows, but do not
+            // leave a settled request labeled as unresolved.
+            transaction.execute(
+                "UPDATE requests SET error_code = NULL WHERE id = ?1 AND state = 'settled'",
+                [&receipt.request_id],
+            )?;
+        }
         if over_quote {
             let excess = actual.checked_sub(quote.1).ok_or(CoreError::InvalidQuotaAmount)?;
             transaction.execute(

@@ -25,6 +25,8 @@ pub struct UserVideoJob {
     pub actual_credits: Option<String>,
     #[serde(default)]
     pub last_reconciled_at_ms: Option<i64>,
+    #[serde(default)]
+    pub one_shot_test: bool,
 }
 
 fn default_billing_state() -> String { "held".into() }
@@ -57,6 +59,9 @@ impl StarlinkRouterState {
         fs::create_dir_all(&config.data_dir).map_err(|e| format!("创建 Core 数据目录失败: {e}"))?;
         let store = Arc::new(CoreStore::open(&config.data_dir).map_err(|e| e.to_string())?);
         store.migrate().map_err(|e| e.to_string())?;
+        store
+            .recover_abandoned_seedance_assist_requests()
+            .map_err(|error| format!("恢复已结束 Seedance 请求失败: {error}"))?;
         let initial_password = std::env::var("STARLINK_ADMIN_INITIAL_PASSWORD").ok();
         ensure_initial_admin_credential(&store, initial_password.as_deref()).map_err(|e| e.to_string())?;
         let jobs = load_jobs(&config.data_dir);

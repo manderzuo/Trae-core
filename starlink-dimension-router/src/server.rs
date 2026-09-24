@@ -7,6 +7,7 @@ use crate::{admin_auth, admin_routes, auth, state::StarlinkRouterState, user_rou
 
 pub fn build_router(state: Arc<StarlinkRouterState>) -> Router {
     crate::video_reconciler::spawn(&state);
+    crate::key_registry_sync::spawn(&state);
     let user = Router::new()
         .route("/v1/models", get(user_routes::models))
         .route("/v1/chat/completions", post(user_routes::chat_completions).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))

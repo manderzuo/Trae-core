@@ -25,6 +25,16 @@ pub fn canonical_json_hash(value: &Value) -> [u8; 32] {
     Sha256::digest(canonical).into()
 }
 
+const IMPLICIT_VIDEO_RETRY_WINDOW_MS: i64 = 2 * 60 * 1000;
+const IMPLICIT_VIDEO_RETRY_QUERY: &str =
+    "SELECT r.id FROM idempotency_keys i
+     JOIN requests r ON r.id = i.request_id
+     WHERE i.scope = ?1 AND i.client_key LIKE 'core-implicit:%'
+       AND i.request_hash = ?2 AND r.model = ?3
+       AND (r.created_at_ms >= ?4 OR r.state IN
+         ('reserved','queued','dispatched','completing','unknown'))
+     ORDER BY r.created_at_ms DESC LIMIT 1";
+
 impl CoreStore {
     /// Read-only idempotency lookup used by stream routes before checking
     /// upstream adapter readiness. It must never create a request or reserve
@@ -954,6 +964,142 @@ impl CoreStore {
             .map_err(CoreError::from)
     }
 
+    /// Read-only counterpart to implicit video coalescing. It lets a paused
+    /// billing gate replay an already accepted task without admitting a new one.
+    pub fn lookup_implicit_billed_video_request(
+        &self,
+        user_id: &str,
+        api_key_id: &str,
+        model: &str,
+        body: &Value,
+    ) -> Result<Option<BeginRequest>, CoreError> {
+        let scope = format!("{user_id}:{api_key_id}:videos");
+        let hash = request_hash("videos", model, body);
+        let cutoff = Utc::now().timestamp_millis().saturating_sub(IMPLICIT_VIDEO_RETRY_WINDOW_MS);
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        let active_key = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = ?1 AND user_id = ?2 AND status = 'active')",
+            params![api_key_id, user_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !active_key {
+            return Err(CoreError::InvalidRequestIdentity {
+                user_id: user_id.into(),
+                api_key_id: api_key_id.into(),
+            });
+        }
+        let request_id = connection.query_row(
+            IMPLICIT_VIDEO_RETRY_QUERY,
+            params![scope, hash.to_vec(), model, cutoff],
+            |row| row.get::<_, String>(0),
+        ).optional()?;
+        request_id.map(|id| {
+            Self::request_handle_in_connection(&connection, &id).map(BeginRequest::Existing)
+        }).transpose()
+    }
+
+    pub fn is_seedance_assist_child(&self, child_request_id: &str) -> Result<bool, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        let found: i64 = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM request_relations
+             WHERE child_request_id = ?1 AND relationship_kind = 'seedance_assist')",
+            [child_request_id],
+            |row| row.get(0),
+        )?;
+        Ok(found != 0)
+    }
+
+    /// At startup, fail only Seedance helper requests that are provably
+    /// abandoned before dispatch: the video parent is terminal, the child is
+    /// still received/validating, and no reservation, job, or upstream lease
+    /// exists for the child.
+    pub fn recover_abandoned_seedance_assist_requests(&self) -> Result<usize, CoreError> {
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let candidates = {
+            let mut statement = transaction.prepare(
+                "SELECT child.id, child.state, parent.id
+                 FROM request_relations relation
+                 JOIN requests parent ON parent.id = relation.parent_request_id
+                 JOIN requests child ON child.id = relation.child_request_id
+                 WHERE relation.relationship_kind = 'seedance_assist'
+                   AND parent.endpoint = 'videos'
+                   AND child.endpoint = 'chat'
+                   AND parent.state IN ('canceled', 'failed', 'settled', 'succeeded')
+                   AND child.state IN ('received', 'validating')
+                   AND NOT EXISTS (
+                     SELECT 1 FROM quota_reservations reservation
+                     WHERE reservation.request_id = child.id
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM jobs job
+                     WHERE job.request_id = child.id
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM upstream_leases lease
+                     WHERE lease.request_id = child.id
+                   )",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let now = Utc::now().timestamp_millis();
+        let mut recovered = 0;
+        for (request_id, state, parent_request_id) in candidates {
+            let mut current = RequestState::from_db(&state).ok_or_else(|| {
+                CoreError::InvalidConfiguration {
+                    key: "requests.state".into(),
+                    value: state,
+                }
+            })?;
+            if current == RequestState::Received {
+                Self::transition_request_on_connection(
+                    &transaction,
+                    &request_id,
+                    RequestState::Received,
+                    RequestState::Validating,
+                    None,
+                    now,
+                )?;
+                current = RequestState::Validating;
+            }
+            if current != RequestState::Validating {
+                continue;
+            }
+            Self::transition_request_on_connection(
+                &transaction,
+                &request_id,
+                RequestState::Validating,
+                RequestState::Failed,
+                Some(RequestResult {
+                    status: None,
+                    error_code: Some("abandoned_seedance_assist_recovered".into()),
+                }),
+                now,
+            )?;
+            Self::insert_audit_event(
+                &transaction,
+                "system",
+                "request.abandoned_seedance_assist_recovered",
+                "request",
+                &request_id,
+                serde_json::json!({ "parent_request_id": parent_request_id }),
+                now,
+            )?;
+            recovered += 1;
+        }
+        transaction.commit()?;
+        Ok(recovered)
+    }
+
     fn begin_request_internal(
         &self,
         input: BeginRequestInput,
@@ -982,17 +1128,10 @@ impl CoreStore {
         }
 
         if coalesce_implicit_video_retry {
-            const RETRY_WINDOW_MS: i64 = 2 * 60 * 1000;
             let previous_request_id = transaction
                 .query_row(
-                    "SELECT r.id FROM idempotency_keys i
-                     JOIN requests r ON r.id = i.request_id
-                     WHERE i.scope = ?1 AND i.client_key LIKE 'core-implicit:%'
-                       AND i.request_hash = ?2 AND r.model = ?3
-                       AND (r.created_at_ms >= ?4 OR r.state IN
-                         ('reserved','queued','dispatched','completing','unknown'))
-                     ORDER BY r.created_at_ms DESC LIMIT 1",
-                    params![&scope, request_hash.to_vec(), &input.model, now.saturating_sub(RETRY_WINDOW_MS)],
+                    IMPLICIT_VIDEO_RETRY_QUERY,
+                    params![&scope, request_hash.to_vec(), &input.model, now.saturating_sub(IMPLICIT_VIDEO_RETRY_WINDOW_MS)],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;

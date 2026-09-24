@@ -10,6 +10,7 @@ pub mod admin_auth;
 pub mod admin_session;
 pub mod admin_routes;
 pub mod key_vault;
+pub mod key_registry_sync;
 pub mod bridge_config;
 pub mod migration;
 pub mod assets;

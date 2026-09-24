@@ -432,10 +432,13 @@ impl CoreStore {
                 value: "control row is missing".into(),
             });
         };
+        let request_hash_matches = configured_hash.as_deref() == Some(request_hash)
+            || configured_hash.as_deref()
+                == Some(crate::VIDEO_DIAGNOSTIC_NEXT_REQUEST_HASH);
         if mode != VideoBillingMode::DiagnosticOnce.as_str()
             || claimed_at_ms.is_some()
             || configured_key.as_deref() != Some(key_id)
-            || configured_hash.as_deref() != Some(request_hash)
+            || !request_hash_matches
         {
             transaction.commit()?;
             return Ok(None);
@@ -1127,6 +1130,27 @@ impl CoreStore {
         };
         transaction.commit()?;
         Ok(users)
+    }
+
+    /// Minimal API Key metadata for the authenticated AI Work bridge sync.
+    /// This internal projection intentionally excludes every credential,
+    /// prefix, user identity, scope and quota field.
+    pub fn bridge_api_key_metadata(&self) -> Result<Vec<(String, String, bool)>, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT api_keys.id, api_keys.name,
+                    CASE WHEN api_keys.status = 'active'
+                               AND api_keys.deleted_at_ms IS NULL
+                               AND users.status = 'active'
+                         THEN 1 ELSE 0 END
+             FROM api_keys INNER JOIN users ON users.id = api_keys.user_id
+             WHERE users.role <> 'admin'
+             ORDER BY api_keys.created_at_ms, api_keys.id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(CoreError::from)
     }
 
     pub fn list_api_keys_as_admin(

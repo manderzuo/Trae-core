@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+/// Reserved diagnostic hash meaning “the next Seedance request from this Key”.
+/// The claim itself still records the concrete request hash transactionally.
+pub const VIDEO_DIAGNOSTIC_NEXT_REQUEST_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoBillingMode {

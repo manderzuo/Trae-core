@@ -133,6 +133,10 @@
   function formatCredits(value) {
     const units = parseCredits(value);
     if (units === null) return '—';
+    return formatMicrocredits(units);
+  }
+
+  function formatMicrocredits(units) {
     const whole = units / MICRO;
     const fraction = (units % MICRO).toString().padStart(6, '0').replace(/0+$/, '');
     return new Intl.NumberFormat('zh-CN').format(whole) + (fraction ? `.${fraction}` : '');
@@ -228,7 +232,7 @@
       const ratio = Number(step) / 2;
       const y = height - padding.bottom - ratio * (height - padding.top - padding.bottom);
       const labelUnits = maxUnits * step / 2n;
-      return `<line x1="${padding.left}" y1="${y}" x2="${width-padding.right}" y2="${y}" stroke="#243452"/><text x="${padding.left-9}" y="${y+4}" text-anchor="end" fill="#8293ae" font-size="11">${escapeHtml(formatCredits(labelUnits.toString()))}</text>`;
+      return `<line x1="${padding.left}" y1="${y}" x2="${width-padding.right}" y2="${y}" stroke="#243452"/><text x="${padding.left-9}" y="${y+4}" text-anchor="end" fill="#8293ae" font-size="11">${escapeHtml(formatMicrocredits(labelUnits))}</text>`;
     }).join('');
     const path = trendPath(points, maxUnits, width, height, padding);
     const dots = points.map((point, index) => {
@@ -248,7 +252,7 @@
     }).join('');
     $('trendChart').innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="按最终结算时间统计的统一积分实扣趋势">${grid}<path d="${path}" fill="none" stroke="#8de0b5" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>${dots}${labels}</svg>`;
     const total = values.reduce((sum, value) => sum + value, 0n);
-    $('trendMeta').textContent = `区间实扣 ${formatCredits(total.toString())} 积分 · ${points.length} 个时间点`;
+    $('trendMeta').textContent = `区间实扣 ${formatMicrocredits(total)} 积分 · ${points.length} 个时间点`;
   }
 
   function renderTrendError() {
@@ -507,7 +511,7 @@
       if (!keyId) { showMessage('quotaMsg', '请选择显示名称对应的 API Key'); return; }
       if (amountUnits === null || amountUnits <= 0n) { showMessage('quotaMsg', '积分必须是非负数，最多 6 位小数'); return; }
       if (!currentSummary?.credits?.upstream_fresh || availableUnits === null) { showMessage('quotaMsg', 'AI Work 积分快照不可用，暂不能分配'); return; }
-      if (amountUnits > availableUnits) { showMessage('quotaMsg', `超过剩余可分配积分 ${formatCredits(availableUnits.toString())}`); return; }
+      if (amountUnits > availableUnits) { showMessage('quotaMsg', `超过剩余可分配积分 ${formatMicrocredits(availableUnits)}`); return; }
       if (!reason) { showMessage('quotaMsg', '请填写分配备注'); return; }
       await call(`/admin/v1/api-keys/${encodeURIComponent(keyId)}/quota`, {method:'POST', body:JSON.stringify({resource_kind:'credits', amount, reason})});
       showMessage('quotaMsg', '积分额度已分配，Key 列表与剩余余额已刷新。', true);

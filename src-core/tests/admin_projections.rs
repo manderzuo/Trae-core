@@ -138,6 +138,46 @@ fn admin_can_create_a_display_name_key_and_update_its_runtime_policy() {
 }
 
 #[test]
+fn bridge_key_projection_contains_only_opaque_id_name_and_enabled_state() {
+    let (store, admin, _regular, dir) = setup();
+    let active = store
+        .issue_api_key("user-1", "desktop display", BTreeSet::new(), &admin.user_id)
+        .unwrap();
+    let revoked = store
+        .issue_api_key("user-1", "revoked display", BTreeSet::new(), &admin.user_id)
+        .unwrap();
+    store.update_api_key_as_admin(&admin, &revoked.id, false, 3).unwrap();
+    let inactive_user = store.create_user_as_admin(
+        NewUser { id: "inactive-user".into(), name: "Inactive user".into(), role: UserRole::User },
+        &admin,
+    ).unwrap();
+    let inactive_user_key = store.issue_api_key_as_admin(
+        &inactive_user.id,
+        "inactive account key",
+        BTreeSet::new(),
+        &admin,
+    ).unwrap();
+    store.set_user_status_as_admin(&admin, &inactive_user.id, false).unwrap();
+
+    let projection = store.bridge_api_key_metadata().unwrap();
+    let active_view = projection.iter().find(|item| item.0 == active.id).unwrap();
+    let revoked_view = projection.iter().find(|item| item.0 == revoked.id).unwrap();
+    let inactive_view = projection.iter().find(|item| item.0 == inactive_user_key.id).unwrap();
+    assert_eq!(active_view, &(active.id.clone(), "desktop display".into(), true));
+    assert_eq!(revoked_view, &(revoked.id.clone(), "revoked display".into(), false));
+    assert_eq!(inactive_view, &(inactive_user_key.id.clone(), "inactive account key".into(), false));
+    assert!(!projection.iter().any(|item| item.0 == admin.key_id));
+    let serialized = serde_json::to_string(&projection).unwrap();
+    assert!(!serialized.contains(&active.plaintext));
+    assert!(!serialized.contains(&revoked.plaintext));
+    assert!(!serialized.contains(&inactive_user_key.plaintext));
+    assert!(!serialized.contains("prefix"));
+    assert!(!serialized.contains("user_id"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn user_status_is_owner_safe_and_preserves_auth_invariants() {
     let (store, admin, _regular, dir) = setup();
     let admin_two = store

@@ -363,8 +363,8 @@ async fn register_video_diagnostic(
     Json(input): Json<VideoDiagnosticInput>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let current = state.store.video_billing_control().map_err(internal)?;
-    if current.mode == aiwork_core::VideoBillingMode::DiagnosticOnce || current.diagnostic_claimed_at_ms.is_some() {
-        return Err((StatusCode::CONFLICT, Json(json!({"error": {"type": "video_diagnostic_already_registered", "message": "已有一次性验收登记或已使用，请先保持暂停后再登记"}}))));
+    if current.mode == aiwork_core::VideoBillingMode::DiagnosticOnce {
+        return Err((StatusCode::CONFLICT, Json(json!({"error": {"type": "video_diagnostic_already_registered", "message": "已有一次性验收正在等待使用；请先暂停或完成本次验收后再登记"}}))));
     }
     let known_key = state.store.list_api_keys_as_admin(&principal, None)
         .map_err(internal)?.into_iter().any(|key| key.id == input.key_id);

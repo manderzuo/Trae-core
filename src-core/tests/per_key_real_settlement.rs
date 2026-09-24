@@ -4,6 +4,7 @@ use aiwork_core::{
     BeginRequest, BeginRequestInput, BillingQuote, BillingReceipt, BillingReceiptResult,
     BillingReceiptStatus, BillingReservationResult, CoreError, CoreStore, CreditAmount,
     KeyQuotaGrant, NewUser, Principal, RequestHandle, UserRole,
+    RequestResult, RequestState,
 };
 use rusqlite::Connection;
 use serde_json::json;
@@ -109,6 +110,44 @@ fn receipt(
         task_ref: None,
         observed_at_ms: chrono::Utc::now().timestamp_millis(),
     }
+}
+
+#[test]
+fn final_receipt_clears_transient_billing_error_after_reconciliation() {
+    let (store, dir, key, _, _) = setup("late-receipt-error");
+    let request = begin(&store, &key, "late-receipt-error-idem");
+    let _reservation = reserve(&store, &request, "late-receipt-error-quote", "5");
+    let current = store.request_state(&request.id).unwrap();
+    store.transition_request(
+        &request.id,
+        current,
+        RequestState::Unknown,
+        Some(RequestResult {
+            status: None,
+            error_code: Some("billing_receipt_unresolved".into()),
+        }),
+    ).unwrap();
+
+    assert!(matches!(
+        store.apply_credit_receipt(receipt(
+            &request.id,
+            BillingReceiptStatus::Final,
+            Some("2.5"),
+            "trae-usage-session:late-receipt",
+        )).unwrap(),
+        BillingReceiptResult::Settled { .. }
+    ));
+    let connection = Connection::open(dir.join("data").join("core.sqlite3")).unwrap();
+    let (state, error_code): (String, Option<String>) = connection.query_row(
+        "SELECT state, error_code FROM requests WHERE id = ?1",
+        [&request.id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(state, "settled");
+    assert_eq!(error_code, None, "a final verified receipt supersedes the temporary billing error");
+    drop(connection);
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
 }
 
 fn reserve(store: &CoreStore, request: &RequestHandle, quote_id: &str, max_credits: &str) -> String {

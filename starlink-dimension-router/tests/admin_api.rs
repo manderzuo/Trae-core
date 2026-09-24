@@ -19,6 +19,7 @@ struct Fixture {
     app: Router,
     cookie: String,
     key_id: String,
+    store: Arc<aiwork_core::CoreStore>,
     _dir: TestDir,
 }
 
@@ -57,9 +58,9 @@ fn fixture() -> Fixture {
         1,
     ).unwrap();
     let config = RouterConfig::defaults(dir.clone());
-    let state = StarlinkRouterState::for_test(store, BridgeClient::new("", ""), config);
+    let state = StarlinkRouterState::for_test(store.clone(), BridgeClient::new("", ""), config);
     let (token, _) = state.admin_sessions.issue("admin".into(), chrono::Utc::now().timestamp_millis());
-    Fixture { app: build_router(state), cookie: format!("starlink_admin_session={token}"), key_id: issued.id, _dir: TestDir(dir) }
+    Fixture { app: build_router(state), cookie: format!("starlink_admin_session={token}"), key_id: issued.id, store, _dir: TestDir(dir) }
 }
 
 async fn json_body(response: Response<Body>) -> Value {
@@ -97,6 +98,27 @@ async fn diagnostic_endpoint_requires_key_id_hash_and_consumes_once() {
     assert_eq!(first.status(), StatusCode::OK);
     let second = admin_request(&fixture, axum::http::Method::POST, "/admin/v1/video-billing/diagnostic", input).await;
     assert_eq!(second.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn used_diagnostic_registration_can_be_rearmed_after_it_returns_to_paused() {
+    let fixture = fixture();
+    let request_hash = "c".repeat(64);
+    let input = json!({"key_id": fixture.key_id, "request_hash": request_hash, "reason": "再次验收"});
+
+    let first = admin_request(&fixture, axum::http::Method::POST, "/admin/v1/video-billing/diagnostic", input.clone()).await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    assert!(fixture.store.claim_video_diagnostic(&fixture.key_id, &request_hash).unwrap().is_some());
+    let consumed = fixture.store.video_billing_control().unwrap();
+    assert_eq!(consumed.mode, aiwork_core::VideoBillingMode::Paused);
+    assert!(consumed.diagnostic_claimed_at_ms.is_some());
+
+    let rearmed = admin_request(&fixture, axum::http::Method::POST, "/admin/v1/video-billing/diagnostic", input).await;
+    assert_eq!(rearmed.status(), StatusCode::OK);
+    let body = json_body(rearmed).await;
+    assert_eq!(body["mode"], "diagnostic_once");
+    assert_eq!(body["diagnostic"]["armed"], true);
 }
 
 #[tokio::test]

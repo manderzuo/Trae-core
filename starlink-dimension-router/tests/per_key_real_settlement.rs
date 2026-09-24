@@ -630,6 +630,7 @@ async fn final_chat_receipt_settles_exact_credits_only_for_the_request_key() {
     let request_id = quote_body["request_id"].as_str().unwrap().to_string();
     let generation = fixture.bridge.requests_to("/v1/chat/completions").pop().unwrap();
     assert_eq!(generation.headers["x-core-request-id"], request_id);
+    assert_eq!(generation.headers["x-core-key-id"], fixture.key_id);
     assert_eq!(generation.headers["x-core-quote-id"], format!("quote-{request_id}"));
     let receipt_query = fixture.bridge.requests_to(&format!("/internal/bridge/requests/{request_id}/billing"));
     assert_eq!(receipt_query.len(), 1);
@@ -846,7 +847,8 @@ async fn completed_video_queries_receipt_once_and_repeated_poll_does_not_double_
     let repeated = poll_video(&fixture, &fixture.key).await;
     assert_eq!(repeated.status(), StatusCode::OK);
     assert_eq!(quota_for(&fixture, &fixture.key).balances[0].settled, 1_250_000);
-    assert_eq!(fixture.bridge.requests_to("/v1/videos/generations").len(), 1);
+    let submitted_request = fixture.bridge.requests_to("/v1/videos/generations").pop().unwrap();
+    assert_eq!(submitted_request.headers["x-core-key-id"], fixture.key_id);
     assert_eq!(fixture.bridge.count_prefix("/internal/bridge/requests/"), 1);
     assert_eq!(quota_for(&fixture, &fixture.second_key).balances[0].settled, 0);
 }
