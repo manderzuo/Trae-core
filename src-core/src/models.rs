@@ -764,7 +764,7 @@ impl RequestState {
     pub(crate) const fn can_transition_to(self, next: Self) -> bool {
         matches!(
             (self, next),
-            (Self::Received, Self::Validating)
+            (Self::Received, Self::Validating | Self::Failed)
                 | (Self::Validating, Self::Reserved | Self::Failed | Self::Unknown)
                 | (Self::Reserved, Self::Queued | Self::Failed | Self::Unknown)
                 | (Self::Reserved, Self::CancelRequested)

@@ -551,6 +551,7 @@ async fn unavailable_quote_blocks_paid_chat_before_forwarding_and_never_charges(
         other => panic!("expected persisted Core request, got {other:?}"),
     };
     assert_eq!(request.id, request_id);
+    assert_eq!(request.state, aiwork_core::RequestState::Failed);
     assert!(fixture.store.reservation_for_request(request_id).unwrap().is_none());
     let principal = fixture.store.authenticate_api_key(&fixture.key).unwrap();
     let quota = fixture
@@ -559,6 +560,43 @@ async fn unavailable_quote_blocks_paid_chat_before_forwarding_and_never_charges(
         .unwrap();
     assert_eq!(quota.balances[0].held, 0);
     assert_eq!(quota.balances[0].settled, 0);
+
+    for retry_id in ["quote-unavailable-next-1", "quote-unavailable-next-2"] {
+        let response = post_chat(&fixture, &fixture.key, retry_id, false).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["code"], "quote_unavailable");
+    }
+}
+
+#[tokio::test]
+async fn unavailable_video_quote_releases_key_concurrency_without_submitting_video() {
+    let fixture = fixture();
+    for attempt in 1..=3 {
+        let response = post_video(
+            &fixture,
+            &fixture.key,
+            &format!("unavailable-video-{attempt}"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 1024 * 1024).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["code"], "quote_unavailable");
+        let request_id = body["error"]["request_id"].as_str().unwrap();
+        assert_eq!(
+            fixture.store.request_state(request_id).unwrap(),
+            aiwork_core::RequestState::Failed,
+        );
+        assert!(fixture.store.reservation_for_request(request_id).unwrap().is_none());
+    }
+    assert_eq!(fixture.bridge.requests_to("/v1/videos/generations").len(), 0);
+    assert_eq!(quota_for(&fixture, &fixture.key).balances[0].held, 0);
 }
 
 async fn post_chat(fixture: &Fixture, key: &str, idempotency_key: &str, stream: bool) -> axum::response::Response<Body> {

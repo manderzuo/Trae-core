@@ -417,6 +417,29 @@ fn quote_and_reserve(
     endpoint: &str,
     model: &str,
 ) -> Result<(String, String), Response> {
+    let result = quote_and_reserve_inner(state, request_id, endpoint, model);
+    if let Err(response) = &result {
+        if matches!(state.store.reservation_for_request(request_id), Ok(None)) {
+            let _ = state.store.transition_request(
+                request_id,
+                RequestState::Received,
+                RequestState::Failed,
+                Some(RequestResult {
+                    status: Some(i64::from(response.status().as_u16())),
+                    error_code: Some("preflight_failed".into()),
+                }),
+            );
+        }
+    }
+    result
+}
+
+fn quote_and_reserve_inner(
+    state: &StarlinkRouterState,
+    request_id: &str,
+    endpoint: &str,
+    model: &str,
+) -> Result<(String, String), Response> {
     let upstream_snapshot = state
         .bridge
         .lock()
