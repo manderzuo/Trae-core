@@ -844,14 +844,31 @@ impl CoreStore {
     }
 
     pub fn begin_request(&self, input: BeginRequestInput) -> Result<BeginRequest, CoreError> {
-        self.begin_request_internal(input, true)
+        self.begin_request_internal(input, true, false)
     }
 
     /// Creates an authenticated, Core-numbered request before an upstream
     /// quote is available. Callers must be behind the normal API-key auth
     /// boundary; paid dispatch still requires `reserve_credit_quote`.
     pub fn begin_billed_request(&self, input: BeginRequestInput) -> Result<BeginRequest, CoreError> {
-        self.begin_request_internal(input, false)
+        self.begin_request_internal(input, false, false)
+    }
+
+    /// Coalesce headerless video retries for the same Key and canonical body.
+    /// Active requests remain reusable regardless of age; completed requests
+    /// are reusable for two minutes to cover immediate client auto-retries.
+    pub fn begin_implicit_billed_video_request(
+        &self,
+        mut input: BeginRequestInput,
+    ) -> Result<BeginRequest, CoreError> {
+        if input.endpoint != "videos" {
+            return Err(CoreError::InvalidConfiguration {
+                key: "implicit_video_idempotency.endpoint".into(),
+                value: input.endpoint,
+            });
+        }
+        input.idempotency_key = format!("core-implicit:{}", Self::new_id("retry"));
+        self.begin_request_internal(input, false, true)
     }
 
     /// Link a separately billed internal child call to its client-visible
@@ -941,6 +958,7 @@ impl CoreStore {
         &self,
         input: BeginRequestInput,
         require_local_cost_policy: bool,
+        coalesce_implicit_video_retry: bool,
     ) -> Result<BeginRequest, CoreError> {
         let request_hash = request_hash(&input.endpoint, &input.model, &input.body);
         let scope = format!("{}:{}:{}", input.user_id, input.api_key_id, input.endpoint);
@@ -961,6 +979,29 @@ impl CoreStore {
                 user_id: input.user_id,
                 api_key_id: input.api_key_id,
             });
+        }
+
+        if coalesce_implicit_video_retry {
+            const RETRY_WINDOW_MS: i64 = 2 * 60 * 1000;
+            let previous_request_id = transaction
+                .query_row(
+                    "SELECT r.id FROM idempotency_keys i
+                     JOIN requests r ON r.id = i.request_id
+                     WHERE i.scope = ?1 AND i.client_key LIKE 'core-implicit:%'
+                       AND i.request_hash = ?2 AND r.model = ?3
+                       AND (r.created_at_ms >= ?4 OR r.state IN
+                         ('reserved','queued','dispatched','completing','unknown'))
+                     ORDER BY r.created_at_ms DESC LIMIT 1",
+                    params![&scope, request_hash.to_vec(), &input.model, now.saturating_sub(RETRY_WINDOW_MS)],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(request_id) = previous_request_id {
+                return Ok(BeginRequest::Existing(Self::request_handle_in_transaction(
+                    &transaction,
+                    &request_id,
+                )?));
+            }
         }
 
         if let Some((stored_hash, request_id)) = transaction

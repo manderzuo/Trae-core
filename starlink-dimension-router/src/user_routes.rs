@@ -348,6 +348,25 @@ fn begin_billed_request(
         .map_err(|error| request_error(StatusCode::INTERNAL_SERVER_ERROR, "core_error", error.to_string()))
 }
 
+fn begin_implicit_billed_video_request(
+    store: &CoreStore,
+    principal: &Principal,
+    model: &str,
+    body: &Value,
+) -> Result<BeginRequest, Response> {
+    store
+        .begin_implicit_billed_video_request(BeginRequestInput {
+            user_id: principal.user_id.clone(),
+            api_key_id: principal.key_id.clone(),
+            protocol: "openai".into(),
+            endpoint: "videos".into(),
+            model: model.into(),
+            idempotency_key: String::new(),
+            body: body.clone(),
+        })
+        .map_err(|error| request_error(StatusCode::INTERNAL_SERVER_ERROR, "core_error", error.to_string()))
+}
+
 fn quote_unavailable(request_id: &str) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -1087,9 +1106,6 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
     let model = value.get("model").and_then(Value::as_str).unwrap_or(&state.config.default_model).to_string();
     let seedance = is_seedance_model(&model);
     let seedance_stream = seedance && value.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    if seedance_stream && headers.get("idempotency-key").and_then(|value| value.to_str().ok()).is_none_or(|value| value.trim().is_empty()) {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": {"type": "invalid_request_error", "code": "idempotency_key_required", "message": "Seedance 流式请求必须提供 Idempotency-Key，确保断线重连不会重复生成或扣费"}}))).into_response();
-    }
     if let Err(response) = authorize_scope(&principal, if seedance { "videos:submit" } else { "chat:invoke" }) { return response; }
     if seedance {
         if let Err(response) = require_video_admission(&state, &principal, &model, &value) {
@@ -1097,14 +1113,14 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
         }
     }
     let endpoint = if seedance { "videos" } else { "chat" };
-    let request = match begin_billed_request(
-        &state.store,
-        &principal,
-        endpoint,
-        &model,
-        idempotency(&headers),
-        &value,
-    ) {
+    let headerless_seedance_stream = seedance_stream
+        && headers.get("idempotency-key").and_then(|value| value.to_str().ok()).is_none_or(|value| value.trim().is_empty());
+    let begun = if headerless_seedance_stream {
+        begin_implicit_billed_video_request(&state.store, &principal, &model, &value)
+    } else {
+        begin_billed_request(&state.store, &principal, endpoint, &model, idempotency(&headers), &value)
+    };
+    let request = match begun {
         Ok(BeginRequest::Created(request)) => request,
         Ok(BeginRequest::Conflict) => return (StatusCode::CONFLICT, Json(json!({"error": {"type": "idempotency_conflict", "message": "Idempotency-Key 与历史请求内容不一致"}}))).into_response(),
         Ok(BeginRequest::Existing(request)) => {

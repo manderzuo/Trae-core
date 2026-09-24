@@ -496,17 +496,66 @@ async fn seedance_stream_forwards_nonstream_with_reference_and_waits_for_verifie
 }
 
 #[tokio::test]
-async fn stream_requires_idempotency_key_before_any_upstream_call() {
+async fn stream_without_idempotency_key_uses_a_core_request_id_and_completes() {
     let fixture = stream_fixture();
     let response = post_chat(&fixture, &fixture.key, None, video_chat_body(true)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers()["content-type"].to_str().unwrap().starts_with("text/event-stream"));
     let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(value["error"]["code"], "idempotency_key_required");
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("https://api.gemstory.cn/v1/videos/video-stream-test/content"));
+    assert_eq!(text.matches("data: [DONE]\n\n").count(), 1);
+    let request_id = payloads(text.as_bytes())
+        .iter()
+        .find_map(|chunk| chunk.pointer("/video_task/request_id").and_then(serde_json::Value::as_str))
+        .expect("server-generated parent request id must be returned")
+        .to_owned();
+    assert!(!request_id.is_empty());
+    assert_eq!(fixture.gateway.core_request_id_for_model("seedance").as_deref(), Some(request_id.as_str()));
     assert_eq!(
         fixture.gateway.request_count("POST", "/v1/chat/completions"),
-        0
+        1
     );
+    assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "deepseek-v4-flash"), 1);
+    let balance = fixture.store.key_quota_balance_for_principal(&fixture.billing_principal, "credits").unwrap();
+    assert_eq!(balance.settled, 5_000_000);
+    assert_eq!(balance.held, 0);
     let _ = fixture.dir.path();
+}
+
+#[tokio::test]
+async fn immediate_headerless_retry_reuses_the_same_video_and_charge() {
+    let fixture = stream_fixture();
+    for _ in 0..2 {
+        let response = post_chat(&fixture, &fixture.key, None, video_chat_body(true)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("https://api.gemstory.cn/v1/videos/video-stream-test/content"));
+        assert_eq!(text.matches("data: [DONE]\n\n").count(), 1);
+    }
+    assert_eq!(fixture.gateway.request_count("POST", "/v1/chat/completions"), 1);
+    assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "deepseek-v4-flash"), 1);
+    let balance = fixture.store.key_quota_balance_for_principal(&fixture.billing_principal, "credits").unwrap();
+    assert_eq!(balance.settled, 5_000_000);
+    assert_eq!(balance.held, 0);
+}
+
+#[tokio::test]
+async fn changed_headerless_prompt_is_a_new_video_request() {
+    let fixture = stream_fixture();
+    let first = post_chat(&fixture, &fixture.key, None, video_chat_body(true)).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    to_bytes(first.into_body(), 64 * 1024).await.unwrap();
+
+    let mut changed = video_chat_body(true);
+    changed["messages"][0]["content"][0]["text"] = "请制作另一段视频".into();
+    let second = post_chat(&fixture, &fixture.key, None, changed).await;
+    assert_eq!(second.status(), StatusCode::OK);
+    to_bytes(second.into_body(), 64 * 1024).await.unwrap();
+
+    assert_eq!(fixture.gateway.request_count("POST", "/v1/chat/completions"), 2);
+    assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "deepseek-v4-flash"), 2);
 }
 
 #[tokio::test]
