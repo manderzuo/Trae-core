@@ -3,7 +3,8 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
+    time::Duration,
 };
 
 use aiwork_core::{AssetState, CoreAsset, CoreStore, CreateAssetInput, Principal};
@@ -16,6 +17,30 @@ use thiserror::Error;
 
 pub const MAX_ASSET_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_TTL_MS: i64 = 30 * 60 * 1000;
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+
+pub fn spawn_cleanup(state: &Arc<crate::state::StarlinkRouterState>) {
+    let weak_state: Weak<crate::state::StarlinkRouterState> = Arc::downgrade(state);
+    tokio::spawn(async move {
+        loop {
+            let Some(state) = weak_state.upgrade() else { break; };
+            let cleanup_state = state.clone();
+            match tokio::task::spawn_blocking(move || {
+                cleanup_expired_assets_once(
+                    &cleanup_state.store,
+                    &cleanup_state.config.data_dir,
+                    Utc::now().timestamp_millis(),
+                )
+            }).await {
+                Ok(Err(error)) => eprintln!("Core asset cleanup failed: {error}"),
+                Err(error) => eprintln!("Core asset cleanup task failed: {error}"),
+                Ok(Ok(_)) => {},
+            }
+            drop(state);
+            tokio::time::sleep(CLEANUP_INTERVAL).await;
+        }
+    });
+}
 
 #[derive(Debug, Deserialize)]
 pub struct AssetUploadRequest {
@@ -257,6 +282,57 @@ pub fn persist_asset(store: &CoreStore, principal: &Principal, stored: &StoredAs
             let _ = fs::remove_file(&stored.storage_path);
             Err(AssetError::Storage(error.to_string()))
         }
+    }
+}
+
+/// Marks timed-out assets inaccessible and removes only files that still
+/// match their own Core record. Expired records remain for audit and retries.
+pub fn cleanup_expired_assets_once(store: &CoreStore, data_dir: &Path, now_ms: i64) -> Result<usize, AssetError> {
+    store.expire_assets(now_ms).map_err(|error| AssetError::Storage(error.to_string()))?;
+    let candidates = store.expired_assets_for_cleanup(now_ms)
+        .map_err(|error| AssetError::Storage(error.to_string()))?;
+    let mut removed = 0;
+    let mut first_error = None;
+    for asset in candidates {
+        let result = (|| -> Result<bool, AssetError> {
+            let expected_ref = format!("assets/{}.{}", asset.id, asset.extension);
+            if asset.storage_ref != expected_ref {
+                return Err(AssetError::Storage("到期素材的存储引用与 ID 不一致".into()));
+            }
+            let root = asset_dir(data_dir);
+            let root_type = fs::symlink_metadata(&root)
+                .map_err(|error| AssetError::Storage(error.to_string()))?
+                .file_type();
+            if !root_type.is_dir() || root_type.is_symlink() {
+                return Err(AssetError::Storage("素材存储目录不是普通目录".into()));
+            }
+            let path = storage_path(data_dir, &asset.storage_ref)?;
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(AssetError::Storage(error.to_string())),
+            };
+            if !metadata.file_type().is_file() || metadata.len() != asset.size as u64 {
+                return Err(AssetError::Storage("到期素材文件类型或大小与记录不符，已保留文件".into()));
+            }
+            let bytes = fs::read(&path).map_err(|error| AssetError::Storage(error.to_string()))?;
+            if format!("{:x}", Sha256::digest(&bytes)) != asset.sha256 {
+                return Err(AssetError::Storage("到期素材内容与记录不符，已保留文件".into()));
+            }
+            fs::remove_file(&path).map_err(|error| AssetError::Storage(error.to_string()))?;
+            Ok(true)
+        })();
+        match result {
+            Ok(true) => removed += 1,
+            Ok(false) => {},
+            Err(error) => {
+                if first_error.is_none() { first_error = Some(error); }
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(removed),
     }
 }
 

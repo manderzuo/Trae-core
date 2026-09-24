@@ -161,6 +161,28 @@ fn expired_assets_are_not_readable_and_invalid_storage_refs_fail_closed() {
 }
 
 #[test]
+fn expired_asset_cleanup_candidates_remain_available_after_an_interrupted_sweep() {
+    let (store, principal, _other, dir) = fixture();
+    store.create_asset(&principal, input("expired", 10_000, 11)).unwrap();
+    store.create_asset(&principal, input("future", 20_000, 12)).unwrap();
+
+    assert!(store.expired_assets_for_cleanup(10_001).unwrap().is_empty());
+    assert_eq!(store.expire_assets(10_001).unwrap(), vec!["assets/expired.png"]);
+    let first = store.expired_assets_for_cleanup(10_001).unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].id, "expired");
+    assert_eq!(first[0].storage_ref, "assets/expired.png");
+    assert_eq!(first[0].state, AssetState::Expired);
+
+    // A crashed cleanup worker must still see the same expired file on retry.
+    let retry = store.expired_assets_for_cleanup(10_001).unwrap();
+    assert_eq!(retry.len(), 1);
+    assert_eq!(retry[0].id, "expired");
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn duplicate_asset_id_and_token_digest_are_rejected_without_partial_rows() {
     let (store, principal_a, _principal_b, dir) = fixture();
     store

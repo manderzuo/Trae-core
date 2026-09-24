@@ -443,6 +443,78 @@ async fn expired_asset_and_missing_file_are_not_found() {
 }
 
 #[tokio::test]
+async fn cleanup_retries_an_expired_asset_file_without_touching_an_active_asset() {
+    let fixture = fixture();
+    let expired = upload_png_id(&fixture.app, &fixture.owner_key).await;
+    let active = upload_png_id(&fixture.app, &fixture.owner_key).await;
+    let principal = fixture.store.authenticate_api_key(&fixture.owner_key).unwrap();
+    let expired_record = fixture.store.asset_for_user(&principal, &expired).unwrap().unwrap();
+    let active_record = fixture.store.asset_for_user(&principal, &active).unwrap().unwrap();
+    let expired_path = fixture.dir.join("data").join(&expired_record.storage_ref);
+    let active_path = fixture.dir.join("data").join(&active_record.storage_ref);
+    let now = Utc::now().timestamp_millis();
+    let database = fixture.dir.join("data").join(aiwork_core::CORE_DB_FILE);
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection.execute("UPDATE assets SET expires_at_ms = ?1 WHERE id = ?2", rusqlite::params![now - 1, expired]).unwrap();
+    drop(connection);
+    assert!(expired_path.exists());
+    assert!(active_path.exists());
+    fixture.store.expire_assets(now).unwrap(); // Simulate a crash after DB expiry, before file removal.
+
+    assert_eq!(starlink_dimension_router::assets::cleanup_expired_assets_once(&fixture.store, &fixture.dir, now).unwrap(), 1);
+    assert!(!expired_path.exists());
+    assert!(active_path.exists());
+    assert_eq!(fixture.store.asset_for_user(&principal, &expired).unwrap().unwrap().state, aiwork_core::AssetState::Expired);
+    assert_eq!(fixture.store.asset_for_user(&principal, &active).unwrap().unwrap().state, aiwork_core::AssetState::Active);
+}
+
+#[tokio::test]
+async fn cleanup_refuses_to_delete_an_expired_file_whose_content_changed() {
+    let fixture = fixture();
+    let id = upload_png_id(&fixture.app, &fixture.owner_key).await;
+    let principal = fixture.store.authenticate_api_key(&fixture.owner_key).unwrap();
+    let record = fixture.store.asset_for_user(&principal, &id).unwrap().unwrap();
+    let path = fixture.dir.join("data").join(&record.storage_ref);
+    let now = Utc::now().timestamp_millis();
+    let database = fixture.dir.join("data").join(aiwork_core::CORE_DB_FILE);
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection.execute("UPDATE assets SET expires_at_ms = ?1 WHERE id = ?2", rusqlite::params![now - 1, id]).unwrap();
+    drop(connection);
+    fs::write(&path, b"changed content; preserve for inspection").unwrap();
+
+    assert!(starlink_dimension_router::assets::cleanup_expired_assets_once(&fixture.store, &fixture.dir, now).is_err());
+    assert!(path.exists());
+    assert_eq!(fs::read(&path).unwrap(), b"changed content; preserve for inspection");
+}
+
+#[tokio::test]
+async fn router_startup_starts_expired_asset_cleanup() {
+    let fixture = fixture();
+    let id = upload_png_id(&fixture.app, &fixture.owner_key).await;
+    let principal = fixture.store.authenticate_api_key(&fixture.owner_key).unwrap();
+    let record = fixture.store.asset_for_user(&principal, &id).unwrap().unwrap();
+    let path = fixture.dir.join("data").join(&record.storage_ref);
+    let database = fixture.dir.join("data").join(aiwork_core::CORE_DB_FILE);
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection.execute(
+        "UPDATE assets SET expires_at_ms = ?1 WHERE id = ?2",
+        rusqlite::params![Utc::now().timestamp_millis() - 1, id],
+    ).unwrap();
+    drop(connection);
+    assert!(path.exists());
+
+    let state = StarlinkRouterState::for_test(
+        fixture.store.clone(), BridgeClient::new("", ""), RouterConfig::defaults(fixture.dir.to_path_buf()),
+    );
+    let _restarted_router = build_router(state);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }).await.expect("startup must clean the expired file without an API request");
+}
+
+#[tokio::test]
 async fn video_request_rewrites_core_asset_ids_to_bridge_asset_ids() {
     let fixture = video_fixture();
     let uploaded = post_bearer(

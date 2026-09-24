@@ -702,6 +702,24 @@ impl CoreStore {
         Ok(assets.into_iter().map(|(_, storage_ref)| storage_ref).collect())
     }
 
+    /// Lists expired asset files until filesystem cleanup succeeds. This is
+    /// intentionally repeatable so a crash after `expire_assets` cannot leak
+    /// files permanently; the authoritative asset record and audit remain.
+    pub fn expired_assets_for_cleanup(&self, now_ms: i64) -> Result<Vec<CoreAsset>, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT id, user_id, filename, mime_type, extension, size, sha256,
+                    storage_ref, content_token_digest, created_at_ms, expires_at_ms, state
+             FROM assets WHERE state = 'expired' AND expires_at_ms <= ?1
+             ORDER BY expires_at_ms, id",
+        )?;
+        let assets = statement
+            .query_map([now_ms], Self::asset_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(CoreError::from)?;
+        Ok(assets)
+    }
+
     pub fn upsert_upstream_account(
         &self,
         input: RegisterUpstreamAccount,
