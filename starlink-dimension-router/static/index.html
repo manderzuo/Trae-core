@@ -333,8 +333,9 @@
       ['待对账', counts.reconcile_required ?? 0, '不自动重试或重复扣费'],
       ['已核验结算', counts.verified_settled ?? 0, '仅统计有任务级回执的任务'],
       ['历史未核验', counts.legacy_unverified ?? 0, '旧任务不自动补扣或退款'],
-    ].map(([label, value, note]) => `<div class="card"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(formatCount(value))}</div><div class="hint">${escapeHtml(note)}</div></div>`).join('');
+    ].map(([label, value, note]) => `<div class="card"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(label === '安全状态' ? value : formatCount(value))}</div><div class="hint">${escapeHtml(note)}</div></div>`).join('');
     $('videoBillingReason').textContent = `当前原因：${data?.reason || '—'}${data?.diagnostic?.claimed ? ' · 本次一次性验收已使用' : ''}`;
+    $('videoBillingMsg').textContent = '';
   }
 
   async function refreshVideoBilling() {
