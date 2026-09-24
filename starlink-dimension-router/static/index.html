@@ -116,6 +116,7 @@
   let refreshing = false;
   let authenticated = false;
   let latestKeys = [];
+  const expandedUsageKeys = new Set();
   let currentSummary = null;
   const $ = id => document.getElementById(id);
   const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
@@ -285,6 +286,15 @@
     renderAllocationHint();
   }
 
+  function toggleUsageDetails(keyId) {
+    if (expandedUsageKeys.has(keyId)) {
+      expandedUsageKeys.delete(keyId);
+      return false;
+    }
+    expandedUsageKeys.add(keyId);
+    return true;
+  }
+
   function renderKeyList(keys) {
     latestKeys = Array.isArray(keys) ? keys : [];
     $('keyCount').textContent = `${latestKeys.length} 个 Key`;
@@ -307,7 +317,7 @@
           <div><div class="key-label">权限与状态</div><div class="scope-list">${escapeHtml(scopes)}</div><div style="margin-top:6px"><span class="pill ${billingBlocked?'off':active?'':'off'}">${billingBlocked?'计费冻结':active?'已开启':'已关闭'}</span></div></div>
           <div class="key-actions"><button class="btn alt small" data-action="copy" type="button">复制 Key</button><button class="btn alt small" data-action="toggle" type="button">${active?'关闭':'开启'}</button><button class="btn alt small" data-action="concurrency" type="button">调整并发</button><button class="btn alt small" data-action="usage" type="button">使用情况</button><button class="btn small" data-action="rotate" type="button">轮换</button><button class="btn warn small" data-action="delete" type="button">删除</button></div>
         </div>
-        <div class="hint" data-usage hidden>显示名称：${escapeHtml(key.display_name)} · 已分配 ${escapeHtml(formatCredits(credits.allocated))} · 已实扣 ${escapeHtml(formatCredits(credits.used))} · 剩余 ${escapeHtml(formatCredits(credits.remaining))} · 持有 ${escapeHtml(formatCredits(credits.held))}${billingBlocked?` · 计费冻结，超额 ${escapeHtml(formatCredits(credits.deficit))}`:''} · 并发 ${escapeHtml(formatCount(key.current_concurrency))}/${escapeHtml(formatCount(key.max_concurrency))}</div>
+        <div class="hint" ${expandedUsageKeys.has(key.id) ? 'data-usage' : 'data-usage hidden'}>显示名称：${escapeHtml(key.display_name)} · 已分配 ${escapeHtml(formatCredits(credits.allocated))} · 已实扣 ${escapeHtml(formatCredits(credits.used))} · 剩余 ${escapeHtml(formatCredits(credits.remaining))} · 持有 ${escapeHtml(formatCredits(credits.held))}${billingBlocked?` · 计费冻结，超额 ${escapeHtml(formatCredits(credits.deficit))}`:''} · 并发 ${escapeHtml(formatCount(key.current_concurrency))}/${escapeHtml(formatCount(key.max_concurrency))}</div>
       </article>`;
     }).join('');
   }
@@ -530,7 +540,7 @@
     try {
       if (button.dataset.action === 'usage') {
         const details = row.querySelector('[data-usage]');
-        details.hidden = !details.hidden;
+        details.hidden = !toggleUsageDetails(key.id);
         return;
       }
       if (button.dataset.action === 'copy') {
