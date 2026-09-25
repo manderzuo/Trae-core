@@ -451,7 +451,22 @@ impl BridgeClient {
                 return Ok(BridgeBillingResult::Unresolved);
             }
         }
+        let expected_pre_dispatch_source = format!("aiwork-pre-dispatch-no-charge:{request_id}");
+        if source_ref.as_deref().is_some_and(|value| value.starts_with("aiwork-pre-dispatch-no-charge:"))
+            && (source_ref.as_deref() != Some(expected_pre_dispatch_source.as_str())
+                || receipt.task_ref.is_some()
+                || receipt.actual_credits.is_none_or(|amount| amount.as_microcredits() != 0))
+        {
+            return Ok(BridgeBillingResult::Unresolved);
+        }
         let status = match receipt.status.as_str() {
+            "final" if unit_is_credits && source_is_verified
+                && source_ref.as_deref() == Some(expected_pre_dispatch_source.as_str())
+                && receipt.task_ref.is_none()
+                && receipt.actual_credits.is_some_and(|amount| amount.as_microcredits() == 0) =>
+            {
+                BillingReceiptStatus::FailedNoCharge
+            }
             "final" if unit_is_credits && source_is_verified && receipt.actual_credits.is_some() => {
                 BillingReceiptStatus::Final
             }
@@ -554,6 +569,29 @@ impl BridgeClient {
         let headers = self.controlled_headers(incoming_headers, request_id, operation_id, core_key_id)?;
         let url = format!("{}{}", self.base_url, normalize_path(path));
         self.transport.send(method, &url, &headers, body)
+    }
+
+    /// Only observes an already created AI Work task. Never submits video.
+    pub fn controlled_video_task(&self, request_id: &str) -> Result<Option<(String, String)>, String> {
+        let path = format!("/internal/bridge/requests/{request_id}/video-task");
+        let response = self.forward("GET", &path, &[], &BTreeMap::new(), request_id)?;
+        if !(200..300).contains(&response.status) {
+            return Err(format!("AI Work 受控视频任务查询返回 HTTP {}", response.status));
+        }
+        let value: Value = serde_json::from_slice(&response.body)
+            .map_err(|error| format!("AI Work 受控视频任务响应无效: {error}"))?;
+        if value.get("request_id").and_then(Value::as_str) != Some(request_id) {
+            return Err("AI Work 受控视频任务 request_id 不匹配".into());
+        }
+        if value.get("task").is_some_and(Value::is_null) {
+            return Ok(None);
+        }
+        let task = value.get("task").ok_or("AI Work 受控视频任务字段缺失")?;
+        let id = task.get("id").and_then(Value::as_str).filter(|id| !id.trim().is_empty())
+            .ok_or("AI Work 受控视频任务 ID 缺失")?;
+        let status = task.get("status").and_then(Value::as_str).filter(|status| !status.trim().is_empty())
+            .ok_or("AI Work 受控视频任务状态缺失")?;
+        Ok(Some((id.into(), status.into())))
     }
 
     pub fn forward_controlled_stream_for_key(
@@ -828,7 +866,8 @@ impl HttpBridgeTransport {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_bounded_response, BridgeClient, BridgeResponse, BridgeTransport};
+    use super::{read_bounded_response, BridgeBillingResult, BridgeClient, BridgeResponse, BridgeTransport};
+    use aiwork_core::BillingReceiptStatus;
     use std::{collections::BTreeMap, io::{Read, Write}, net::TcpListener, sync::{Arc, Mutex}, thread, time::Duration};
 
     struct RecordingBridge {
@@ -987,6 +1026,27 @@ mod tests {
         assert_eq!(captured.get("x-core-key-id").map(String::as_str), Some("key_server_owned"));
         assert_eq!(captured.get("authorization").map(String::as_str), Some("Bearer bridge-secret"));
         assert!(!captured.values().any(|value| value.contains("aw_live_never_forward")));
+    }
+
+    #[test]
+    fn controlled_video_task_lookup_requires_matching_request_identity() {
+        let body = br#"{"request_id":"req-one","task":{"id":"video-one","status":"processing"}}"#;
+        let client = BridgeClient::from_transport("http://bridge", "secret",
+            Arc::new(RecordingBridge::responding_with_body(200, body)));
+        assert_eq!(client.controlled_video_task("req-one").unwrap(), Some(("video-one".into(), "processing".into())));
+        assert!(client.controlled_video_task("req-other").is_err());
+    }
+
+    #[test]
+    fn pre_dispatch_zero_receipt_is_failed_no_charge_not_successful_video() {
+        let body = br#"{"request_id":"req-zero","status":"final","actual_credits":"0.000000","unit":"credits","source_ref":"aiwork-pre-dispatch-no-charge:req-zero","task_ref":null,"observed_at_ms":1790000000000}"#;
+        let client = BridgeClient::from_transport("http://bridge", "secret",
+            Arc::new(RecordingBridge::responding_with_body(200, body)));
+        let BridgeBillingResult::Final(receipt) = client.billing("req-zero").unwrap() else {
+            panic!("verified zero receipt must be final");
+        };
+        assert_eq!(receipt.status, BillingReceiptStatus::FailedNoCharge);
+        assert_eq!(receipt.actual_credits.unwrap().as_microcredits(), 0);
     }
 
     #[test]

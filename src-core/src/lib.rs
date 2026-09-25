@@ -18,7 +18,7 @@ mod video_billing;
 
 pub use cost::{CostError, CostEstimate, CostPolicy};
 pub use credits::CreditAmount;
-pub use controlled_billing::{ControlledOperation, ControlledSettlement, ControlledStepKind, ControlledStepResult};
+pub use controlled_billing::{ControlledOperation, ControlledRecoverableStep, ControlledSettlement, ControlledStepKind, ControlledStepResult};
 pub use error::CoreError;
 pub use identity::{require_scope, AuthError, Principal};
 pub use models::{

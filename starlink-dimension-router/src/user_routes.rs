@@ -1,8 +1,8 @@
-use std::{collections::{BTreeMap, HashMap}, io, pin::Pin, sync::Arc, task::{Context, Poll}, time::{Duration, Instant}};
+use std::{collections::{BTreeMap, BTreeSet, HashMap}, io, pin::Pin, sync::Arc, task::{Context, Poll}, time::{Duration, Instant}};
 
 use aiwork_core::{
-    BillingQuote, BillingReceiptResult, BillingReservationResult, BeginRequest, BeginRequestInput,
-    CoreError, CoreStore, CreditAmount, Principal, RequestResult, RequestState, Settlement,
+    BillingReceiptResult, BillingReservationResult, BeginRequest, BeginRequestInput,
+    ControlledStepKind, ControlledStepResult, CoreError, CoreStore, Principal, RequestResult, RequestState, Settlement,
     UpstreamCreditSnapshot,
 };
 use axum::{body::{Body, Bytes}, extract::{Extension, Path, Query, State}, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, Json};
@@ -23,11 +23,10 @@ fn header_map(headers: &HeaderMap) -> BTreeMap<String, String> {
 
 fn video_forward_headers(headers: &HeaderMap, request_id: &str) -> BTreeMap<String, String> {
     let mut forwarded = header_map(headers);
-    if forwarded.get("idempotency-key").is_none_or(|value| value.trim().is_empty()) {
-        // The Core request ID is durable and unique even when the client cannot
-        // send this header. AI Work requires it before creating a video task.
-        forwarded.insert("idempotency-key".into(), request_id.into());
-    }
+    // The client key is scoped to a Core API Key in Core's request ledger, but
+    // AI Work sees only the shared bridge credential. Its idempotency namespace
+    // must therefore use Core's durable, globally unique request identity.
+    forwarded.insert("idempotency-key".into(), request_id.into());
     forwarded
 }
 
@@ -565,112 +564,88 @@ fn quote_and_reserve(
     }
 }
 
-fn reserve_quote_with_snapshot(
-    state: &StarlinkRouterState,
-    request_id: &str,
-    quote: BillingQuote,
-    upstream_snapshot: UpstreamCreditSnapshot,
-) -> Result<(String, String), Response> {
-    let quote_id = quote.quote_id.clone();
-    match state.store.reserve_credit_quote_with_upstream_snapshot(quote, upstream_snapshot) {
-        Ok(BillingReservationResult::Created { reservation, .. }) => Ok((quote_id, reservation.id)),
-        Ok(BillingReservationResult::Existing { .. }) => Err(request_error(
-            StatusCode::CONFLICT,
-            "request_already_reserved",
-            format!("该请求已存在积分预占，已阻止重复提交。request_id={request_id}"),
-        )),
-        Ok(BillingReservationResult::Insufficient { available, required }) => Err(request_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "insufficient_quota",
-            format!("积分不足：可用 {}，本次上限 {}。request_id={request_id}", format_microcredits(available), format_microcredits(required)),
-        )),
-        Err(error) => {
-            let (status, code) = match error {
-                CoreError::KeyConcurrencyExceeded { .. } => (StatusCode::TOO_MANY_REQUESTS, "concurrency_limit"),
-                CoreError::KeyQuotaNotConfigured { .. } | CoreError::QuotaInsufficient { .. } => (StatusCode::TOO_MANY_REQUESTS, "insufficient_quota"),
-                error @ CoreError::UpstreamCreditsUnavailable { .. } => {
-                    return Err(upstream_credits_unavailable(request_id, "upstream_credits_unavailable", error.to_string()));
-                }
-                error @ CoreError::UpstreamCommitmentsExceedBalance { .. } => {
-                    return Err(upstream_credits_unavailable(request_id, "upstream_commitments_exceed_balance", error.to_string()));
-                }
-                _ => (StatusCode::INTERNAL_SERVER_ERROR, "one_shot_reservation_failed"),
-            };
-            Err(request_error(status, code, format!("一次性积分预占失败，未发送视频请求。request_id={request_id}")))
-        }
-    }
-}
-
-fn quote_and_reserve_with_one_shot_fallback(
-    state: &StarlinkRouterState,
-    principal: &Principal,
-    request_id: &str,
-    endpoint: &str,
-    model: &str,
-    allow_unquoted_one_shot: bool,
-) -> Result<(String, String, bool), Response> {
-    let upstream_snapshot = state.bridge.lock().unwrap().upstream_credit_snapshot().map_err(|_| {
-        upstream_credits_unavailable(
-            request_id,
-            "upstream_credits_unavailable",
-            "AI Work 统一积分余额不可用或已过期，已阻止付费请求",
-        )
-    })?;
-    let fingerprint = state.store.request_fingerprint_for_billing(request_id).map_err(|error| {
-        request_error(StatusCode::INTERNAL_SERVER_ERROR, "core_error", error.to_string())
-    })?;
-    let quote_result = state.bridge.lock().unwrap().quote(request_id, endpoint, model, &fingerprint);
-    let (quote, one_shot_test) = match quote_result {
-        Ok(BridgeQuoteResult::Quoted(quote)) => (quote, false),
-        Ok(BridgeQuoteResult::Unavailable { error_code })
-            if allow_unquoted_one_shot && error_code == "quote_unavailable" =>
-        {
-            let balance = state.store.key_quota_balance_for_principal(principal, "credits").map_err(|error| {
-                request_error(StatusCode::TOO_MANY_REQUESTS, "insufficient_quota", error.to_string())
-            })?;
-            let Some(max_credits) = CreditAmount::try_from_microcredits(balance.available) else {
-                return Err(request_error(StatusCode::TOO_MANY_REQUESTS, "insufficient_quota", "该 API Key 没有可用积分，未发送付费请求"));
-            };
-            if max_credits.as_microcredits() == 0 {
-                return Err(request_error(StatusCode::TOO_MANY_REQUESTS, "insufficient_quota", "该 API Key 没有可用积分，未发送付费请求"));
-            }
-            let expires_at_ms = Utc::now().timestamp_millis().saturating_add(30 * 24 * 60 * 60 * 1_000);
-            (
-                BillingQuote {
-                    request_id: request_id.into(),
-                    quote_id: format!("authorized-one-shot-test-{request_id}"),
-                    request_fingerprint: fingerprint,
-                    endpoint: endpoint.into(),
-                    model: model.into(),
-                    max_credits,
-                    unit: "credits".into(),
-                    expires_at_ms,
-                    source_ref: "core-approved-one-shot-unquoted-test".into(),
-                },
-                true,
-            )
-        }
-        Ok(BridgeQuoteResult::Unavailable { .. }) | Err(_) => return Err(quote_unavailable(request_id)),
-    };
-    reserve_quote_with_snapshot(state, request_id, quote, upstream_snapshot)
-        .map(|(quote_id, reservation_id)| (quote_id, reservation_id, one_shot_test))
-}
-
 fn quote_and_reserve_video(
     state: &StarlinkRouterState,
-    principal: &Principal,
     request_id: &str,
     model: &str,
-    allow_unquoted_one_shot: bool,
 ) -> Result<(String, String, bool), Response> {
-    quote_and_reserve_with_one_shot_fallback(
-        state,
-        principal,
-        request_id,
-        "videos",
-        model,
-        allow_unquoted_one_shot,
-    )
+    quote_and_reserve(state, request_id, "videos", model)
+        .map(|(quote_id, reservation_id)| (quote_id, reservation_id, false))
+}
+
+/// Mirror the bridge's deterministic Seedance validation before taking a hold
+/// or paying for the prompt assistant. The bridge remains authoritative.
+fn validate_controlled_video_input(body: &Value, chat: bool) -> Result<(), Response> {
+    let bad = |message: String| request_error(StatusCode::BAD_REQUEST, "invalid_request_error", message);
+    let object = body.as_object().ok_or_else(|| bad("视频请求必须是 JSON 对象".into()))?;
+    if chat {
+        extract_seedance_prompt(body)?;
+        let user = object.get("messages").and_then(Value::as_array)
+            .and_then(|items| items.iter().rev().find(|item| item.get("role").and_then(Value::as_str) == Some("user")))
+            .ok_or_else(|| bad("Seedance 请求缺少用户消息".into()))?;
+        if let Some(parts) = user.get("content").and_then(Value::as_array) {
+            for part in parts {
+                match part.get("type").and_then(Value::as_str) {
+                    Some("text") if part.get("text").and_then(Value::as_str).is_some() => {}
+                    Some("image_url") => {
+                        let raw = part.pointer("/image_url/url").and_then(Value::as_str)
+                            .ok_or_else(|| bad("参考图缺少 data URL".into()))?;
+                        let (metadata, encoded) = raw.strip_prefix("data:").and_then(|value| value.split_once(','))
+                            .ok_or_else(|| bad("参考图必须使用 data URL".into()))?;
+                        if !matches!(metadata.split(';').next(), Some("image/png" | "image/jpeg" | "image/webp"))
+                            || !metadata.split(';').any(|part| part.eq_ignore_ascii_case("base64"))
+                            || STANDARD.decode(encoded.trim()).is_err()
+                        {
+                            return Err(bad("参考图 data URL 格式无效".into()));
+                        }
+                    }
+                    _ => return Err(bad("Seedance Chat 仅支持文字与 image_url 内容片段".into())),
+                }
+            }
+        } else if user.get("content").and_then(Value::as_str).is_none() {
+            return Err(bad("Seedance 用户消息内容格式无效".into()));
+        }
+    } else if object.get("prompt").and_then(Value::as_str).is_none_or(|value| value.trim().is_empty()) {
+        return Err(bad("prompt 不能为空".into()));
+    }
+    if object.get("model").and_then(Value::as_str).is_some_and(|value| value.len() > 96) {
+        return Err(bad("model 过长".into()));
+    }
+    if let Some(duration) = object.get("duration") {
+        if !duration.as_u64().is_some_and(|value| (2..=15).contains(&value)) {
+            return Err(bad("duration 必须是 2-15 秒的整数".into()));
+        }
+    }
+    if let Some(resolution) = object.get("resolution") {
+        if !resolution.as_str().is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "480p" | "720p" | "1080p" | "4k")) {
+            return Err(bad("resolution 仅支持 480p、720p、1080p 或 4K".into()));
+        }
+    }
+    if let Some(ratio) = object.get("ratio") {
+        if !ratio.as_str().is_some_and(|value| matches!(value.trim(), "16:9" | "9:16" | "1:1" | "4:3" | "3:4" | "21:9")) {
+            return Err(bad("ratio 不是支持的画面比例".into()));
+        }
+    }
+    for field in ["image_asset_ids", "video_asset_ids"] {
+        if let Some(value) = object.get(field) {
+            if !value.as_array().is_some_and(|items| items.len() <= 10 && items.iter().all(|item| item.as_str().is_some_and(|id| !id.trim().is_empty()))) {
+                return Err(bad(format!("{field} 最多包含 10 个非空字符串")));
+            }
+        }
+    }
+    if !chat {
+        for field in ["image_paths", "video_paths", "image_data", "video_data"] {
+            if object.contains_key(field) { return Err(bad(format!("{field} 请先上传到 /v1/assets"))); }
+        }
+        for field in ["image_urls", "video_urls"] {
+            if let Some(value) = object.get(field) {
+                if !value.as_array().is_some_and(|items| items.len() <= 10 && items.iter().all(|item| item.as_str().is_some_and(|uri| uri.starts_with("tos-") && uri.len() <= 4096 && !uri.contains("://") && !uri.chars().any(char::is_whitespace)))) {
+                    return Err(bad(format!("{field} 请先上传到 /v1/assets")));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn transition_request_to(
@@ -861,8 +836,93 @@ pub fn reconcile_pending_billing_requests_once(state: &StarlinkRouterState) -> u
         if video_job_requests.contains(&request.request_id) {
             continue;
         }
+        if state.store.controlled_operation_exists(&request.request_id).unwrap_or(true) {
+            continue;
+        }
         queried += 1;
         let _ = reconcile_billing_request_once(state, &request.request_id);
+    }
+    let controlled_steps = match state.store.recoverable_controlled_steps(100) {
+        Ok(steps) => steps,
+        Err(_) => return queried,
+    };
+    for step in controlled_steps {
+        if video_job_requests.contains(&step.parent_request_id) || step.state == "conflict"
+            || (step.state == "verified" && step.kind != ControlledStepKind::Video) {
+            continue;
+        }
+        if step.kind == ControlledStepKind::Video {
+            let observed_task = state.bridge.lock().unwrap().controlled_video_task(&step.request_id);
+            let task = match (step.task_ref.as_deref(), observed_task) {
+                (Some(expected), Ok(Some((observed, status)))) if expected == observed => Some((observed, status)),
+                (Some(expected), Ok(None) | Err(_)) => Some((expected.to_string(), "queued".into())),
+                (None, Ok(Some(task))) => Some(task),
+                _ => None,
+            };
+            if let Some((task_id, status)) = task {
+                let identity_safe = state.jobs.lock().unwrap().get(&task_id)
+                    .is_none_or(|job| job.request_id == step.parent_request_id && job.api_key_id == step.api_key_id);
+                if identity_safe && state.store.bind_controlled_video_task(&step.parent_request_id, &task_id).is_ok() {
+                    let principal = Principal { user_id: step.user_id.clone(), key_id: step.api_key_id.clone(), scopes: BTreeSet::new() };
+                    let mut job = accepted_video_job(&principal, &step.parent_request_id, task_id.clone(),
+                        Some(step.hold_id.clone()), &status, None, false);
+                    job.controlled_operation_id = Some(step.operation_id.clone());
+                    state.jobs.lock().unwrap().insert(task_id, job);
+                    state.persist_jobs();
+                    // The video reconciler will observe its terminal state and
+                    // finalize billing; recovery never resubmits generation.
+                    queried += 1;
+                    continue;
+                }
+            }
+        }
+        queried += 1;
+        let receipt = {
+            let bridge = state.bridge.lock().unwrap();
+            match step.kind {
+                ControlledStepKind::Assist => match bridge.billing(&step.request_id) {
+                    Ok(BridgeBillingResult::Unresolved) => bridge.finalize_chat_billing(&step.request_id),
+                    other => other,
+                },
+                ControlledStepKind::Video => match step.task_ref.as_deref() {
+                    Some(task_ref) => bridge.finalize_video_billing(&step.request_id, task_ref),
+                    None => bridge.billing(&step.request_id),
+                },
+            }
+        };
+        if let Ok(BridgeBillingResult::Final(receipt)) = receipt {
+            let no_charge = receipt.status == aiwork_core::BillingReceiptStatus::FailedNoCharge;
+            if matches!(state.store.record_controlled_step(&step.parent_request_id, &step.request_id,
+                step.kind, receipt), Ok(ControlledStepResult::Verified | ControlledStepResult::Duplicate))
+            {
+                if step.kind == ControlledStepKind::Assist {
+                    let _ = prepare_for_final_receipt(state, &step.request_id);
+                    let _ = transition_request_to(state, &step.request_id,
+                        if no_charge { RequestState::Failed } else { RequestState::Succeeded }, None);
+                    let _ = transition_request_to(state, &step.request_id, RequestState::Settled, None);
+                } else if no_charge && step.task_ref.is_none() {
+                    // AI Work proved this video was rejected before task creation
+                    // and before any upstream attempt. Keep any verified helper
+                    // cost, then release the remainder of the parent hold.
+                    let _ = state.store.finish_controlled_operation(&step.parent_request_id, Some(false));
+                }
+            }
+        }
+    }
+    // A final billing receipt alone does not prove that the video succeeded.
+    // The video job reconciler observes its terminal task state and commits
+    // that outcome alongside the real receipt.
+    // Operations created before this process started cannot still be between
+    // assistant and video dispatch in this process. Once every persisted
+    // assistant step is verified and no video step exists, atomically settle
+    // its actual cost (or release the untouched hold). Never apply this to a
+    // request created after startup: that would race a live helper call.
+    if let Ok(orphans) = state.store.recoverable_undispatched_operations_before(state.startup_cutoff_ms) {
+        for parent in orphans {
+            if state.store.finish_controlled_operation(&parent, None).is_ok() {
+                queried += 1;
+            }
+        }
     }
     queried
 }
@@ -872,6 +932,9 @@ fn receipt_is_settled(result: &BillingReceiptResult) -> bool {
 }
 
 fn existing_request_error(state: &StarlinkRouterState, request_id: &str) -> Response {
+    if state.store.controlled_operation_exists(request_id).unwrap_or(true) {
+        return reconcile_required(request_id);
+    }
     if state.store.reservation_for_request(request_id).ok().flatten().is_some() {
         match reconcile_billing_request_once(state, request_id) {
             Ok(result) if receipt_is_settled(&result) => {
@@ -971,12 +1034,118 @@ fn settle_chat_response(state: &StarlinkRouterState, request_id: &str) -> bool {
     )
 }
 
+fn run_controlled_seedance_assist(
+    state: &StarlinkRouterState,
+    principal: &Principal,
+    parent_request_id: &str,
+    operation_id: &str,
+    original: &Value,
+) -> Result<(String, i64), Response> {
+    let prompt = extract_seedance_prompt(original)?;
+    let model = if state.config.default_model.trim().is_empty() || is_seedance_model(&state.config.default_model) {
+        "deepseek-v4-flash"
+    } else {
+        state.config.default_model.trim()
+    };
+    let assist_body = seedance_assist_chat_body(model, original, &prompt);
+    let child = match begin_billed_request(
+        &state.store, principal, "chat", model,
+        format!("{parent_request_id}:seedance-assist-v1"), &assist_body,
+    ) {
+        Ok(BeginRequest::Created(request)) => request,
+        Ok(BeginRequest::Existing(_)) | Ok(BeginRequest::Conflict) => return Err(request_error(
+            StatusCode::CONFLICT, "seedance_assist_already_processed", "DeepSeek 辅助步骤已存在；禁止重复提交")),
+        Err(response) => return Err(response),
+    };
+    let child_id = child.id;
+    if let Err(error) = state.store.link_seedance_assist_request(parent_request_id, &child_id) {
+        let _ = fail_unreserved_pre_dispatch_request(state, &child_id, 500, "request_relation_failed");
+        return Err(request_error(StatusCode::INTERNAL_SERVER_ERROR, "request_relation_failed", error.to_string()));
+    }
+    for next in [RequestState::Validating, RequestState::Reserved, RequestState::Queued, RequestState::Dispatched] {
+        if transition_request_to(state, &child_id, next, None).is_err() {
+            mark_request_unknown(state, parent_request_id, "seedance_assist_dispatch_state_failed");
+            return Err(reconcile_required(parent_request_id));
+        }
+    }
+    if state.store.mark_controlled_step_dispatched(parent_request_id, &child_id, ControlledStepKind::Assist).is_err() {
+        mark_request_unknown(state, parent_request_id, "seedance_assist_dispatch_marker_failed");
+        return Err(reconcile_required(parent_request_id));
+    }
+    let body = match serde_json::to_vec(&assist_body) {
+        Ok(body) => body,
+        Err(_) => return Err(reconcile_required(parent_request_id)),
+    };
+    let headers = BTreeMap::from([("content-type".into(), "application/json".into())]);
+    let response = state.bridge.lock().unwrap().forward_controlled_for_key(
+        "POST", "/v1/chat/completions", &body, &headers,
+        &child_id, operation_id, &principal.key_id,
+    );
+    let response = match response {
+        Ok(response) => response,
+        Err(_) => {
+            mark_request_unknown(state, &child_id, "seedance_assist_result_unknown");
+            mark_request_unknown(state, parent_request_id, "seedance_assist_result_unknown");
+            return Err(reconcile_required(parent_request_id));
+        }
+    };
+    let receipt = {
+        let bridge = state.bridge.lock().unwrap();
+        match bridge.billing(&child_id) {
+            Ok(BridgeBillingResult::Final(receipt)) => Ok(BridgeBillingResult::Final(receipt)),
+            Ok(BridgeBillingResult::Unresolved) => bridge.finalize_chat_billing(&child_id),
+            Err(error) => Err(error),
+        }
+    };
+    let receipt = match receipt {
+        Ok(BridgeBillingResult::Final(receipt)) => receipt,
+        _ => {
+            mark_request_unknown(state, &child_id, "seedance_assist_receipt_unknown");
+            mark_request_unknown(state, parent_request_id, "seedance_assist_receipt_unknown");
+            return Err(reconcile_required(parent_request_id));
+        }
+    };
+    let actual = receipt.actual_credits.map_or(0, |value| value.as_microcredits());
+    if !matches!(state.store.record_controlled_step(parent_request_id, &child_id, ControlledStepKind::Assist, receipt),
+        Ok(ControlledStepResult::Verified | ControlledStepResult::Duplicate))
+    {
+        mark_request_unknown(state, parent_request_id, "seedance_assist_receipt_conflict");
+        return Err(reconcile_required(parent_request_id));
+    }
+    if prepare_for_final_receipt(state, &child_id).is_err()
+        || transition_request_to(state, &child_id,
+            if (200..300).contains(&response.status) { RequestState::Succeeded } else { RequestState::Failed }, None).is_err()
+        || transition_request_to(state, &child_id, RequestState::Settled, None).is_err()
+    {
+        mark_request_unknown(state, parent_request_id, "seedance_assist_terminal_state_failed");
+        return Err(reconcile_required(parent_request_id));
+    }
+    if !(200..300).contains(&response.status) {
+        if state.store.finish_controlled_operation(parent_request_id, None).is_err() {
+            mark_request_unknown(state, parent_request_id, "controlled_assist_settlement_failed");
+            return Err(reconcile_required(parent_request_id));
+        }
+        return Err(request_error(StatusCode::BAD_GATEWAY, "seedance_assist_upstream_error",
+            format!("DeepSeek 辅助请求失败，真实积分已按回执记入本次操作；request_id={child_id}")));
+    }
+    match extract_assisted_prompt(&response.body) {
+        Ok(prompt) => Ok((prompt, actual)),
+        Err(_) => {
+            if state.store.finish_controlled_operation(parent_request_id, None).is_err() {
+                mark_request_unknown(state, parent_request_id, "controlled_assist_settlement_failed");
+                return Err(reconcile_required(parent_request_id));
+            }
+            Err(request_error(StatusCode::BAD_GATEWAY, "seedance_assist_invalid_response",
+                format!("DeepSeek 辅助响应无法解析，已按真实回执结算；request_id={child_id}")))
+        }
+    }
+}
+
 fn run_seedance_assist(
     state: &StarlinkRouterState,
     principal: &Principal,
     parent_request_id: &str,
     original: &Value,
-    allow_unquoted_one_shot: bool,
 ) -> Result<String, Response> {
     let prompt = extract_seedance_prompt(original)?;
     let model = if state.config.default_model.trim().is_empty() || is_seedance_model(&state.config.default_model) {
@@ -1023,20 +1192,7 @@ fn run_seedance_assist(
         }
         return Err(request_error(StatusCode::INTERNAL_SERVER_ERROR, "request_relation_failed", error.to_string()));
     }
-    let quote_result = if allow_unquoted_one_shot {
-        quote_and_reserve_with_one_shot_fallback(
-            state,
-            principal,
-            &child_request_id,
-            "chat",
-            model,
-            true,
-        )
-    } else {
-        quote_and_reserve(state, &child_request_id, "chat", model)
-            .map(|(quote_id, reservation_id)| (quote_id, reservation_id, false))
-    };
-    let (quote_id, reservation_id, _one_shot_test) = match quote_result {
+    let (quote_id, reservation_id) = match quote_and_reserve(state, &child_request_id, "chat", model) {
         Ok(reservation) => reservation,
         Err(response) => {
             let status = response.status().as_u16();
@@ -1391,6 +1547,133 @@ fn stream_seedance_video_response(
     response
 }
 
+async fn run_controlled_seedance_chat(
+    state: Arc<StarlinkRouterState>,
+    headers: HeaderMap,
+    principal: Principal,
+    request_id: String,
+    mut forward_value: Value,
+    upstream_snapshot: UpstreamCreditSnapshot,
+    seedance_stream: bool,
+) -> Response {
+    if let Err(response) = validate_controlled_video_input(&forward_value, true) {
+        return finish_failed_quote_request(&state, &request_id, response);
+    }
+    if forward_value.get("image_asset_ids").is_some() || forward_value.get("video_asset_ids").is_some() {
+        if let Err(response) = materialize_bridge_assets(&state, &principal, &mut forward_value, &request_id).await {
+            return finish_failed_quote_request(&state, &request_id, response);
+        }
+    }
+    if let Err(response) = validate_vision_data_urls(&forward_value) {
+        return finish_failed_quote_request(&state, &request_id, response);
+    }
+    if let Err(response) = extract_seedance_prompt(&forward_value) {
+        return finish_failed_quote_request(&state, &request_id, response);
+    }
+    let operation = match state.store.begin_controlled_operation(&request_id, upstream_snapshot) {
+        Ok(operation) => operation,
+        Err(error) => return finish_failed_quote_request(&state, &request_id,
+            request_error(StatusCode::SERVICE_UNAVAILABLE, "controlled_admission_failed", error.to_string())),
+    };
+    let reservation_id = match state.store.reservation_for_request(&request_id) {
+        Ok(Some(reservation)) => reservation.id,
+        _ => {
+            mark_request_unknown(&state, &request_id, "controlled_hold_missing");
+            return reconcile_required(&request_id);
+        }
+    };
+    let (assisted_prompt, assist_cost) = match run_controlled_seedance_assist(
+        &state, &principal, &request_id, &operation.operation_id, &forward_value,
+    ) {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    if assist_cost >= operation.held.as_microcredits() {
+        if state.store.finish_controlled_operation(&request_id, None).is_err() {
+            mark_request_unknown(&state, &request_id, "controlled_assist_settlement_failed");
+            return reconcile_required(&request_id);
+        }
+        return request_error(StatusCode::TOO_MANY_REQUESTS, "controlled_hold_exhausted",
+            "DeepSeek 辅助费用已用尽本次 Key 授权持有额，未提交视频");
+    }
+    if apply_assisted_prompt(&mut forward_value, &assisted_prompt).is_err() {
+        if state.store.finish_controlled_operation(&request_id, None).is_err() {
+            mark_request_unknown(&state, &request_id, "controlled_assist_settlement_failed");
+            return reconcile_required(&request_id);
+        }
+        return request_error(StatusCode::BAD_GATEWAY, "seedance_assist_invalid_response", "DeepSeek 辅助结果无法转换为视频提示词");
+    }
+    if seedance_stream { forward_value["stream"] = Value::Bool(false); }
+    let forward_body = match serde_json::to_vec(&forward_value) {
+        Ok(body) => body,
+        Err(_) => {
+            mark_request_unknown(&state, &request_id, "controlled_video_body_encoding_failed");
+            return reconcile_required(&request_id);
+        }
+    };
+    if state.store.mark_controlled_step_dispatched(&request_id, &request_id, ControlledStepKind::Video).is_err()
+        || mark_request_dispatched(&state, &request_id).is_err()
+    {
+        mark_request_unknown(&state, &request_id, "controlled_video_dispatch_state_failed");
+        return reconcile_required(&request_id);
+    }
+    let upstream = state.bridge.lock().unwrap().forward_controlled_for_key(
+        "POST", "/v1/chat/completions", &forward_body,
+        &video_forward_headers(&headers, &request_id),
+        &request_id, &operation.operation_id, &principal.key_id,
+    );
+    match upstream {
+        Ok(response) if (200..300).contains(&response.status) => {
+            let value = serde_json::from_slice::<Value>(&response.body).unwrap_or(Value::Null);
+            let Some(task_id) = extract_upstream_task_id(&value) else {
+                mark_request_unknown(&state, &request_id, "bridge_task_id_missing");
+                let task_id = format!("task-{request_id}");
+                let mut job = unknown_video_job(&principal, &request_id, task_id.clone(),
+                    Some(reservation_id), "bridge_task_id_missing", false);
+                job.controlled_operation_id = Some(operation.operation_id);
+                state.jobs.lock().unwrap().insert(task_id, job);
+                state.persist_jobs();
+                return reconcile_required(&request_id);
+            };
+            if state.store.bind_controlled_video_task(&request_id, &task_id).is_err() {
+                mark_request_unknown(&state, &request_id, "controlled_video_task_binding_failed");
+                return reconcile_required(&request_id);
+            }
+            let mut job = accepted_video_job(&principal, &request_id, task_id.clone(),
+                Some(reservation_id), extract_upstream_task_status(&value).as_deref().unwrap_or("queued"), None, false);
+            job.controlled_operation_id = Some(operation.operation_id);
+            state.jobs.lock().unwrap().insert(task_id.clone(), job);
+            state.persist_jobs();
+            if seedance_stream {
+                stream_seedance_video_response(state, principal, task_id)
+            } else {
+                proxy(response.status, response.headers, response.body)
+            }
+        }
+        Ok(response) => {
+            if settle_confirmed_pre_dispatch_video_rejection(&state, &request_id) {
+                return proxy(response.status, response.headers, response.body);
+            }
+            mark_request_unknown(&state, &request_id, "controlled_video_rejected_receipt_unknown");
+            if confirmed_video_pre_dispatch_error_code(&response).is_some() {
+                // A rejected HTTP response alone is not an AI Work no-charge receipt.
+                // Keep the hold until the bridge can prove that no video cost occurred.
+            }
+            reconcile_required(&request_id)
+        }
+        Err(_) => {
+            mark_request_unknown(&state, &request_id, "controlled_video_result_unknown");
+            let task_id = format!("task-{request_id}");
+            let mut job = unknown_video_job(&principal, &request_id, task_id.clone(),
+                Some(reservation_id), "controlled_video_result_unknown", false);
+            job.controlled_operation_id = Some(operation.operation_id);
+            state.jobs.lock().unwrap().insert(task_id, job);
+            state.persist_jobs();
+            reconcile_required(&request_id)
+        }
+    }
+}
+
 pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, headers: HeaderMap, Extension(principal): Extension<Principal>, body: Bytes) -> Response {
     let value: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
@@ -1451,6 +1734,29 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
     if seedance {
         infer_video_parameters_from_prompt(&mut forward_value);
     }
+    if seedance && video_admission == VideoAdmission::DiagnosticClaimed {
+        let snapshot = match state.bridge.lock().unwrap().upstream_credit_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(_) => return finish_failed_quote_request(&state, &request_id,
+                upstream_credits_unavailable(&request_id, "upstream_credits_unavailable",
+                    "AI Work 统一积分余额不可用或已过期，未发送付费请求")),
+        };
+        let fingerprint = match state.store.request_fingerprint_for_billing(&request_id) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => return finish_failed_quote_request(&state, &request_id,
+                request_error(StatusCode::INTERNAL_SERVER_ERROR, "core_error", error.to_string())),
+        };
+        let quote = state.bridge.lock().unwrap().quote(&request_id, "videos", &model, &fingerprint);
+        match quote {
+            Ok(BridgeQuoteResult::Unavailable { error_code }) if error_code == "quote_unavailable" => {
+                return run_controlled_seedance_chat(
+                    state, headers, principal, request_id, forward_value, snapshot, seedance_stream,
+                ).await;
+            }
+            Ok(BridgeQuoteResult::Quoted(_)) => {}
+            _ => return finish_failed_quote_request(&state, &request_id, quote_unavailable(&request_id)),
+        }
+    }
     let mut assisted_before_reservation = false;
     if seedance && video_admission == VideoAdmission::DiagnosticClaimed {
         let has_asset_ids = forward_value.get("image_asset_ids").is_some() || forward_value.get("video_asset_ids").is_some();
@@ -1466,7 +1772,7 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
             let _ = transition_request_to(&state, &request_id, RequestState::Failed, Some("vision_input_invalid"));
             return response;
         }
-        let assisted_prompt = match run_seedance_assist(&state, &principal, &request_id, &forward_value, true) {
+        let assisted_prompt = match run_seedance_assist(&state, &principal, &request_id, &forward_value) {
             Ok(prompt) => prompt,
             Err(response) => {
                 let _ = transition_request_to(&state, &request_id, RequestState::Validating, None);
@@ -1484,10 +1790,8 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
     let (quote_id, reservation_id, one_shot_test) = if seedance {
         match quote_and_reserve_video(
             &state,
-            &principal,
             &request_id,
             &model,
-            video_admission == VideoAdmission::DiagnosticClaimed,
         ) {
             Ok(reservation) => reservation,
             Err(response) => return finish_failed_quote_request(&state, &request_id, response),
@@ -1510,7 +1814,7 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
             release_before_dispatch(&state, &principal, &reservation_id, response.status().as_u16(), "vision_input_invalid");
             return response;
         }
-        let assisted_prompt = match run_seedance_assist(&state, &principal, &request_id, &forward_value, false) {
+        let assisted_prompt = match run_seedance_assist(&state, &principal, &request_id, &forward_value) {
             Ok(prompt) => prompt,
             Err(response) => {
                 release_before_dispatch(&state, &principal, &reservation_id, response.status().as_u16(), "seedance_assist_failed");
@@ -1689,6 +1993,84 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
     }
 }
 
+async fn run_controlled_native_video(
+    state: Arc<StarlinkRouterState>,
+    headers: HeaderMap,
+    principal: Principal,
+    request_id: String,
+    mut forward_value: Value,
+    snapshot: UpstreamCreditSnapshot,
+) -> Response {
+    if let Err(response) = validate_controlled_video_input(&forward_value, false) {
+        return finish_failed_quote_request(&state, &request_id, response);
+    }
+    if forward_value.get("image_asset_ids").is_some() || forward_value.get("video_asset_ids").is_some() {
+        if let Err(response) = materialize_bridge_assets(&state, &principal, &mut forward_value, &request_id).await {
+            return finish_failed_quote_request(&state, &request_id, response);
+        }
+    }
+    let operation = match state.store.begin_controlled_operation(&request_id, snapshot) {
+        Ok(operation) => operation,
+        Err(error) => return finish_failed_quote_request(&state, &request_id,
+            request_error(StatusCode::SERVICE_UNAVAILABLE, "controlled_admission_failed", error.to_string())),
+    };
+    let reservation_id = match state.store.reservation_for_request(&request_id) {
+        Ok(Some(reservation)) => reservation.id,
+        _ => {
+            mark_request_unknown(&state, &request_id, "controlled_hold_missing");
+            return reconcile_required(&request_id);
+        }
+    };
+    let forward_body = match serde_json::to_vec(&forward_value) {
+        Ok(body) => body,
+        Err(_) => {
+            mark_request_unknown(&state, &request_id, "controlled_video_body_encoding_failed");
+            return reconcile_required(&request_id);
+        }
+    };
+    if state.store.mark_controlled_step_dispatched(&request_id, &request_id, ControlledStepKind::Video).is_err()
+        || mark_request_dispatched(&state, &request_id).is_err()
+    {
+        mark_request_unknown(&state, &request_id, "controlled_video_dispatch_state_failed");
+        return reconcile_required(&request_id);
+    }
+    let response = state.bridge.lock().unwrap().forward_controlled_for_key(
+        "POST", "/v1/videos/generations", &forward_body,
+        &video_forward_headers(&headers, &request_id),
+        &request_id, &operation.operation_id, &principal.key_id,
+    );
+    match response {
+        Ok(response) if (200..300).contains(&response.status) => {
+            let value = serde_json::from_slice::<Value>(&response.body).unwrap_or(Value::Null);
+            let Some(task_id) = extract_upstream_task_id(&value) else {
+                mark_request_unknown(&state, &request_id, "bridge_task_id_missing");
+                return reconcile_required(&request_id);
+            };
+            if state.store.bind_controlled_video_task(&request_id, &task_id).is_err() {
+                mark_request_unknown(&state, &request_id, "controlled_video_task_binding_failed");
+                return reconcile_required(&request_id);
+            }
+            let mut job = accepted_video_job(&principal, &request_id, task_id.clone(), Some(reservation_id),
+                extract_upstream_task_status(&value).as_deref().unwrap_or("queued"), None, false);
+            job.controlled_operation_id = Some(operation.operation_id);
+            state.jobs.lock().unwrap().insert(task_id, job);
+            state.persist_jobs();
+            proxy(response.status, response.headers, response.body)
+        }
+        Ok(response) => {
+            if settle_confirmed_pre_dispatch_video_rejection(&state, &request_id) {
+                return proxy(response.status, response.headers, response.body);
+            }
+            mark_request_unknown(&state, &request_id, "controlled_video_result_unknown");
+            reconcile_required(&request_id)
+        }
+        Err(_) => {
+            mark_request_unknown(&state, &request_id, "controlled_video_result_unknown");
+            reconcile_required(&request_id)
+        }
+    }
+}
+
 pub async fn video_generations(State(state): State<Arc<StarlinkRouterState>>, headers: HeaderMap, Extension(principal): Extension<Principal>, body: Bytes) -> Response {
     let value: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
@@ -1720,12 +2102,31 @@ pub async fn video_generations(State(state): State<Arc<StarlinkRouterState>>, he
         Err(response) => return response,
     };
     let request_id = request.id.clone();
+    if video_admission == VideoAdmission::DiagnosticClaimed {
+        let snapshot = match state.bridge.lock().unwrap().upstream_credit_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(_) => return finish_failed_quote_request(&state, &request_id,
+                upstream_credits_unavailable(&request_id, "upstream_credits_unavailable",
+                    "AI Work 统一积分余额不可用或已过期，未发送付费请求")),
+        };
+        let fingerprint = match state.store.request_fingerprint_for_billing(&request_id) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => return finish_failed_quote_request(&state, &request_id,
+                request_error(StatusCode::INTERNAL_SERVER_ERROR, "core_error", error.to_string())),
+        };
+        let quote = state.bridge.lock().unwrap().quote(&request_id, "videos", &model, &fingerprint);
+        match quote {
+            Ok(BridgeQuoteResult::Unavailable { error_code }) if error_code == "quote_unavailable" => {
+                return run_controlled_native_video(state, headers, principal, request_id, value, snapshot).await;
+            }
+            Ok(BridgeQuoteResult::Quoted(_)) => {}
+            _ => return finish_failed_quote_request(&state, &request_id, quote_unavailable(&request_id)),
+        }
+    }
     let (quote_id, reservation_id, one_shot_test) = match quote_and_reserve_video(
         &state,
-        &principal,
         &request_id,
         &model,
-        video_admission == VideoAdmission::DiagnosticClaimed,
     ) {
         Ok(reservation) => reservation,
         Err(response) => return finish_failed_quote_request(&state, &request_id, response),
@@ -1916,7 +2317,25 @@ fn accepted_video_job(
         actual_credits: None,
         last_reconciled_at_ms: None,
         one_shot_test,
+        controlled_operation_id: None,
     }
+}
+
+fn settle_confirmed_pre_dispatch_video_rejection(
+    state: &StarlinkRouterState,
+    request_id: &str,
+) -> bool {
+    let receipt = state.bridge.lock().unwrap().billing(request_id);
+    let Ok(BridgeBillingResult::Final(receipt)) = receipt else { return false; };
+    if receipt.status != aiwork_core::BillingReceiptStatus::FailedNoCharge || receipt.task_ref.is_some() {
+        return false;
+    }
+    if !matches!(state.store.record_controlled_step(request_id, request_id,
+        ControlledStepKind::Video, receipt),
+        Ok(ControlledStepResult::Verified | ControlledStepResult::Duplicate)) {
+        return false;
+    }
+    state.store.finish_controlled_operation(request_id, Some(false)).is_ok()
 }
 
 fn confirmed_video_pre_dispatch_error_code(response: &BridgeResponse) -> Option<String> {
@@ -1970,6 +2389,7 @@ fn unknown_video_job(
         actual_credits: None,
         last_reconciled_at_ms: None,
         one_shot_test,
+        controlled_operation_id: None,
     }
 }
 
@@ -2019,6 +2439,38 @@ pub(crate) fn settle_video_job(
             stored.last_reconciled_at_ms = Some(Utc::now().timestamp_millis());
         });
         return Ok(VideoBillingDecision::Held);
+    }
+    if job.controlled_operation_id.is_some() {
+        let receipt = state.bridge.lock().unwrap().finalize_video_billing(&job.request_id, upstream_id);
+        let receipt = match receipt {
+            Ok(BridgeBillingResult::Final(receipt)) => receipt,
+            _ => {
+                mark_request_unknown(state, &job.request_id, "billing_receipt_unresolved");
+                mark_video_reconcile(state, job_id, "billing_receipt_unresolved", None);
+                return Ok(VideoBillingDecision::ReconcileRequired);
+            }
+        };
+        let actual_credits = receipt.actual_credits.map(|amount| format_microcredits(amount.as_microcredits()));
+        let no_charge = receipt.status == aiwork_core::BillingReceiptStatus::FailedNoCharge;
+        if !matches!(state.store.record_controlled_step(&job.request_id, &job.request_id,
+            ControlledStepKind::Video, receipt)?, ControlledStepResult::Verified | ControlledStepResult::Duplicate)
+        {
+            mark_video_reconcile(state, job_id, "billing_receipt_conflict", actual_credits);
+            return Ok(VideoBillingDecision::ReconcileRequired);
+        }
+        if state.store.finish_controlled_operation(&job.request_id, Some(terminal_success)).is_err() {
+            mark_video_reconcile(state, job_id, "controlled_settlement_failed", actual_credits);
+            return Ok(VideoBillingDecision::ReconcileRequired);
+        }
+        update_video_job(state, job_id, |stored| {
+            stored.status = status.clone();
+            stored.reconcile_required = false;
+            stored.billing_state = if no_charge { "released" } else { "settled" }.into();
+            stored.actual_credits = actual_credits.clone().or_else(|| no_charge.then(|| "0.000000".into()));
+            stored.error_code = None;
+            stored.last_reconciled_at_ms = Some(Utc::now().timestamp_millis());
+        });
+        return Ok(if no_charge { VideoBillingDecision::Released } else { VideoBillingDecision::Settled });
     }
     let Some(reservation_id) = job.reservation_id.as_deref() else {
         mark_video_reconcile(state, job_id, "reservation_id_missing", None);
@@ -2157,10 +2609,31 @@ fn proxy(status: u16, headers: BTreeMap<String, String>, body: Vec<u8>) -> Respo
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_assisted_prompt, authorize_scope, extract_assisted_prompt, extract_seedance_prompt, seedance_assist_chat_body};
+    use super::{apply_assisted_prompt, authorize_scope, extract_assisted_prompt, extract_seedance_prompt, seedance_assist_chat_body, validate_controlled_video_input, video_forward_headers};
+    use axum::http::HeaderMap;
     use aiwork_core::Principal;
     use std::collections::BTreeSet;
     use serde_json::json;
+
+    #[test]
+    fn video_upstream_idempotency_is_scoped_by_core_request_not_client_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "same-client-value".parse().unwrap());
+        let first = video_forward_headers(&headers, "core-request-key-one");
+        let second = video_forward_headers(&headers, "core-request-key-two");
+        assert_eq!(first["idempotency-key"], "core-request-key-one");
+        assert_eq!(second["idempotency-key"], "core-request-key-two");
+    }
+
+    #[test]
+    fn controlled_video_rejects_invalid_parameters_before_any_paid_helper() {
+        let chat = json!({"model":"seedance","messages":[{"role":"user","content":"cat"}],"duration":1});
+        let native = json!({"model":"seedance","prompt":"cat","duration":1});
+        assert!(validate_controlled_video_input(&chat, true).is_err());
+        assert!(validate_controlled_video_input(&native, false).is_err());
+        assert!(validate_controlled_video_input(&json!({"model":"seedance","prompt":"cat","duration":5,"resolution":"720p","ratio":"16:9"}), false).is_ok());
+        assert!(validate_controlled_video_input(&json!({"model":"seedance","messages":[{"role":"user","content":"cat"}],"image_asset_ids":[42]}), true).is_err());
+    }
 
     #[test]
     fn ordinary_user_scope_is_checked_before_forwarding() {

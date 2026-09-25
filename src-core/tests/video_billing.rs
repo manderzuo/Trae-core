@@ -83,6 +83,25 @@ fn diagnostic_claim_is_bound_to_key_and_request_hash_and_is_one_shot() {
 }
 
 #[test]
+fn diagnostic_registration_and_claim_have_durable_audit_events() {
+    let dir = test_dir("audit");
+    let store = CoreStore::open(&dir).unwrap();
+    store.migrate().unwrap();
+    store.create_user(NewUser { id: "audit-user".into(), name: "Audit".into(), role: UserRole::User }, "test").unwrap();
+    let key = store.issue_api_key("audit-user", "audit-video", BTreeSet::from(["videos:submit".into()]), "test").unwrap();
+    store.set_video_billing_control_as_actor(VideoBillingControlInput::diagnostic(
+        &key.id, &"a".repeat(64), "controlled acceptance"), "admin").unwrap();
+    assert!(store.claim_video_diagnostic(&key.id, &"a".repeat(64)).unwrap().is_some());
+    let db = rusqlite::Connection::open(dir.join("data").join(aiwork_core::CORE_DB_FILE)).unwrap();
+    let actions = db.prepare("SELECT action FROM audit_events WHERE action LIKE 'video_billing.%' ORDER BY created_at_ms, rowid").unwrap()
+        .query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(actions, vec!["video_billing.control_update", "video_billing.diagnostic_claim"]);
+    drop(db);
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn diagnostic_registration_can_be_rearmed_with_the_same_key_and_request_hash() {
     let dir = test_dir("rearm");
     let store = CoreStore::open(&dir).unwrap();

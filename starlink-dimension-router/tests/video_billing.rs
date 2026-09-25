@@ -156,12 +156,17 @@ impl BridgeTransport for FakeBridge {
         &self,
         method: &str,
         url: &str,
-        _headers: &BTreeMap<String, String>,
+        headers: &BTreeMap<String, String>,
         body: &[u8],
     ) -> Result<BridgeResponse, String> {
         let path = url.trim_start_matches("http://bridge").to_owned();
         self.requests.lock().unwrap().push(path.clone());
         let request_body = serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
+        if method == "POST" && path == "/v1/chat/completions" && request_body["model"] != "seedance" {
+            if let Some(request_id) = headers.get("x-core-request-id") {
+                self.chat_request_ids.lock().unwrap().push(request_id.clone());
+            }
+        }
         let response = match (method, path.as_str()) {
             ("GET", "/internal/bridge/summary") => BridgeResponse {
                 status: 200,
@@ -482,6 +487,7 @@ async fn approved_one_shot_quote_fallback_reserves_the_entire_key_balance_once()
     let response = post_video(&fixture).await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let job = fixture.state.jobs.lock().unwrap()["video-test"].clone();
+    assert!(job.controlled_operation_id.is_some(), "unquoted native video must use a controlled operation");
     let reservation = fixture.store.reservation_for_request(&job.request_id).unwrap().unwrap();
     assert_eq!(reservation.amount, 100_000_000);
     assert_eq!(reservation.state, aiwork_core::ReservationState::Held);
@@ -536,9 +542,9 @@ async fn one_shot_seedance_chat_keeps_the_assist_quote_separate_from_the_video_h
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let job = fixture.state.jobs.lock().unwrap()["video-test"].clone();
-    assert!(job.one_shot_test);
-    assert_eq!(quota(&fixture).balances[0].held, 99_000_000);
-    assert_eq!(quota(&fixture).balances[0].settled, 1_000_000);
+    assert!(job.controlled_operation_id.is_some());
+    assert_eq!(quota(&fixture).balances[0].held, 100_000_000);
+    assert_eq!(quota(&fixture).balances[0].settled, 0);
 
     assert_eq!(post_seedance_chat(&fixture).await.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(fixture.bridge.request_count("/v1/chat/completions"), 2);
@@ -553,7 +559,7 @@ async fn one_shot_video_settlement_uses_request_scoped_aiwork_finalization() {
     )).unwrap();
     assert_eq!(post_video(&fixture).await.status(), StatusCode::ACCEPTED);
     let job = fixture.state.jobs.lock().unwrap()["video-test"].clone();
-    assert!(job.one_shot_test);
+    assert!(job.controlled_operation_id.is_some());
 
     fixture.bridge.set_receipt("final", Some("120.000000"), "credits", Some("video-test"));
     fixture.bridge.set_status(json!({"task":{"id":"video-test","status":"completed"}}));

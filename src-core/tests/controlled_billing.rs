@@ -143,7 +143,7 @@ fn controlled_assist_and_video_commit_once() {
             .unwrap(),
         ControlledStepResult::Verified
     );
-    let settled = store.finish_controlled_operation(&parent, true).unwrap();
+    let settled = store.finish_controlled_operation(&parent, Some(true)).unwrap();
     assert_eq!(settled.actual_credits.as_microcredits(), 45_750_000);
     let balance = store
         .key_quota_balance_as_admin(&admin, &key, "credits")
@@ -161,7 +161,7 @@ fn controlled_assist_and_video_commit_once() {
         .unwrap();
     assert_eq!(
         store
-            .finish_controlled_operation(&parent, true)
+            .finish_controlled_operation(&parent, Some(true))
             .unwrap()
             .actual_credits
             .as_microcredits(),
@@ -197,7 +197,7 @@ fn controlled_assist_only_failure_commits_assist() {
         .unwrap();
     assert_eq!(
         store
-            .finish_controlled_operation(&parent, false)
+            .finish_controlled_operation(&parent, None)
             .unwrap()
             .actual_credits
             .as_microcredits(),
@@ -239,7 +239,7 @@ fn controlled_unknown_receipt_survives_restart() {
     let reopened = CoreStore::open(&dir).unwrap();
     reopened.migrate().unwrap();
     assert!(reopened
-        .finish_controlled_operation(&parent, false)
+        .finish_controlled_operation(&parent, None)
         .is_err());
     let balance = reopened
         .key_quota_balance_as_admin(&admin, &key, "credits")
@@ -276,6 +276,55 @@ fn controlled_same_key_cannot_start_second_operation() {
 }
 
 #[test]
+fn accepted_video_task_can_be_bound_durably_before_job_snapshot() {
+    let (store, dir, key, _) = fixture("task-ref-recovery");
+    let parent = request(&store, &key, "seedance", "task-ref-parent");
+    store.begin_controlled_operation(&parent, snapshot()).unwrap();
+    store.mark_controlled_step_dispatched(&parent, &parent, ControlledStepKind::Video).unwrap();
+    store.bind_controlled_video_task(&parent, "video-bound").unwrap();
+    assert!(store.bind_controlled_video_task(&parent, "video-other").is_err());
+    drop(store);
+    let reopened = CoreStore::open(&dir).unwrap();
+    reopened.migrate().unwrap();
+    let step = reopened.recoverable_controlled_steps(10).unwrap().remove(0);
+    assert_eq!(step.task_ref.as_deref(), Some("video-bound"));
+    assert_eq!(step.api_key_id, key);
+    assert_eq!(step.user_id, "user");
+    assert!(!step.hold_id.is_empty());
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn restart_inventory_releases_undispatched_hold_and_settles_assist_only_receipt() {
+    let (store, dir, key, admin) = fixture("orphan-recovery");
+    let parent = request(&store, &key, "seedance", "orphan-parent");
+    let child = request(&store, &key, "deepseek-v4-flash", "orphan-child");
+    store.begin_controlled_operation(&parent, snapshot()).unwrap();
+    store.link_seedance_assist_request(&parent, &child).unwrap();
+    let cutoff = chrono::Utc::now().timestamp_millis() + 1;
+    assert_eq!(store.recoverable_undispatched_operations_before(cutoff).unwrap(), vec![parent.clone()]);
+    store.finish_controlled_operation(&parent, None).unwrap();
+    let balance = store.key_quota_balance_as_admin(&admin, &key, "credits").unwrap();
+    assert_eq!((balance.available, balance.held, balance.settled), (100_000_000, 0, 0));
+
+    let second = request(&store, &key, "seedance", "orphan-second-parent");
+    let second_child = request(&store, &key, "deepseek-v4-flash", "orphan-second-child");
+    store.begin_controlled_operation(&second, snapshot()).unwrap();
+    store.link_seedance_assist_request(&second, &second_child).unwrap();
+    store.mark_controlled_step_dispatched(&second, &second_child, ControlledStepKind::Assist).unwrap();
+    assert!(store.recoverable_undispatched_operations_before(cutoff + 1000).unwrap().is_empty());
+    store.record_controlled_step(&second, &second_child, ControlledStepKind::Assist,
+        receipt(&second_child, BillingReceiptStatus::Final, Some("0.25"), None)).unwrap();
+    assert_eq!(store.recoverable_undispatched_operations_before(cutoff + 1000).unwrap(), vec![second.clone()]);
+    store.finish_controlled_operation(&second, None).unwrap();
+    let balance = store.key_quota_balance_as_admin(&admin, &key, "credits").unwrap();
+    assert_eq!((balance.available, balance.held, balance.settled), (99_750_000, 0, 250_000));
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn controlled_overrun_records_true_cost_and_blocks_key() {
     let (store, dir, key, admin) = fixture("overrun");
     let parent = request(&store, &key, "seedance", "overrun-parent");
@@ -295,7 +344,7 @@ fn controlled_overrun_records_true_cost_and_blocks_key() {
             ),
         )
         .unwrap();
-    let settled = store.finish_controlled_operation(&parent, true).unwrap();
+    let settled = store.finish_controlled_operation(&parent, Some(true)).unwrap();
     assert!(settled.over_authorized_hold);
     assert_eq!(settled.actual_credits.as_microcredits(), 120_000_000);
     let balance = store
@@ -307,6 +356,28 @@ fn controlled_overrun_records_true_cost_and_blocks_key() {
     );
     let next = request(&store, &key, "seedance", "overrun-next");
     assert!(store.begin_controlled_operation(&next, snapshot()).is_err());
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn charged_failed_video_debits_real_receipt_without_marking_request_successful() {
+    let (store, dir, key, admin) = fixture("charged-failure");
+    let parent = request(&store, &key, "seedance", "charged-failure-parent");
+    store.begin_controlled_operation(&parent, snapshot()).unwrap();
+    store.mark_controlled_step_dispatched(&parent, &parent, ControlledStepKind::Video).unwrap();
+    store.record_controlled_step(&parent, &parent, ControlledStepKind::Video,
+        receipt(&parent, BillingReceiptStatus::Final, Some("3.5"), Some("video-failed"))).unwrap();
+    store.finish_controlled_operation(&parent, Some(false)).unwrap();
+    assert_eq!(store.request_state(&parent).unwrap(), aiwork_core::RequestState::Settled);
+    let db = rusqlite::Connection::open(dir.join("data").join(aiwork_core::CORE_DB_FILE)).unwrap();
+    let outcome: (Option<i64>, Option<String>) = db.query_row(
+        "SELECT result_status, error_code FROM requests WHERE id = ?1", [&parent],
+        |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert_eq!(outcome, (Some(502), Some("video_generation_failed".into())));
+    drop(db);
+    let balance = store.key_quota_balance_as_admin(&admin, &key, "credits").unwrap();
+    assert_eq!((balance.available, balance.held, balance.settled), (96_500_000, 0, 3_500_000));
     drop(store);
     fs::remove_dir_all(dir).unwrap();
 }
@@ -347,7 +418,7 @@ fn controlled_conflicting_receipt_preserves_hold_and_blocks_settlement() {
             .unwrap(),
         ControlledStepResult::Conflict
     );
-    assert!(store.finish_controlled_operation(&parent, true).is_err());
+    assert!(store.finish_controlled_operation(&parent, Some(true)).is_err());
     let balance = store
         .key_quota_balance_as_admin(&admin, &key, "credits")
         .unwrap();
@@ -382,7 +453,7 @@ fn controlled_unknown_can_be_resolved_without_second_charge() {
             .unwrap(),
         ControlledStepResult::Held
     );
-    assert!(store.finish_controlled_operation(&parent, true).is_err());
+    assert!(store.finish_controlled_operation(&parent, Some(true)).is_err());
     assert_eq!(
         store
             .record_controlled_step(
@@ -401,7 +472,7 @@ fn controlled_unknown_can_be_resolved_without_second_charge() {
     );
     assert_eq!(
         store
-            .finish_controlled_operation(&parent, true)
+            .finish_controlled_operation(&parent, Some(true))
             .unwrap()
             .actual_credits
             .as_microcredits(),
@@ -488,8 +559,8 @@ fn controlled_different_keys_keep_independent_holds_and_receipts() {
             ),
         )
         .unwrap();
-    store.finish_controlled_operation(&first, true).unwrap();
-    store.finish_controlled_operation(&second, true).unwrap();
+    store.finish_controlled_operation(&first, Some(true)).unwrap();
+    store.finish_controlled_operation(&second, Some(true)).unwrap();
     assert_eq!(
         store
             .key_quota_balance_as_admin(&admin, &first_key, "credits")
@@ -525,5 +596,87 @@ fn controlled_rejects_stale_upstream_snapshot_before_hold() {
         (100_000_000, 0, 0)
     );
     drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn controlled_dispatched_video_cannot_be_released_without_receipt() {
+    let (store, dir, key, admin) = fixture("video-dispatch");
+    let parent = request(&store, &key, "seedance", "video-dispatch-parent");
+    store
+        .begin_controlled_operation(&parent, snapshot())
+        .unwrap();
+    store
+        .mark_controlled_step_dispatched(&parent, &parent, ControlledStepKind::Video)
+        .unwrap();
+    assert!(store.finish_controlled_operation(&parent, None).is_err());
+    assert!(store.finish_controlled_operation(&parent, Some(true)).is_err());
+    let held = store
+        .key_quota_balance_as_admin(&admin, &key, "credits")
+        .unwrap();
+    assert_eq!(
+        (held.available, held.held, held.settled),
+        (0, 100_000_000, 0)
+    );
+    store
+        .record_controlled_step(
+            &parent,
+            &parent,
+            ControlledStepKind::Video,
+            receipt(
+                &parent,
+                BillingReceiptStatus::Final,
+                Some("33"),
+                Some("video-dispatch"),
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .finish_controlled_operation(&parent, Some(true))
+            .unwrap()
+            .actual_credits
+            .as_microcredits(),
+        33_000_000
+    );
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn controlled_restart_lists_pending_step_without_releasing_hold() {
+    let (store, dir, key, admin) = fixture("recover-list");
+    let parent = request(&store, &key, "seedance", "recover-parent");
+    let child = request(&store, &key, "deepseek-v4-flash", "recover-child");
+    store.link_seedance_assist_request(&parent, &child).unwrap();
+    store
+        .begin_controlled_operation(&parent, snapshot())
+        .unwrap();
+    store
+        .mark_controlled_step_dispatched(&parent, &child, ControlledStepKind::Assist)
+        .unwrap();
+    drop(store);
+    let reopened = CoreStore::open(&dir).unwrap();
+    reopened.migrate().unwrap();
+    assert!(reopened.controlled_operation_exists(&parent).unwrap());
+    let steps = reopened.recoverable_controlled_steps(10).unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(
+        (
+            steps[0].parent_request_id.as_str(),
+            steps[0].request_id.as_str()
+        ),
+        (parent.as_str(), child.as_str())
+    );
+    assert_eq!(steps[0].kind, ControlledStepKind::Assist);
+    assert_eq!(steps[0].state, "pending");
+    assert_eq!(
+        reopened
+            .key_quota_balance_as_admin(&admin, &key, "credits")
+            .unwrap()
+            .held,
+        100_000_000
+    );
+    drop(reopened);
     fs::remove_dir_all(dir).unwrap();
 }

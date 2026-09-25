@@ -15,6 +15,7 @@ const elements = {
   videoBillingCards: { innerHTML: '' },
   videoBillingReason: { textContent: '' },
   videoBillingMsg: { textContent: '一次性验收已登记；只有匹配该 Key 和请求摘要的下一次视频请求可以通过。', className: 'msg ok' },
+  controlledOperationList: { innerHTML: '' },
 };
 const source = script.slice(0, end) + '  return { renderVideoBilling };\n})();';
 const { renderVideoBilling } = vm.runInNewContext(source, {
@@ -26,9 +27,19 @@ renderVideoBilling({
   reason: '单次验收完成',
   diagnostic: { claimed: true },
   counts: { held: 0, reconcile_required: 0, verified_settled: 5, legacy_unverified: 0 },
+  controlled_operations: [{
+    operation_id: 'operation-1', parent_request_id: 'request-1', api_key_id: 'key-1',
+    held_microcredits: 100000000, actual_microcredits: null, state: 'unknown',
+    steps: [{request_id:'request-helper', kind:'assist', state:'verified', actual_microcredits:500000},
+      {request_id:'request-1', kind:'video', state:'unknown', actual_microcredits:null}],
+  }],
 });
 
 assert.match(elements.videoBillingCards.innerHTML, /<div class="value">已暂停<\/div>/);
 assert.match(elements.videoBillingCards.innerHTML, /<div class="value">5<\/div>/);
 assert.equal(elements.videoBillingMsg.textContent, '');
 assert.match(elements.videoBillingReason.textContent, /本次一次性验收已使用/);
+assert.match(elements.controlledOperationList.innerHTML, /待对账/);
+assert.match(elements.controlledOperationList.innerHTML, /已核验 0\.5 积分/);
+assert.match(elements.controlledOperationList.innerHTML, /视频/);
+assert.match(elements.controlledOperationList.innerHTML, /持有 100 积分/);

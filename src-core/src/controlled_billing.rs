@@ -3,7 +3,7 @@ use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
 use crate::{
     BillingReceipt, BillingReceiptStatus, CoreError, CoreStore, CreditAmount, QuotaReserve,
-    RequestState, ReservationState, ReserveResult, UpstreamCreditSnapshot,
+    RequestResult, RequestState, ReservationState, ReserveResult, UpstreamCreditSnapshot,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,7 +43,174 @@ pub struct ControlledSettlement {
     pub over_authorized_hold: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlledRecoverableStep {
+    pub parent_request_id: String,
+    pub user_id: String,
+    pub api_key_id: String,
+    pub operation_id: String,
+    pub hold_id: String,
+    pub request_id: String,
+    pub kind: ControlledStepKind,
+    pub state: String,
+    pub task_ref: Option<String>,
+}
+
 impl CoreStore {
+    /// Startup-only inventory. The cutoff must be captured before this process
+    /// accepts new requests, so an in-flight helper cannot race settlement.
+    pub fn recoverable_undispatched_operations_before(&self, startup_cutoff_ms: i64) -> Result<Vec<String>, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT operation.parent_request_id FROM controlled_billing_operations operation
+             WHERE operation.created_at_ms < ?1 AND operation.state IN ('held','submitted','unknown')
+             AND NOT EXISTS (SELECT 1 FROM controlled_billing_steps step
+                             WHERE step.operation_id = operation.operation_id AND step.kind = 'video')
+             AND NOT EXISTS (SELECT 1 FROM controlled_billing_steps step
+                             WHERE step.operation_id = operation.operation_id AND step.state != 'verified')
+             ORDER BY operation.created_at_ms LIMIT 100",
+        )?;
+        let rows = statement.query_map([startup_cutoff_ms], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+    pub fn active_controlled_operation_for_key(&self, api_key_id: &str) -> Result<bool, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM controlled_billing_operations
+             WHERE api_key_id = ?1 AND state IN ('held','submitted','unknown'))",
+                [api_key_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn controlled_operation_summaries(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT operation_id, parent_request_id, api_key_id, held_microcredits,
+                    actual_microcredits, state, created_at_ms, updated_at_ms
+             FROM controlled_billing_operations ORDER BY created_at_ms DESC LIMIT ?1",
+        )?;
+        let operations = statement
+            .query_map([limit.min(100) as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut result = Vec::with_capacity(operations.len());
+        for (operation_id, parent_request_id, api_key_id, held, actual, state, created, updated) in
+            operations
+        {
+            let mut step_statement = connection.prepare(
+                "SELECT request_id, kind, state, actual_microcredits, task_ref
+                 FROM controlled_billing_steps WHERE operation_id = ?1 ORDER BY kind",
+            )?;
+            let steps = step_statement.query_map([&operation_id], |row| {
+                Ok(serde_json::json!({
+                    "request_id":row.get::<_, String>(0)?, "kind":row.get::<_, String>(1)?,
+                    "state":row.get::<_, String>(2)?, "actual_microcredits":row.get::<_, Option<i64>>(3)?,
+                    "task_ref":row.get::<_, Option<String>>(4)?,
+                }))
+            })?.collect::<Result<Vec<_>, _>>()?;
+            result.push(serde_json::json!({
+                "operation_id":operation_id, "parent_request_id":parent_request_id,
+                "api_key_id":api_key_id, "held_microcredits":held,
+                "actual_microcredits":actual, "state":state,
+                "created_at_ms":created, "updated_at_ms":updated,
+                "steps":steps,
+            }));
+        }
+        Ok(result)
+    }
+
+    pub fn controlled_operation_exists(&self, parent_request_id: &str) -> Result<bool, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM controlled_billing_operations WHERE parent_request_id = ?1)",
+            [parent_request_id], |row| row.get(0),
+        ).map_err(Into::into)
+    }
+
+    /// Query-only recovery inventory. Active operations remain held until
+    /// verified receipts or explicit no-charge evidence permit settlement.
+    pub fn recoverable_controlled_steps(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ControlledRecoverableStep>, CoreError> {
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT operation.parent_request_id, step.request_id, step.kind, step.state, step.task_ref,
+                    parent.user_id, operation.api_key_id, operation.operation_id, operation.hold_reservation_id
+             FROM controlled_billing_steps step
+             JOIN controlled_billing_operations operation ON operation.operation_id = step.operation_id
+             JOIN requests parent ON parent.id = operation.parent_request_id
+             WHERE operation.state IN ('held','submitted','unknown')
+             ORDER BY operation.created_at_ms, step.kind LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit.min(1000) as i64], |row| {
+            let kind: String = row.get(2)?;
+            let kind = match kind.as_str() {
+                "assist" => ControlledStepKind::Assist,
+                "video" => ControlledStepKind::Video,
+                _ => {
+                    return Err(rusqlite::Error::InvalidColumnType(
+                        2,
+                        "kind".into(),
+                        rusqlite::types::Type::Text,
+                    ))
+                }
+            };
+            Ok(ControlledRecoverableStep {
+                parent_request_id: row.get(0)?,
+                user_id: row.get(5)?,
+                api_key_id: row.get(6)?,
+                operation_id: row.get(7)?,
+                hold_id: row.get(8)?,
+                request_id: row.get(1)?,
+                kind,
+                state: row.get(3)?,
+                task_ref: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+}
+
+impl CoreStore {
+    /// Bind AI Work's already accepted task to the dispatched video step.
+    /// Rebinding to a different task is a hard conflict, never an overwrite.
+    pub fn bind_controlled_video_task(&self, parent_request_id: &str, task_ref: &str) -> Result<(), CoreError> {
+        if task_ref.trim().is_empty() || task_ref.len() > 256 || task_ref.chars().any(char::is_control) {
+            return Err(CoreError::BillingReceiptInvalid { reason: "controlled video task reference is invalid".into() });
+        }
+        let connection = self.connection.lock().expect("core store mutex poisoned");
+        let updated = connection.execute(
+            "UPDATE controlled_billing_steps SET task_ref = ?2
+             WHERE request_id = ?1 AND kind = 'video' AND state IN ('pending','unknown')
+             AND (task_ref IS NULL OR task_ref = ?2)
+             AND operation_id = (SELECT operation_id FROM controlled_billing_operations
+                                 WHERE parent_request_id = ?1 AND state IN ('submitted','unknown'))",
+            params![parent_request_id, task_ref],
+        )?;
+        if updated != 1 {
+            return Err(CoreError::BillingReceiptInvalid { reason: "controlled video task reference conflicts with the operation".into() });
+        }
+        Ok(())
+    }
     /// One transaction creates the only charge authorization for the whole
     /// assistant-plus-video operation. It is not an upstream price quote.
     pub fn begin_controlled_operation(
@@ -201,8 +368,9 @@ impl CoreStore {
     pub fn finish_controlled_operation(
         &self,
         parent_request_id: &str,
-        video_submitted: bool,
+        video_outcome: Option<bool>,
     ) -> Result<ControlledSettlement, CoreError> {
+        let video_submitted = video_outcome.is_some();
         let now = Utc::now().timestamp_millis();
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -251,10 +419,12 @@ impl CoreStore {
                 reason: "controlled operation was released".into(),
             });
         }
+        // A linked child without a dispatched step cannot have reached the
+        // upstream: mark_controlled_step_dispatched precedes every send.
         let has_assist: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM request_relations
-             WHERE parent_request_id = ?1 AND relationship_kind = 'seedance_assist')",
-            [parent_request_id],
+            "SELECT EXISTS(SELECT 1 FROM controlled_billing_steps
+             WHERE operation_id = ?1 AND kind = 'assist')",
+            [&operation_id],
             |row| row.get(0),
         )?;
         let mut statement = transaction.prepare(
@@ -394,12 +564,15 @@ impl CoreStore {
             &transaction,
             parent_request_id,
             request_state,
-            if video_submitted && !video_failed_no_charge {
+            if video_outcome == Some(true) && !video_failed_no_charge {
                 RequestState::Succeeded
             } else {
                 RequestState::Failed
             },
-            None,
+            (video_outcome == Some(false)).then(|| RequestResult {
+                status: Some(502),
+                error_code: Some("video_generation_failed".into()),
+            }),
             now,
         )?;
         transaction.commit()?;
@@ -415,6 +588,65 @@ impl CoreStore {
 impl CoreStore {
     /// Persists a request-scoped observation without consuming the operation
     /// hold. Only verified terminal steps contribute to final settlement.
+    pub fn mark_controlled_step_dispatched(
+        &self,
+        parent_request_id: &str,
+        step_request_id: &str,
+        kind: ControlledStepKind,
+    ) -> Result<(), CoreError> {
+        let now = Utc::now().timestamp_millis();
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (operation_id, api_key_id, state): (String, String, String) = transaction.query_row(
+            "SELECT operation_id, api_key_id, state FROM controlled_billing_operations WHERE parent_request_id = ?1",
+            [parent_request_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional()?.ok_or_else(|| CoreError::BillingReceiptInvalid {
+            reason: "controlled operation is missing".into(),
+        })?;
+        if !matches!(state.as_str(), "held" | "submitted") {
+            return Err(CoreError::BillingReceiptInvalid {
+                reason: "controlled operation cannot dispatch another step".into(),
+            });
+        }
+        let valid_step: bool = if kind == ControlledStepKind::Video {
+            step_request_id == parent_request_id
+        } else {
+            transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM request_relations WHERE parent_request_id = ?1
+                 AND child_request_id = ?2 AND relationship_kind = 'seedance_assist')",
+                params![parent_request_id, step_request_id],
+                |row| row.get(0),
+            )?
+        };
+        let step_key: String = transaction
+            .query_row(
+                "SELECT api_key_id FROM requests WHERE id = ?1",
+                [step_request_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::RequestNotFound {
+                request_id: step_request_id.into(),
+            })?;
+        if !valid_step || step_key != api_key_id {
+            return Err(CoreError::BillingReceiptInvalid {
+                reason: "controlled step identity does not match its parent Key".into(),
+            });
+        }
+        transaction.execute(
+            "INSERT INTO controlled_billing_steps (request_id, operation_id, kind, state)
+             VALUES (?1, ?2, ?3, 'pending')",
+            params![step_request_id, operation_id, kind.as_str()],
+        )?;
+        transaction.execute(
+            "UPDATE controlled_billing_operations SET state = 'submitted', updated_at_ms = ?2 WHERE operation_id = ?1",
+            params![operation_id, now],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn record_controlled_step(
         &self,
         parent_request_id: &str,
@@ -519,13 +751,13 @@ impl CoreStore {
             });
         }
 
-        let previous: Option<(Vec<u8>, String, Option<i64>)> = transaction.query_row(
+        let previous: Option<(Option<Vec<u8>>, String, Option<i64>)> = transaction.query_row(
             "SELECT receipt_hash, state, actual_microcredits FROM controlled_billing_steps WHERE request_id = ?1",
             [step_request_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).optional()?;
         if let Some((previous_hash, previous_state, _)) = previous.as_ref() {
-            if *previous_hash == hash {
+            if previous_hash.as_deref() == Some(hash.as_slice()) {
                 transaction.commit()?;
                 return Ok(if previous_state == "verified" {
                     ControlledStepResult::Duplicate

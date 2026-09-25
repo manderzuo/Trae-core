@@ -374,6 +374,14 @@ impl CoreStore {
         &self,
         input: VideoBillingControlInput,
     ) -> Result<(), CoreError> {
+        self.set_video_billing_control_as_actor(input, "system")
+    }
+
+    pub fn set_video_billing_control_as_actor(
+        &self,
+        input: VideoBillingControlInput,
+        actor: &str,
+    ) -> Result<(), CoreError> {
         validate_video_billing_control_input(&input)?;
         let now = Utc::now().timestamp_millis();
         let diagnostic_key_id = if input.mode == VideoBillingMode::DiagnosticOnce {
@@ -386,8 +394,9 @@ impl CoreStore {
         } else {
             None
         };
-        let connection = self.connection.lock().expect("core store mutex poisoned");
-        connection.execute(
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
             "UPDATE video_billing_control
              SET mode = ?1, reason = ?2, diagnostic_key_id = ?3,
                  diagnostic_request_hash = ?4, diagnostic_claimed_at_ms = NULL,
@@ -401,6 +410,10 @@ impl CoreStore {
                 now,
             ],
         )?;
+        Self::insert_audit_event(&transaction, actor, "video_billing.control_update", "video_billing_control", "1",
+            serde_json::json!({"mode":input.mode.as_str(), "diagnostic_key_id":diagnostic_key_id,
+                "reason":input.reason.trim()}), now)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -459,6 +472,8 @@ impl CoreStore {
              WHERE id = 1",
             [now],
         )?;
+        Self::insert_audit_event(&transaction, "system", "video_billing.diagnostic_claim", "video_diagnostic_claim", &claim_id,
+            serde_json::json!({"key_id":key_id, "claimed_at_ms":now}), now)?;
         transaction.commit()?;
         Ok(Some(VideoDiagnosticClaim { claimed_at_ms: now }))
     }

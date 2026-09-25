@@ -129,3 +129,36 @@ async fn video_billing_controls_require_an_admin_session() {
     ).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn controlled_status_shows_hold_and_prevents_rearming_same_key() {
+    let fixture = fixture();
+    let admin = aiwork_core::Principal {
+        user_id: "admin".into(), key_id: "admin_session:test".into(),
+        scopes: BTreeSet::from(["admin:*".into()]),
+    };
+    let key = fixture.store.list_api_keys_as_admin(&admin, None).unwrap().into_iter()
+        .find(|item| item.id == fixture.key_id).unwrap();
+    fixture.store.key_quota_grant_as_admin(&admin, aiwork_core::KeyQuotaGrant {
+        api_key_id: key.id.clone(), resource_kind: "credits".into(), amount: 50_000_000,
+        actor_user_id: "admin".into(), reason: "controlled status test".into(),
+    }).unwrap();
+    let parent = match fixture.store.begin_billed_request(aiwork_core::BeginRequestInput {
+        user_id: key.user_id, api_key_id: key.id.clone(), protocol: "openai".into(),
+        endpoint: "/v1/videos/generations".into(), model: "seedance".into(),
+        idempotency_key: "admin-controlled-status".into(), body: json!({"model":"seedance","prompt":"test"}),
+    }).unwrap() { aiwork_core::BeginRequest::Created(request) => request.id, other => panic!("{other:?}") };
+    fixture.store.begin_controlled_operation(&parent, aiwork_core::UpstreamCreditSnapshot {
+        total: aiwork_core::CreditAmount::parse("1000", "credits").unwrap(),
+        updated_at_ms: chrono::Utc::now().timestamp_millis(),
+    }).unwrap();
+    let response = admin_request(&fixture, axum::http::Method::GET, "/admin/v1/video-billing", json!({})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["controlled_operations"][0]["parent_request_id"], parent);
+    assert_eq!(body["controlled_operations"][0]["held_microcredits"], 50_000_000);
+    assert_eq!(body["controlled_operations"][0]["state"], "held");
+    let register = admin_request(&fixture, axum::http::Method::POST, "/admin/v1/video-billing/diagnostic",
+        json!({"key_id":fixture.key_id,"request_hash":"0".repeat(64),"reason":"must not rearm"})).await;
+    assert_eq!(register.status(), StatusCode::CONFLICT);
+}

@@ -27,6 +27,8 @@ pub struct UserVideoJob {
     pub last_reconciled_at_ms: Option<i64>,
     #[serde(default)]
     pub one_shot_test: bool,
+    #[serde(default)]
+    pub controlled_operation_id: Option<String>,
 }
 
 fn default_billing_state() -> String { "held".into() }
@@ -41,6 +43,9 @@ pub struct StarlinkRouterState {
     pub admin_sessions: Arc<AdminSessionStore>,
     pub login_throttle: Arc<LoginThrottle>,
     pub asset_limiter: Arc<AssetLimiter>,
+    /// Captured before this process accepts requests; only older operations
+    /// may be classified as abandoned between assistant and video dispatch.
+    pub startup_cutoff_ms: i64,
 }
 
 impl StarlinkRouterState {
@@ -78,6 +83,7 @@ impl StarlinkRouterState {
             admin_sessions: Arc::new(AdminSessionStore::new(SESSION_TTL_MS)),
             login_throttle: Arc::new(LoginThrottle::new()),
             asset_limiter: Arc::new(AssetLimiter::from_env()),
+            startup_cutoff_ms: chrono::Utc::now().timestamp_millis(),
         }))
     }
 
@@ -91,7 +97,7 @@ impl StarlinkRouterState {
         config: RouterConfig,
         key_vault: KeyVault,
     ) -> Arc<Self> {
-        Arc::new(Self { store, bridge: Arc::new(Mutex::new(bridge)), config, key_vault: Arc::new(key_vault), jobs: Arc::new(Mutex::new(HashMap::new())), video_stream_observers: Arc::new(Mutex::new(HashSet::new())), admin_sessions: Arc::new(AdminSessionStore::new(SESSION_TTL_MS)), login_throttle: Arc::new(LoginThrottle::new()), asset_limiter: Arc::new(AssetLimiter::from_env()) })
+        Arc::new(Self { store, bridge: Arc::new(Mutex::new(bridge)), config, key_vault: Arc::new(key_vault), jobs: Arc::new(Mutex::new(HashMap::new())), video_stream_observers: Arc::new(Mutex::new(HashSet::new())), admin_sessions: Arc::new(AdminSessionStore::new(SESSION_TTL_MS)), login_throttle: Arc::new(LoginThrottle::new()), asset_limiter: Arc::new(AssetLimiter::from_env()), startup_cutoff_ms: chrono::Utc::now().timestamp_millis() })
     }
 
     pub fn replace_bridge(&self, bridge: BridgeClient) {

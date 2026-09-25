@@ -94,10 +94,12 @@
       </section>
 
       <section class="panel">
-        <div class="section-head"><div><h2>视频计费安全状态</h2><div class="hint">只有拿到任务级、可核验的上游积分回执后才会结算；未知状态保持待对账。</div></div><div class="row"><span id="videoBillingStatus" class="hint">等待读取</span><button class="btn alt" id="videoBillingRefresh" type="button">刷新</button></div></div>
+        <div class="section-head"><div><h2>视频计费安全状态</h2><div class="hint">方案 B 仅用于一次受控验收：操作先持有该 Key 全部可用积分，DeepSeek 与视频按各自真实回执合并结算；未知状态不自动释放或重试。</div></div><div class="row"><span id="videoBillingStatus" class="hint">等待读取</span><button class="btn alt" id="videoBillingRefresh" type="button">刷新</button></div></div>
         <div id="videoBillingCards" class="grid" style="margin-top:14px"></div><div id="videoBillingReason" class="hint" style="margin-top:10px">—</div>
+        <div class="section-head" style="margin-top:18px"><h3>最近受控操作与真实回执</h3><span class="hint">仅管理员可见；未核验费用不算已扣</span></div>
+        <div id="controlledOperationList" class="stack" style="margin-top:10px"><div class="list-empty">暂无受控操作</div></div>
         <div class="row" style="margin-top:12px"><div class="field"><label for="videoBillingMode">安全闸门模式</label><select id="videoBillingMode"><option value="paused">保持暂停</option><option value="active">启用（仅在回执契约已确认后）</option></select></div><div class="field"><label for="videoBillingReasonInput">调整原因</label><input id="videoBillingReasonInput" value="管理员调整视频计费安全状态" /></div><button class="btn" id="videoBillingSave" type="button">保存模式</button></div>
-        <div class="row" style="margin-top:12px"><div class="field"><label for="videoDiagnosticKeyId">验收普通 Key 内部 ID（不是明文 Key）</label><input id="videoDiagnosticKeyId" placeholder="例如 key-..." /></div><div class="field"><label for="videoDiagnosticHash">本次请求 SHA-256（64 位十六进制）</label><input id="videoDiagnosticHash" placeholder="仅登记精确的一次请求" /></div><div class="field"><label for="videoDiagnosticReason">验收原因</label><input id="videoDiagnosticReason" value="一次性视频计费验收" /></div><button class="btn warn" id="videoDiagnosticRegister" type="button">登记一次性验收</button></div>
+        <div class="row" style="margin-top:12px"><div class="field"><label for="videoDiagnosticKeyId">受控验收普通 Key 内部 ID（不是明文 Key）</label><input id="videoDiagnosticKeyId" placeholder="例如 key-..." /></div><div class="field"><label for="videoDiagnosticHash">本次请求 SHA-256（64 位十六进制）</label><input id="videoDiagnosticHash" placeholder="仅登记精确的一次请求" /></div><div class="field"><label for="videoDiagnosticReason">验收原因</label><input id="videoDiagnosticReason" value="方案 B 一次性受控验收" /></div><button class="btn warn" id="videoDiagnosticRegister" type="button">登记一次性验收</button></div>
         <div id="videoBillingMsg" class="msg" aria-live="polite"></div>
       </section>
 
@@ -345,6 +347,21 @@
       ['历史未核验', counts.legacy_unverified ?? 0, '旧任务不自动补扣或退款'],
     ].map(([label, value, note]) => `<div class="card"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(label === '安全状态' ? value : formatCount(value))}</div><div class="hint">${escapeHtml(note)}</div></div>`).join('');
     $('videoBillingReason').textContent = `当前原因：${data?.reason || '—'}${data?.diagnostic?.claimed ? ' · 本次一次性验收已使用' : ''}`;
+    const operationLabels = {held:'已持有',submitted:'生成中',unknown:'待对账',settled:'已结算',released:'已释放'};
+    const stepLabels = {assist:'文字辅助',video:'视频'};
+    const stepStates = {pending:'等待回执',verified:'已核验',unknown:'待对账',conflict:'回执冲突'};
+    const operations = Array.isArray(data?.controlled_operations) ? data.controlled_operations : [];
+    $('controlledOperationList').innerHTML = operations.length ? operations.map(operation => {
+      const stateLabel = operationLabels[operation.state] || operation.state;
+      const held = formatMicrocredits(BigInt(operation.held_microcredits || 0));
+      const actual = operation.actual_microcredits == null ? '尚未最终结算' : `实扣 ${formatMicrocredits(BigInt(operation.actual_microcredits))} 积分`;
+      const steps = Array.isArray(operation.steps) ? operation.steps : [];
+      const detail = steps.map(step => {
+        const cost = step.actual_microcredits == null ? '' : ` ${formatMicrocredits(BigInt(step.actual_microcredits))} 积分`;
+        return `<div class="hint">${escapeHtml(stepLabels[step.kind] || step.kind)} · ${escapeHtml(stepStates[step.state] || step.state)}${escapeHtml(cost)} · ${escapeHtml(step.request_id)}</div>`;
+      }).join('');
+      return `<div class="settings-note"><div><strong>${escapeHtml(stateLabel)}</strong> · ${escapeHtml(operation.parent_request_id)} · Key ${escapeHtml(operation.api_key_id)}</div><div class="hint">持有 ${escapeHtml(held)} 积分 · ${escapeHtml(actual)}</div>${detail}</div>`;
+    }).join('') : '<div class="list-empty">暂无受控操作</div>';
     $('videoBillingMsg').textContent = '';
   }
 

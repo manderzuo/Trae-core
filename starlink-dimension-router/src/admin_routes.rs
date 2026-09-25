@@ -311,6 +311,7 @@ async fn usage_trend(State(state): State<Arc<StarlinkRouterState>>, Query(query)
 
 fn video_billing_snapshot(state: &StarlinkRouterState) -> Result<serde_json::Value, aiwork_core::CoreError> {
     let control = state.store.video_billing_control()?;
+    let controlled_operations = state.store.controlled_operation_summaries(20)?;
     let jobs = state.jobs.lock().unwrap_or_else(|error| error.into_inner());
     let held = jobs.values().filter(|job| job.billing_state == "held").count();
     let reconcile_required = jobs.values().filter(|job| job.billing_state == "reconcile_required" || job.reconcile_required).count();
@@ -330,6 +331,7 @@ fn video_billing_snapshot(state: &StarlinkRouterState) -> Result<serde_json::Val
             "verified_settled": verified_settled,
             "legacy_unverified": legacy_unverified,
         },
+        "controlled_operations": controlled_operations,
         "updated_at_ms": control.updated_at_ms,
     }))
 }
@@ -340,6 +342,7 @@ async fn video_billing_status(State(state): State<Arc<StarlinkRouterState>>) -> 
 
 async fn update_video_billing(
     State(state): State<Arc<StarlinkRouterState>>,
+    Extension(principal): Extension<aiwork_core::Principal>,
     Json(input): Json<VideoBillingUpdateInput>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let mode = match input.mode.trim().to_ascii_lowercase().as_str() {
@@ -348,12 +351,12 @@ async fn update_video_billing(
         "diagnostic_once" => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": {"type": "invalid_video_billing_mode", "message": "一次性验收请使用登记一次性验收接口"}})))),
         _ => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": {"type": "invalid_video_billing_mode", "message": "模式只能是 paused 或 active"}})))),
     };
-    state.store.set_video_billing_control(aiwork_core::VideoBillingControlInput {
+    state.store.set_video_billing_control_as_actor(aiwork_core::VideoBillingControlInput {
         mode,
         reason: input.reason,
         diagnostic_key_id: None,
         diagnostic_request_hash: None,
-    }).map_err(internal)?;
+    }, &principal.user_id).map_err(internal)?;
     video_billing_snapshot(&state).map(Json).map_err(internal)
 }
 
@@ -371,11 +374,17 @@ async fn register_video_diagnostic(
     if !known_key {
         return Err((StatusCode::BAD_REQUEST, Json(json!({"error": {"type": "video_diagnostic_key_not_found", "message": "只能登记已存在的普通 API Key 内部 ID"}}))));
     }
-    state.store.set_video_billing_control(aiwork_core::VideoBillingControlInput::diagnostic(
+    if state.store.active_controlled_operation_for_key(&input.key_id).map_err(internal)? {
+        return Err((StatusCode::CONFLICT, Json(json!({"error": {
+            "type":"controlled_operation_active",
+            "message":"该 Key 仍有未结清的受控视频操作，先核验回执后才能登记下一次"
+        }}))));
+    }
+    state.store.set_video_billing_control_as_actor(aiwork_core::VideoBillingControlInput::diagnostic(
         &input.key_id,
         &input.request_hash,
         &input.reason,
-    )).map_err(internal)?;
+    ), &principal.user_id).map_err(internal)?;
     video_billing_snapshot(&state).map(Json).map_err(internal)
 }
 

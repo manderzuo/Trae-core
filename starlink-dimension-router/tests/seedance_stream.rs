@@ -121,6 +121,7 @@ struct FakeGateway {
     assistant_receipt_status: Mutex<String>,
     assistant_finalization_status: Mutex<String>,
     video_preflight_rejection: Mutex<Option<&'static str>>,
+    video_no_charge_proof: Mutex<bool>,
     content_status: Mutex<u16>,
 }
 
@@ -136,6 +137,7 @@ impl FakeGateway {
             assistant_receipt_status: Mutex::new("final".into()),
             assistant_finalization_status: Mutex::new("unknown".into()),
             video_preflight_rejection: Mutex::new(None),
+            video_no_charge_proof: Mutex::new(false),
             content_status: Mutex::new(200),
         })
     }
@@ -289,6 +291,17 @@ impl BridgeTransport for FakeGateway {
                     })).unwrap(),
                 }
             }
+            ("GET", path) if path.starts_with("/internal/bridge/requests/") && path.ends_with("/video-task") => {
+                let request_id = path.trim_start_matches("/internal/bridge/requests/").trim_end_matches("/video-task");
+                let submitted = self.requests.lock().unwrap().iter().any(|(method, route, _, seen_headers)| {
+                    method == "POST" && route == "/v1/chat/completions"
+                        && seen_headers.get("x-core-request-id").is_some_and(|value| value == request_id)
+                });
+                let submitted = submitted && self.video_preflight_rejection.lock().unwrap().is_none();
+                BridgeResponse { status: 200, headers: BTreeMap::new(),
+                    body: serde_json::to_vec(&serde_json::json!({"request_id":request_id,
+                        "task":if submitted { serde_json::json!({"id":"video-stream-test","status":"queued"}) } else { serde_json::Value::Null }})).unwrap() }
+            }
             (method, path)
                 if path.starts_with("/internal/bridge/requests/")
                     && ((method == "GET" && path.ends_with("/billing"))
@@ -310,16 +323,17 @@ impl BridgeTransport for FakeGateway {
                 } else {
                     self.assistant_receipt_status.lock().unwrap().clone()
                 };
+                let no_charge = model == "seedance" && *self.video_no_charge_proof.lock().unwrap();
                 BridgeResponse {
                     status: 200,
                     headers: BTreeMap::new(),
                     body: serde_json::to_vec(&serde_json::json!({
                         "request_id":request_id,
-                        "status":status,
-                        "actual_credits":"2.500000",
+                        "status":if no_charge { "final" } else { status.as_str() },
+                        "actual_credits":if no_charge { "0.000000" } else { "2.500000" },
                         "unit":"credits",
-                        "source_ref":"trae-usage-session:test-account:test-session",
-                        "task_ref":"video-stream-test",
+                        "source_ref":if no_charge { format!("aiwork-pre-dispatch-no-charge:{request_id}") } else { "trae-usage-session:test-account:test-session".into() },
+                        "task_ref":if no_charge { serde_json::Value::Null } else { serde_json::json!("video-stream-test") },
                         "observed_at_ms":chrono::Utc::now().timestamp_millis()
                     }))
                     .unwrap(),
@@ -372,6 +386,7 @@ impl BridgeTransport for FakeGateway {
 
 struct StreamFixture {
     app: Router,
+    state: Arc<StarlinkRouterState>,
     gateway: Arc<FakeGateway>,
     store: Arc<aiwork_core::CoreStore>,
     billing_principal: aiwork_core::Principal,
@@ -452,6 +467,7 @@ fn stream_fixture() -> StreamFixture {
     let app = build_router(state.clone());
     StreamFixture {
         app,
+        state: state.clone(),
         gateway,
         store: state.store.clone(),
         billing_principal,
@@ -759,6 +775,8 @@ async fn diagnostic_stream_falls_back_for_both_billing_requests_and_settles_inde
     let text = String::from_utf8(bytes.to_vec()).unwrap();
     assert!(text.contains("chat.completion.chunk"));
     assert!(text.contains("[DONE]"));
+    assert_eq!(fixture.gateway.submitted_body()["messages"][0]["content"][1]["image_url"]["url"],
+        "data:image/png;base64,iVBORw0KGgo=", "controlled video must retain its reference image");
 
     let parent_request_id = payloads(text.as_bytes())
         .iter()
@@ -781,7 +799,9 @@ async fn diagnostic_stream_falls_back_for_both_billing_requests_and_settles_inde
         .map(|(_, _, _, headers)| headers)
         .expect("the text helper must be dispatched once");
     assert_eq!(assistant_headers["x-core-request-id"], child_request_id);
-    assert_eq!(assistant_headers["x-core-quote-id"], format!("authorized-one-shot-test-{child_request_id}"));
+    let operation_id = assistant_headers.get("x-core-controlled-operation-id")
+        .expect("helper must carry the parent controlled operation");
+    assert!(!assistant_headers.contains_key("x-core-quote-id"));
     assert_eq!(assistant_headers["x-core-key-id"], fixture.billing_principal.key_id);
     let video_headers = requests
         .iter()
@@ -791,7 +811,8 @@ async fn diagnostic_stream_falls_back_for_both_billing_requests_and_settles_inde
         .map(|(_, _, _, headers)| headers)
         .expect("the video request must be dispatched once");
     assert_eq!(video_headers["x-core-request-id"], parent_request_id);
-    assert_eq!(video_headers["x-core-quote-id"], format!("authorized-one-shot-test-{parent_request_id}"));
+    assert_eq!(video_headers.get("x-core-controlled-operation-id"), Some(operation_id));
+    assert!(!video_headers.contains_key("x-core-quote-id"));
     assert_eq!(video_headers["idempotency-key"], parent_request_id,
         "headerless clients still need a stable upstream idempotency key");
     drop(requests);
@@ -803,6 +824,182 @@ async fn diagnostic_stream_falls_back_for_both_billing_requests_and_settles_inde
     assert_eq!(balance.settled, 5_000_000, "both request-scoped receipts must be charged once");
     assert_eq!(balance.held, 0, "successful completion must release all unused reserved credits");
     assert_eq!(current_key_concurrency(&fixture), 0);
+}
+
+#[tokio::test]
+async fn controlled_unknown_helper_receipt_blocks_video_and_keeps_the_whole_hold() {
+    let fixture = stream_fixture();
+    fixture.gateway.set_quote_unavailable("videos");
+    *fixture.gateway.assistant_receipt_status.lock().unwrap() = "unknown".into();
+    let body = video_chat_body(true);
+    let hash = starlink_dimension_router::video_billing::request_hash("seedance", &body);
+    fixture.store.set_video_billing_control(aiwork_core::VideoBillingControlInput::diagnostic(
+        &fixture.billing_principal.key_id, &hash, "unknown helper receipt must fail closed",
+    )).unwrap();
+    let response = post_chat(&fixture, &fixture.key, Some("controlled-helper-unknown"), body).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "deepseek-v4-flash"), 1);
+    assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "seedance"), 0);
+    let balance = fixture.store.key_quota_balance_for_principal(&fixture.billing_principal, "credits").unwrap();
+    assert_eq!((balance.available, balance.held, balance.settled), (0, 100_000_000, 0));
+}
+
+#[tokio::test]
+async fn controlled_reference_asset_failure_happens_before_paid_helper() {
+    let fixture = stream_fixture();
+    fixture.gateway.set_quote_unavailable("videos");
+    let mut body = video_chat_body(true);
+    body["image_asset_ids"] = serde_json::json!(["asset-does-not-belong-to-this-key"]);
+    let hash = starlink_dimension_router::video_billing::request_hash("seedance", &body);
+    fixture.store.set_video_billing_control(aiwork_core::VideoBillingControlInput::diagnostic(
+        &fixture.billing_principal.key_id, &hash, "reference image permission check",
+    )).unwrap();
+    let response = post_chat(&fixture, &fixture.key, Some("controlled-bad-asset"), body).await;
+    assert!(response.status().is_client_error());
+    assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "deepseek-v4-flash"), 0);
+    assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "seedance"), 0);
+    let balance = fixture.store.key_quota_balance_for_principal(&fixture.billing_principal, "credits").unwrap();
+    assert_eq!((balance.available, balance.held, balance.settled), (100_000_000, 0, 0));
+}
+
+#[tokio::test]
+async fn controlled_recovery_queries_existing_helper_receipt_without_restarting_video() {
+    let fixture = stream_fixture();
+    fixture.gateway.set_quote_unavailable("videos");
+    *fixture.gateway.assistant_receipt_status.lock().unwrap() = "unknown".into();
+    let body = video_chat_body(false);
+    let hash = starlink_dimension_router::video_billing::request_hash("seedance", &body);
+    fixture.store.set_video_billing_control(aiwork_core::VideoBillingControlInput::diagnostic(
+        &fixture.billing_principal.key_id, &hash, "controlled receipt recovery",
+    )).unwrap();
+    let response = post_chat(&fixture, &fixture.key, Some("controlled-recovery"), body).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    *fixture.gateway.assistant_receipt_status.lock().unwrap() = "final".into();
+    assert!(starlink_dimension_router::user_routes::reconcile_pending_billing_requests_once(&fixture.state) > 0);
+    let steps = fixture.store.recoverable_controlled_steps(10).unwrap();
+    assert!(steps.iter().any(|step| step.kind == aiwork_core::ControlledStepKind::Assist && step.state == "verified"));
+    assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "seedance"), 0);
+    assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "deepseek-v4-flash"), 1);
+    let parent = &steps[0].parent_request_id;
+    fixture.store.mark_controlled_step_dispatched(parent, parent, aiwork_core::ControlledStepKind::Video).unwrap();
+    fixture.store.record_controlled_step(parent, parent, aiwork_core::ControlledStepKind::Video,
+        aiwork_core::BillingReceipt {
+            request_id: parent.clone(), status: aiwork_core::BillingReceiptStatus::Final,
+            actual_credits: Some(aiwork_core::CreditAmount::parse("2.5", "credits").unwrap()),
+            unit: "credits".into(), source_ref: "trae-usage-session:recovered-video".into(),
+            task_ref: Some("video-recovered".into()), observed_at_ms: chrono::Utc::now().timestamp_millis(),
+        }).unwrap();
+    starlink_dimension_router::user_routes::reconcile_pending_billing_requests_once(&fixture.state);
+    let balance = fixture.store.key_quota_balance_for_principal(&fixture.billing_principal, "credits").unwrap();
+    assert_eq!((balance.held, balance.settled), (100_000_000, 0),
+        "a billing receipt alone must not classify the unobserved video as successful");
+    fixture.store.finish_controlled_operation(parent, Some(true)).unwrap();
+    let balance = fixture.store.key_quota_balance_for_principal(&fixture.billing_principal, "credits").unwrap();
+    assert_eq!((balance.held, balance.settled), (0, 5_000_000));
+}
+
+#[tokio::test]
+async fn controlled_recovery_restores_accepted_video_without_resubmitting_it() {
+    let fixture = stream_fixture();
+    fixture.gateway.set_quote_unavailable("videos");
+    let body = video_chat_body(false);
+    let hash = starlink_dimension_router::video_billing::request_hash("seedance", &body);
+    fixture.store.set_video_billing_control(aiwork_core::VideoBillingControlInput::diagnostic(
+        &fixture.billing_principal.key_id, &hash, "accepted task crash recovery",
+    )).unwrap();
+    let response = post_chat(&fixture, &fixture.key, Some("controlled-task-crash"), body).await;
+    assert!(response.status().is_success());
+    let parent = fixture.gateway.core_request_id_for_model("seedance").unwrap();
+    fixture.state.jobs.lock().unwrap().clear();
+    fixture.state.persist_jobs();
+    assert!(fixture.store.recoverable_controlled_steps(10).unwrap().iter().any(|step| step.kind == aiwork_core::ControlledStepKind::Video && step.task_ref.as_deref() == Some("video-stream-test")));
+    starlink_dimension_router::user_routes::reconcile_pending_billing_requests_once(&fixture.state);
+    let restored = fixture.state.jobs.lock().unwrap().get("video-stream-test").cloned().expect("accepted task must be restored");
+    assert_eq!(restored.request_id, parent);
+    assert_eq!(restored.api_key_id, fixture.billing_principal.key_id);
+    assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "seedance"), 1);
+    assert_eq!(fixture.store.recoverable_controlled_steps(10).unwrap().iter()
+        .find(|step| step.kind == aiwork_core::ControlledStepKind::Video).unwrap().task_ref.as_deref(), Some("video-stream-test"));
+}
+
+#[tokio::test]
+async fn controlled_recovery_finds_task_after_crash_before_core_task_binding() {
+    let fixture = stream_fixture();
+    let begun = fixture.store.begin_billed_request(aiwork_core::BeginRequestInput {
+        user_id: fixture.billing_principal.user_id.clone(),
+        api_key_id: fixture.billing_principal.key_id.clone(),
+        protocol: "openai".into(), endpoint: "/v1/videos/generations".into(),
+        model: "seedance".into(), idempotency_key: "crash-before-bind".into(),
+        body: serde_json::json!({"model":"seedance","prompt":"cat"}),
+    }).unwrap();
+    let parent = match begun { aiwork_core::BeginRequest::Created(handle) => handle.id, other => panic!("{other:?}") };
+    fixture.store.begin_controlled_operation(&parent, aiwork_core::UpstreamCreditSnapshot {
+        total: aiwork_core::CreditAmount::parse("1000", "credits").unwrap(),
+        updated_at_ms: chrono::Utc::now().timestamp_millis(),
+    }).unwrap();
+    fixture.store.mark_controlled_step_dispatched(&parent, &parent, aiwork_core::ControlledStepKind::Video).unwrap();
+    fixture.gateway.requests.lock().unwrap().push(("POST".into(), "/v1/chat/completions".into(),
+        serde_json::json!({"model":"seedance"}),
+        BTreeMap::from([("x-core-request-id".into(), parent.clone())])));
+    starlink_dimension_router::user_routes::reconcile_pending_billing_requests_once(&fixture.state);
+    let restored = fixture.state.jobs.lock().unwrap().get("video-stream-test").cloned().expect("task lookup must recover accepted video");
+    assert_eq!(restored.request_id, parent);
+    assert_eq!(restored.api_key_id, fixture.billing_principal.key_id);
+    assert_eq!(fixture.store.recoverable_controlled_steps(10).unwrap().iter()
+        .find(|step| step.kind == aiwork_core::ControlledStepKind::Video).unwrap().task_ref.as_deref(), Some("video-stream-test"));
+    assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "seedance"), 1);
+}
+
+#[tokio::test]
+async fn restarted_core_settles_verified_assist_without_dispatching_video() {
+    let fixture = stream_fixture();
+    let begin = |model: &str, key: &str| fixture.store.begin_billed_request(aiwork_core::BeginRequestInput {
+        user_id: fixture.billing_principal.user_id.clone(), api_key_id: fixture.billing_principal.key_id.clone(),
+        protocol: "openai".into(), endpoint: "/v1/chat/completions".into(), model: model.into(),
+        idempotency_key: key.into(), body: serde_json::json!({"model":model,"messages":[{"role":"user","content":"cat"}]}),
+    }).unwrap();
+    let parent = match begin("seedance", "orphan-parent") { aiwork_core::BeginRequest::Created(handle) => handle.id, other => panic!("{other:?}") };
+    let child = match begin("deepseek-v4-flash", "orphan-child") { aiwork_core::BeginRequest::Created(handle) => handle.id, other => panic!("{other:?}") };
+    fixture.store.begin_controlled_operation(&parent, aiwork_core::UpstreamCreditSnapshot {
+        total: aiwork_core::CreditAmount::parse("1000", "credits").unwrap(),
+        updated_at_ms: chrono::Utc::now().timestamp_millis(),
+    }).unwrap();
+    fixture.store.link_seedance_assist_request(&parent, &child).unwrap();
+    fixture.store.mark_controlled_step_dispatched(&parent, &child, aiwork_core::ControlledStepKind::Assist).unwrap();
+    fixture.store.record_controlled_step(&parent, &child, aiwork_core::ControlledStepKind::Assist,
+        aiwork_core::BillingReceipt { request_id: child.clone(), status: aiwork_core::BillingReceiptStatus::Final,
+            actual_credits: Some(aiwork_core::CreditAmount::parse("0.25", "credits").unwrap()),
+            unit: "credits".into(), source_ref: "trae-usage-session:assist-only".into(), task_ref: None,
+            observed_at_ms: chrono::Utc::now().timestamp_millis() }).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    let restarted = StarlinkRouterState::for_test(fixture.store.clone(),
+        BridgeClient::from_transport("http://bridge", "test-bridge-secret", fixture.gateway.clone()),
+        fixture.state.config.clone());
+    starlink_dimension_router::user_routes::reconcile_pending_billing_requests_once(&restarted);
+    let balance = fixture.store.key_quota_balance_for_principal(&fixture.billing_principal, "credits").unwrap();
+    assert_eq!((balance.available, balance.held, balance.settled), (99_750_000, 0, 250_000));
+    assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "seedance"), 0);
+}
+
+#[tokio::test]
+async fn controlled_headerless_retry_replays_without_second_upstream_submission() {
+    let fixture = stream_fixture();
+    fixture.gateway.set_quote_unavailable("videos");
+    let body = video_chat_body(true);
+    let hash = starlink_dimension_router::video_billing::request_hash("seedance", &body);
+    fixture.store.set_video_billing_control(aiwork_core::VideoBillingControlInput::diagnostic(
+        &fixture.billing_principal.key_id, &hash, "controlled headerless replay",
+    )).unwrap();
+    let first = post_chat(&fixture, &fixture.key, None, body.clone()).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let _ = to_bytes(first.into_body(), 64 * 1024).await.unwrap();
+    let replay = post_chat(&fixture, &fixture.key, None, body).await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    let _ = to_bytes(replay.into_body(), 64 * 1024).await.unwrap();
+    assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "deepseek-v4-flash"), 1);
+    assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "seedance"), 1);
+    let balance = fixture.store.key_quota_balance_for_principal(&fixture.billing_principal, "credits").unwrap();
+    assert_eq!(balance.settled, 5_000_000);
 }
 
 #[tokio::test]
@@ -838,7 +1035,7 @@ async fn diagnostic_stream_promotes_unknown_helper_usage_before_video_dispatch()
 }
 
 #[tokio::test]
-async fn confirmed_preflight_rejection_releases_video_hold_without_reversing_helper_charge() {
+async fn preflight_http_error_without_no_charge_receipt_keeps_controlled_hold() {
     let fixture = stream_fixture();
     fixture.gateway.set_quote_unavailable("chat");
     fixture.gateway.set_quote_unavailable("videos");
@@ -851,14 +1048,61 @@ async fn confirmed_preflight_rejection_releases_video_hold_without_reversing_hel
     )).unwrap();
 
     let response = post_chat(&fixture, &fixture.key, None, body).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let parent = fixture.gateway.core_request_id_for_model("seedance").unwrap();
+    assert_eq!(fixture.store.request_state(&parent).unwrap(), aiwork_core::RequestState::Unknown,
+        "HTTP rejection alone does not prove that no upstream cost occurred");
+    let balance = fixture.store.key_quota_balance_for_principal(&fixture.billing_principal, "credits").unwrap();
+    assert_eq!(balance.settled, 0, "helper cost remains recorded inside the operation until video proof arrives");
+    assert_eq!(balance.held, 100_000_000, "unknown video cost cannot release the operation hold");
+    assert_eq!(current_key_concurrency(&fixture), 1);
+}
+
+#[tokio::test]
+async fn verified_pre_dispatch_rejection_charges_only_helper_and_releases_hold() {
+    let fixture = stream_fixture();
+    fixture.gateway.set_quote_unavailable("chat");
+    fixture.gateway.set_quote_unavailable("videos");
+    *fixture.gateway.video_preflight_rejection.lock().unwrap() = Some("invalid_request_error");
+    *fixture.gateway.video_no_charge_proof.lock().unwrap() = true;
+    let body = video_chat_body(true);
+    let request_hash = starlink_dimension_router::video_billing::request_hash("seedance", &body);
+    fixture.store.set_video_billing_control(aiwork_core::VideoBillingControlInput::diagnostic(
+        &fixture.billing_principal.key_id, &request_hash, "视频本地拒绝零扣费验收",
+    )).unwrap();
+
+    let response = post_chat(&fixture, &fixture.key, None, body).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let parent = fixture.gateway.core_request_id_for_model("seedance").unwrap();
-    assert_eq!(fixture.store.request_state(&parent).unwrap(), aiwork_core::RequestState::Settled,
-        "the failed request is terminal after its zero-cost reservation is released");
+    assert_eq!(fixture.store.request_state(&parent).unwrap(), aiwork_core::RequestState::Settled);
     let balance = fixture.store.key_quota_balance_for_principal(&fixture.billing_principal, "credits").unwrap();
-    assert_eq!(balance.settled, 2_500_000, "real helper charge remains settled");
-    assert_eq!(balance.held, 0, "video never started and must not hold the Key balance");
+    assert_eq!(balance.settled, 2_500_000, "only the verified helper cost may be charged");
+    assert_eq!(balance.held, 0);
     assert_eq!(current_key_concurrency(&fixture), 0);
+}
+
+#[tokio::test]
+async fn delayed_zero_cost_proof_reconciles_without_resubmitting_video() {
+    let fixture = stream_fixture();
+    fixture.gateway.set_quote_unavailable("chat");
+    fixture.gateway.set_quote_unavailable("videos");
+    *fixture.gateway.video_preflight_rejection.lock().unwrap() = Some("invalid_request_error");
+    let body = video_chat_body(true);
+    let request_hash = starlink_dimension_router::video_billing::request_hash("seedance", &body);
+    fixture.store.set_video_billing_control(aiwork_core::VideoBillingControlInput::diagnostic(
+        &fixture.billing_principal.key_id, &request_hash, "迟到的零扣费证明",
+    )).unwrap();
+    assert_eq!(post_chat(&fixture, &fixture.key, None, body).await.status(), StatusCode::BAD_GATEWAY);
+    let parent = fixture.gateway.core_request_id_for_model("seedance").unwrap();
+    assert_eq!(fixture.store.key_quota_balance_for_principal(&fixture.billing_principal, "credits").unwrap().held, 100_000_000);
+
+    *fixture.gateway.video_no_charge_proof.lock().unwrap() = true;
+    assert!(starlink_dimension_router::user_routes::reconcile_pending_billing_requests_once(&fixture.state) > 0);
+    assert_eq!(fixture.store.request_state(&parent).unwrap(), aiwork_core::RequestState::Settled);
+    let balance = fixture.store.key_quota_balance_for_principal(&fixture.billing_principal, "credits").unwrap();
+    assert_eq!(balance.settled, 2_500_000);
+    assert_eq!(balance.held, 0);
+    assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "seedance"), 1);
 }
 
 #[tokio::test]
