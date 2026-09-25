@@ -541,6 +541,59 @@ impl BridgeClient {
         )
     }
 
+    pub fn forward_controlled_for_key(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        incoming_headers: &BTreeMap<String, String>,
+        request_id: &str,
+        operation_id: &str,
+        core_key_id: &str,
+    ) -> Result<BridgeResponse, String> {
+        let headers = self.controlled_headers(incoming_headers, request_id, operation_id, core_key_id)?;
+        let url = format!("{}{}", self.base_url, normalize_path(path));
+        self.transport.send(method, &url, &headers, body)
+    }
+
+    pub fn forward_controlled_stream_for_key(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        incoming_headers: &BTreeMap<String, String>,
+        request_id: &str,
+        operation_id: &str,
+        core_key_id: &str,
+    ) -> Result<BridgeStreamingResponse, String> {
+        let headers = self.controlled_headers(incoming_headers, request_id, operation_id, core_key_id)?;
+        let url = format!("{}{}", self.base_url, normalize_path(path));
+        self.transport.send_stream(method, &url, &headers, body)
+    }
+
+    fn controlled_headers(
+        &self,
+        incoming_headers: &BTreeMap<String, String>,
+        request_id: &str,
+        operation_id: &str,
+        core_key_id: &str,
+    ) -> Result<BTreeMap<String, String>, String> {
+        let valid = |value: &str| {
+            !value.is_empty() && value.len() <= 128
+                && value.bytes().all(|byte| byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'-' | b'_' | b'.' | b':'))
+        };
+        if !valid(request_id) || !valid(operation_id) || !valid(core_key_id) {
+            return Err("Core 受控操作关联编号无效；拒绝转发付费请求".into());
+        }
+        let mut headers = safe_headers(incoming_headers);
+        headers.insert("authorization".into(), format!("Bearer {}", self.bridge_secret));
+        headers.insert("x-core-request-id".into(), request_id.into());
+        headers.insert("x-core-controlled-operation-id".into(), operation_id.into());
+        headers.insert("x-core-key-id".into(), core_key_id.into());
+        Ok(headers)
+    }
+
     pub fn forward_billed_stream(
         &self,
         method: &str,
@@ -934,6 +987,35 @@ mod tests {
         assert_eq!(captured.get("x-core-key-id").map(String::as_str), Some("key_server_owned"));
         assert_eq!(captured.get("authorization").map(String::as_str), Some("Bearer bridge-secret"));
         assert!(!captured.values().any(|value| value.contains("aw_live_never_forward")));
+    }
+
+    #[test]
+    fn controlled_bridge_headers_use_server_identity_only() {
+        let recording = Arc::new(RecordingBridge::default());
+        let client = BridgeClient::from_transport("http://bridge", "bridge-secret", recording.clone());
+        let headers = BTreeMap::from([
+            ("x-core-controlled-operation-id".into(), "client-forged".into()),
+            ("x-core-quote-id".into(), "client-fake-quote".into()),
+            ("x-core-key-id".into(), "client-key".into()),
+            ("authorization".into(), "Bearer user-key".into()),
+        ]);
+        client.forward_controlled_for_key("POST", "/v1/chat/completions", b"{}", &headers,
+            "request-assist", "operation-parent", "key-server").unwrap();
+        let seen = recording.last_headers();
+        assert_eq!(seen.get("x-core-controlled-operation-id").map(String::as_str), Some("operation-parent"));
+        assert_eq!(seen.get("x-core-request-id").map(String::as_str), Some("request-assist"));
+        assert_eq!(seen.get("x-core-key-id").map(String::as_str), Some("key-server"));
+        assert_eq!(seen.get("authorization").map(String::as_str), Some("Bearer bridge-secret"));
+        assert!(!seen.contains_key("x-core-quote-id"));
+
+        client.forward_controlled_stream_for_key("POST", "/v1/chat/completions", b"{}", &headers,
+            "request-video", "operation-parent", "key-server").unwrap();
+        let stream_seen = recording.last_headers();
+        assert_eq!(stream_seen.get("x-core-request-id").map(String::as_str), Some("request-video"));
+        assert_eq!(stream_seen.get("x-core-controlled-operation-id").map(String::as_str), Some("operation-parent"));
+        assert!(!stream_seen.contains_key("x-core-quote-id"));
+        assert!(client.forward_controlled_for_key("POST", "/v1/chat/completions", b"{}", &headers,
+            "request-assist", "bad\noperation", "key-server").is_err());
     }
 
     #[test]
