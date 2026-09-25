@@ -1795,7 +1795,7 @@ impl CoreStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let request = transaction
             .query_row(
-                "SELECT user_id, api_key_id, endpoint, model, request_hash, state
+                "SELECT user_id, api_key_id, endpoint, model, request_hash, state, created_at_ms
                  FROM requests WHERE id = ?1",
                 [&quote.request_id],
                 |row| {
@@ -1806,6 +1806,7 @@ impl CoreStore {
                         row.get::<_, String>(3)?,
                         row.get::<_, Vec<u8>>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
                     ))
                 },
             )
@@ -1914,13 +1915,33 @@ impl CoreStore {
             });
         }
 
-        let active_concurrency: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM requests
-             WHERE api_key_id = ?1 AND id <> ?2
-               AND state IN ('received','validating','reserved','queued','dispatched','completing','unknown')",
-            params![&request.1, &quote.request_id],
+        let is_seedance_assist_child: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM request_relations
+             WHERE child_request_id = ?1 AND relationship_kind = 'seedance_assist')",
+            [&quote.request_id],
             |row| row.get(0),
         )?;
+        let active_concurrency: i64 = if is_seedance_assist_child {
+            0
+        } else {
+            transaction.query_row(
+                "SELECT COUNT(*) FROM requests active
+                 WHERE active.api_key_id = ?1 AND active.id <> ?2
+                   AND active.state IN ('received','validating','reserved','queued','dispatched','completing','unknown')
+                   AND NOT EXISTS (
+                     SELECT 1 FROM request_relations relation
+                     WHERE relation.child_request_id = active.id
+                       AND relation.relationship_kind = 'seedance_assist'
+                   )
+                   AND (
+                     active.state <> 'received'
+                     OR active.created_at_ms < ?3
+                     OR (active.created_at_ms = ?3 AND active.id < ?2)
+                   )",
+                params![&request.1, &quote.request_id, request.6],
+                |row| row.get(0),
+            )?
+        };
         if active_concurrency >= active_key {
             return Err(CoreError::KeyConcurrencyExceeded {
                 api_key_id: request.1,

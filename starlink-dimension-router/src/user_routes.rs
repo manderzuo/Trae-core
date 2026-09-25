@@ -393,6 +393,31 @@ fn begin_billed_request(
         .map_err(|error| request_error(StatusCode::INTERNAL_SERVER_ERROR, "core_error", error.to_string()))
 }
 
+fn begin_seedance_assist_billed_request(
+    store: &CoreStore,
+    principal: &Principal,
+    parent_request_id: &str,
+    endpoint: &str,
+    model: &str,
+    idempotency_key: String,
+    body: &Value,
+) -> Result<BeginRequest, Response> {
+    store
+        .begin_seedance_assist_billed_request(
+            parent_request_id,
+            BeginRequestInput {
+                user_id: principal.user_id.clone(),
+                api_key_id: principal.key_id.clone(),
+                protocol: "openai".into(),
+                endpoint: endpoint.into(),
+                model: model.into(),
+                idempotency_key,
+                body: body.clone(),
+            },
+        )
+        .map_err(|error| request_error(StatusCode::INTERNAL_SERVER_ERROR, "core_error", error.to_string()))
+}
+
 fn begin_implicit_billed_video_request(
     store: &CoreStore,
     principal: &Principal,
@@ -1048,8 +1073,8 @@ fn run_controlled_seedance_assist(
         state.config.default_model.trim()
     };
     let assist_body = seedance_assist_chat_body(model, original, &prompt);
-    let child = match begin_billed_request(
-        &state.store, principal, "chat", model,
+    let child = match begin_seedance_assist_billed_request(
+        &state.store, principal, parent_request_id, "chat", model,
         format!("{parent_request_id}:seedance-assist-v1"), &assist_body,
     ) {
         Ok(BeginRequest::Created(request)) => request,
@@ -1058,10 +1083,6 @@ fn run_controlled_seedance_assist(
         Err(response) => return Err(response),
     };
     let child_id = child.id;
-    if let Err(error) = state.store.link_seedance_assist_request(parent_request_id, &child_id) {
-        let _ = fail_unreserved_pre_dispatch_request(state, &child_id, 500, "request_relation_failed");
-        return Err(request_error(StatusCode::INTERNAL_SERVER_ERROR, "request_relation_failed", error.to_string()));
-    }
     for next in [RequestState::Validating, RequestState::Reserved, RequestState::Queued, RequestState::Dispatched] {
         if transition_request_to(state, &child_id, next, None).is_err() {
             mark_request_unknown(state, parent_request_id, "seedance_assist_dispatch_state_failed");
@@ -1155,9 +1176,10 @@ fn run_seedance_assist(
     };
     let assist_body = seedance_assist_chat_body(model, original, &prompt);
     let assist_idempotency = format!("{parent_request_id}:seedance-assist-v1");
-    let request = match begin_billed_request(
+    let request = match begin_seedance_assist_billed_request(
         &state.store,
         principal,
+        parent_request_id,
         "chat",
         model,
         assist_idempotency,
@@ -1177,21 +1199,6 @@ fn run_seedance_assist(
         Err(response) => return Err(response),
     };
     let child_request_id = request.id.clone();
-    if let Err(error) = state.store.link_seedance_assist_request(parent_request_id, &child_request_id) {
-        if let Err(cleanup_error) = fail_unreserved_pre_dispatch_request(
-            state,
-            &child_request_id,
-            StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-            "request_relation_failed",
-        ) {
-            return Err(request_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "request_cleanup_failed",
-                format!("关联 DeepSeek 辅助请求失败，且子请求状态清理失败：{cleanup_error}"),
-            ));
-        }
-        return Err(request_error(StatusCode::INTERNAL_SERVER_ERROR, "request_relation_failed", error.to_string()));
-    }
     let (quote_id, reservation_id) = match quote_and_reserve(state, &child_request_id, "chat", model) {
         Ok(reservation) => reservation,
         Err(response) => {
@@ -1734,6 +1741,7 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
     if seedance {
         infer_video_parameters_from_prompt(&mut forward_value);
     }
+    let mut pre_reserved_video: Option<(String, String, bool)> = None;
     if seedance && video_admission == VideoAdmission::DiagnosticClaimed {
         let snapshot = match state.bridge.lock().unwrap().upstream_credit_snapshot() {
             Ok(snapshot) => snapshot,
@@ -1753,48 +1761,22 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
                     state, headers, principal, request_id, forward_value, snapshot, seedance_stream,
                 ).await;
             }
-            Ok(BridgeQuoteResult::Quoted(_)) => {}
+            Ok(BridgeQuoteResult::Quoted(_)) => {
+                pre_reserved_video = match quote_and_reserve_video(&state, &request_id, &model) {
+                    Ok(reservation) => Some(reservation),
+                    Err(response) => return finish_failed_quote_request(&state, &request_id, response),
+                };
+            }
             _ => return finish_failed_quote_request(&state, &request_id, quote_unavailable(&request_id)),
         }
     }
-    let mut assisted_before_reservation = false;
-    if seedance && video_admission == VideoAdmission::DiagnosticClaimed {
-        let has_asset_ids = forward_value.get("image_asset_ids").is_some() || forward_value.get("video_asset_ids").is_some();
-        if has_asset_ids {
-            if let Err(response) = materialize_bridge_assets(&state, &principal, &mut forward_value, &request_id).await {
-                let _ = transition_request_to(&state, &request_id, RequestState::Validating, None);
-                let _ = transition_request_to(&state, &request_id, RequestState::Failed, Some("asset_materialization_failed"));
-                return response;
-            }
-        }
-        if let Err(response) = validate_vision_data_urls(&forward_value) {
-            let _ = transition_request_to(&state, &request_id, RequestState::Validating, None);
-            let _ = transition_request_to(&state, &request_id, RequestState::Failed, Some("vision_input_invalid"));
-            return response;
-        }
-        let assisted_prompt = match run_seedance_assist(&state, &principal, &request_id, &forward_value) {
-            Ok(prompt) => prompt,
-            Err(response) => {
-                let _ = transition_request_to(&state, &request_id, RequestState::Validating, None);
-                let _ = transition_request_to(&state, &request_id, RequestState::Failed, Some("seedance_assist_failed"));
-                return response;
-            }
-        };
-        if let Err(error) = apply_assisted_prompt(&mut forward_value, &assisted_prompt) {
-            let _ = transition_request_to(&state, &request_id, RequestState::Validating, None);
-            let _ = transition_request_to(&state, &request_id, RequestState::Failed, Some("seedance_assist_invalid_response"));
-            return request_error(StatusCode::BAD_GATEWAY, "seedance_assist_invalid_response", error);
-        }
-        assisted_before_reservation = true;
-    }
     let (quote_id, reservation_id, one_shot_test) = if seedance {
-        match quote_and_reserve_video(
-            &state,
-            &request_id,
-            &model,
-        ) {
-            Ok(reservation) => reservation,
-            Err(response) => return finish_failed_quote_request(&state, &request_id, response),
+        match pre_reserved_video.take() {
+            Some(reservation) => reservation,
+            None => match quote_and_reserve_video(&state, &request_id, &model) {
+                Ok(reservation) => reservation,
+                Err(response) => return finish_failed_quote_request(&state, &request_id, response),
+            },
         }
     } else {
         match quote_and_reserve(&state, &request_id, endpoint, &model) {
@@ -1802,7 +1784,7 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
             Err(response) => return finish_failed_quote_request(&state, &request_id, response),
         }
     };
-    if seedance && !assisted_before_reservation {
+    if seedance {
         let has_asset_ids = forward_value.get("image_asset_ids").is_some() || forward_value.get("video_asset_ids").is_some();
         if has_asset_ids {
             if let Err(response) = materialize_bridge_assets(&state, &principal, &mut forward_value, &request_id).await {

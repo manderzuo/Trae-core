@@ -396,6 +396,10 @@ struct StreamFixture {
 }
 
 fn stream_fixture() -> StreamFixture {
+    stream_fixture_with_concurrency(2)
+}
+
+fn stream_fixture_with_concurrency(max_concurrency: i64) -> StreamFixture {
     let dir = StreamTestDir::new();
     let store = Arc::new(aiwork_core::CoreStore::open(dir.path()).unwrap());
     store.migrate().unwrap();
@@ -416,7 +420,7 @@ fn stream_fixture() -> StreamFixture {
     };
     let scopes = BTreeSet::from(["videos:submit".into()]);
     let first = store
-        .issue_api_key_for_new_user_as_admin(&admin, "视频 Key", scopes.clone(), 2)
+        .issue_api_key_for_new_user_as_admin(&admin, "视频 Key", scopes.clone(), max_concurrency)
         .unwrap();
     let second = store
         .issue_api_key_as_admin(&first.user_id, "另一个视频 Key", scopes, &admin)
@@ -522,6 +526,32 @@ fn current_key_concurrency(fixture: &StreamFixture) -> i64 {
         .find(|key| key.id == fixture.billing_principal.key_id)
         .expect("the test key must be listed")
         .current_concurrency
+}
+
+#[tokio::test]
+async fn active_seedance_job_holds_the_only_key_slot_before_helper_and_video_dispatch() {
+    let fixture = stream_fixture_with_concurrency(1);
+    *fixture.gateway.task_status.lock().unwrap() = serde_json::json!({
+        "task":{"id":"video-stream-test","status":"queued"}
+    });
+
+    let first = post_chat(&fixture, &fixture.key, None, video_chat_body(false)).await;
+    let first_status = first.status();
+    let first_body = to_bytes(first.into_body(), 64 * 1024).await.unwrap();
+    assert_eq!(first_status, StatusCode::ACCEPTED, "response body: {}", String::from_utf8_lossy(&first_body));
+    assert_eq!(current_key_concurrency(&fixture), 1);
+
+    let second = post_chat(&fixture, &fixture.key, None, video_chat_body(false)).await;
+    let second_status = second.status();
+    let second_body = to_bytes(second.into_body(), 64 * 1024).await.unwrap();
+    assert_eq!(second_status, StatusCode::TOO_MANY_REQUESTS, "response body: {}", String::from_utf8_lossy(&second_body));
+    let error: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
+    assert_eq!(error.pointer("/error/code").and_then(serde_json::Value::as_str), Some("concurrency_limit"));
+
+    assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "deepseek-v4-flash"), 1);
+    assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "seedance"), 1);
+    let balance = fixture.store.key_quota_balance_for_principal(&fixture.billing_principal, "credits").unwrap();
+    assert_eq!((balance.available, balance.held, balance.settled), (77_500_000, 20_000_000, 2_500_000));
 }
 
 #[tokio::test]
@@ -713,8 +743,9 @@ async fn claimed_one_shot_video_can_be_replayed_without_new_charge_after_gate_cl
     )).unwrap();
 
     let first = post_chat(&fixture, &fixture.key, Some("seedance-claimed-replay"), body.clone()).await;
-    assert_eq!(first.status(), StatusCode::OK);
-    let _ = to_bytes(first.into_body(), 64 * 1024).await.unwrap();
+    let first_status = first.status();
+    let first_body = to_bytes(first.into_body(), 64 * 1024).await.unwrap();
+    assert_eq!(first_status, StatusCode::OK, "response body: {}", String::from_utf8_lossy(&first_body));
 
     let replay = post_chat(&fixture, &fixture.key, Some("seedance-claimed-replay"), body).await;
     assert_eq!(replay.status(), StatusCode::OK);
@@ -723,6 +754,7 @@ async fn claimed_one_shot_video_can_be_replayed_without_new_charge_after_gate_cl
     assert!(text.contains("video_task"));
     assert_eq!(text.matches("data: [DONE]\n\n").count(), 1);
     assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "seedance"), 1);
+    assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "deepseek-v4-flash"), 1);
     let balance = fixture.store.key_quota_balance_for_principal(&fixture.billing_principal, "credits").unwrap();
     assert_eq!(balance.settled, 5_000_000);
     assert_eq!(balance.held, 0);
@@ -748,6 +780,7 @@ async fn headerless_one_shot_retry_replays_within_window_after_gate_closes() {
     let frames = to_bytes(replay.into_body(), 64 * 1024).await.unwrap();
     assert!(String::from_utf8(frames.to_vec()).unwrap().contains("video_task"));
     assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "seedance"), 1);
+    assert_eq!(fixture.gateway.model_request_count("/v1/chat/completions", "deepseek-v4-flash"), 1);
     let balance = fixture.store.key_quota_balance_for_principal(&fixture.billing_principal, "credits").unwrap();
     assert_eq!(balance.settled, 5_000_000);
     assert_eq!(balance.held, 0);
@@ -991,8 +1024,9 @@ async fn controlled_headerless_retry_replays_without_second_upstream_submission(
         &fixture.billing_principal.key_id, &hash, "controlled headerless replay",
     )).unwrap();
     let first = post_chat(&fixture, &fixture.key, None, body.clone()).await;
-    assert_eq!(first.status(), StatusCode::OK);
-    let _ = to_bytes(first.into_body(), 64 * 1024).await.unwrap();
+    let first_status = first.status();
+    let first_body = to_bytes(first.into_body(), 64 * 1024).await.unwrap();
+    assert_eq!(first_status, StatusCode::OK, "response body: {}", String::from_utf8_lossy(&first_body));
     let replay = post_chat(&fixture, &fixture.key, None, body).await;
     assert_eq!(replay.status(), StatusCode::OK);
     let _ = to_bytes(replay.into_body(), 64 * 1024).await.unwrap();

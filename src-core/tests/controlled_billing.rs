@@ -1,9 +1,15 @@
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::PathBuf,
+    sync::{Arc, Barrier},
+    thread,
+};
 
 use aiwork_core::{
-    BeginRequest, BeginRequestInput, BillingReceipt, BillingReceiptStatus, ControlledStepKind,
-    ControlledStepResult, CoreStore, CreditAmount, KeyQuotaGrant, NewUser, Principal,
-    UpstreamCreditSnapshot, UserRole,
+    BeginRequest, BeginRequestInput, BillingQuote, BillingReceipt, BillingReceiptStatus,
+    BillingReservationResult, ControlledStepKind, ControlledStepResult, CoreError, CoreStore,
+    CreditAmount, KeyQuotaGrant, NewUser, Principal, UpstreamCreditSnapshot, UserRole,
 };
 use serde_json::json;
 
@@ -81,6 +87,20 @@ fn request(store: &CoreStore, key_id: &str, model: &str, idempotency: &str) -> S
     match result {
         BeginRequest::Created(handle) => handle.id,
         other => panic!("unexpected request: {other:?}"),
+    }
+}
+
+fn billing_quote(store: &CoreStore, request_id: &str, model: &str, quote_id: &str) -> BillingQuote {
+    BillingQuote {
+        request_id: request_id.into(),
+        quote_id: quote_id.into(),
+        request_fingerprint: store.request_fingerprint_for_billing(request_id).unwrap(),
+        endpoint: "/v1/chat/completions".into(),
+        model: model.into(),
+        max_credits: CreditAmount::parse("25", "credits").unwrap(),
+        unit: "credits".into(),
+        expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
+        source_ref: format!("aiwork-test-quote:{quote_id}"),
     }
 }
 
@@ -286,6 +306,57 @@ fn controlled_same_key_cannot_start_second_operation() {
         100_000_000
     );
     drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn concurrent_controlled_starts_for_same_key_allow_only_one_hold() {
+    let (store, dir, key, admin) = fixture("same-key-concurrent");
+    let first = request(&store, &key, "seedance", "same-key-concurrent-first");
+    let second = request(&store, &key, "seedance", "same-key-concurrent-second");
+    let first_store = Arc::new(store);
+    let second_store = Arc::new(CoreStore::open(&dir).unwrap());
+    let barrier = Arc::new(Barrier::new(3));
+
+    let first_thread = {
+        let store = Arc::clone(&first_store);
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            store.begin_controlled_operation(&first, snapshot())
+        })
+    };
+    let second_thread = {
+        let store = Arc::clone(&second_store);
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            store.begin_controlled_operation(&second, snapshot())
+        })
+    };
+    barrier.wait();
+    let results = [first_thread.join().unwrap(), second_thread.join().unwrap()];
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(CoreError::ApiKeyBillingBlocked { .. })))
+            .count(),
+        1,
+        "the losing parent must be rejected because this Key already has an active operation"
+    );
+    let balance = first_store
+        .key_quota_balance_as_admin(&admin, &key, "credits")
+        .unwrap();
+    assert_eq!(
+        (balance.available, balance.held, balance.settled),
+        (0, 100_000_000, 0),
+        "only one full-Key hold may exist after the race"
+    );
+
+    drop(second_store);
+    drop(first_store);
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -589,6 +660,358 @@ fn controlled_different_keys_keep_independent_holds_and_receipts() {
             .settled,
         35_000_000
     );
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn different_keys_can_settle_in_parallel_without_cross_attributing_receipts() {
+    let (store, dir, first_key, admin) = fixture("two-keys-concurrent");
+    let second_key = store
+        .issue_api_key_as_admin_with_max_concurrency(
+            "user",
+            "second-video",
+            BTreeSet::from(["chat:invoke".into(), "video:submit".into()]),
+            3,
+            &admin,
+        )
+        .unwrap();
+    store
+        .key_quota_grant_as_admin(
+            &admin,
+            KeyQuotaGrant {
+                api_key_id: second_key.id.clone(),
+                resource_kind: "credits".into(),
+                amount: 80_000_000,
+                actor_user_id: "ignored".into(),
+                reason: "second concurrent controlled key".into(),
+            },
+        )
+        .unwrap();
+    let first = request(&store, &first_key, "seedance", "two-keys-concurrent-first");
+    let second = request(&store, &second_key.id, "seedance", "two-keys-concurrent-second");
+    let first_store = Arc::new(store);
+    let second_store = Arc::new(CoreStore::open(&dir).unwrap());
+
+    let start_barrier = Arc::new(Barrier::new(3));
+    let first_parent = first.clone();
+    let first_thread = {
+        let store = Arc::clone(&first_store);
+        let barrier = Arc::clone(&start_barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            store.begin_controlled_operation(&first_parent, snapshot())
+        })
+    };
+    let second_parent = second.clone();
+    let second_thread = {
+        let store = Arc::clone(&second_store);
+        let barrier = Arc::clone(&start_barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            store.begin_controlled_operation(&second_parent, snapshot())
+        })
+    };
+    start_barrier.wait();
+    assert_eq!(first_thread.join().unwrap().unwrap().held.as_microcredits(), 100_000_000);
+    assert_eq!(second_thread.join().unwrap().unwrap().held.as_microcredits(), 80_000_000);
+
+    first_store
+        .mark_controlled_step_dispatched(&first, &first, ControlledStepKind::Video)
+        .unwrap();
+    second_store
+        .mark_controlled_step_dispatched(&second, &second, ControlledStepKind::Video)
+        .unwrap();
+    let receipt_barrier = Arc::new(Barrier::new(3));
+    let first_receipt = receipt(&first, BillingReceiptStatus::Final, Some("25"), Some("video-first"));
+    let first_receipt_parent = first.clone();
+    let first_receipt_step = first.clone();
+    let first_thread = {
+        let store = Arc::clone(&first_store);
+        let barrier = Arc::clone(&receipt_barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            store.record_controlled_step(
+                &first_receipt_parent,
+                &first_receipt_step,
+                ControlledStepKind::Video,
+                first_receipt,
+            )
+        })
+    };
+    let second_receipt = receipt(&second, BillingReceiptStatus::Final, Some("35"), Some("video-second"));
+    let second_receipt_parent = second.clone();
+    let second_receipt_step = second.clone();
+    let second_thread = {
+        let store = Arc::clone(&second_store);
+        let barrier = Arc::clone(&receipt_barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            store.record_controlled_step(
+                &second_receipt_parent,
+                &second_receipt_step,
+                ControlledStepKind::Video,
+                second_receipt,
+            )
+        })
+    };
+    receipt_barrier.wait();
+    assert_eq!(first_thread.join().unwrap().unwrap(), ControlledStepResult::Verified);
+    assert_eq!(second_thread.join().unwrap().unwrap(), ControlledStepResult::Verified);
+
+    let settle_barrier = Arc::new(Barrier::new(3));
+    let first_parent = first.clone();
+    let first_thread = {
+        let store = Arc::clone(&first_store);
+        let barrier = Arc::clone(&settle_barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            store.finish_controlled_operation(&first_parent, Some(true))
+        })
+    };
+    let second_parent = second.clone();
+    let second_thread = {
+        let store = Arc::clone(&second_store);
+        let barrier = Arc::clone(&settle_barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            store.finish_controlled_operation(&second_parent, Some(true))
+        })
+    };
+    settle_barrier.wait();
+    assert_eq!(first_thread.join().unwrap().unwrap().actual_credits.as_microcredits(), 25_000_000);
+    assert_eq!(second_thread.join().unwrap().unwrap().actual_credits.as_microcredits(), 35_000_000);
+
+    let first_balance = first_store
+        .key_quota_balance_as_admin(&admin, &first_key, "credits")
+        .unwrap();
+    let second_balance = second_store
+        .key_quota_balance_as_admin(&admin, &second_key.id, "credits")
+        .unwrap();
+    assert_eq!((first_balance.available, first_balance.held, first_balance.settled), (75_000_000, 0, 25_000_000));
+    assert_eq!((second_balance.available, second_balance.held, second_balance.settled), (45_000_000, 0, 35_000_000));
+
+    drop(second_store);
+    drop(first_store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn concurrent_duplicate_controlled_receipts_settle_only_once() {
+    let (store, dir, key, admin) = fixture("receipt-race");
+    let parent = request(&store, &key, "seedance", "receipt-race-parent");
+    store.begin_controlled_operation(&parent, snapshot()).unwrap();
+    store
+        .mark_controlled_step_dispatched(&parent, &parent, ControlledStepKind::Video)
+        .unwrap();
+    let first_store = Arc::new(store);
+    let second_store = Arc::new(CoreStore::open(&dir).unwrap());
+    let barrier = Arc::new(Barrier::new(3));
+    let receipt_value = receipt(
+        &parent,
+        BillingReceiptStatus::Final,
+        Some("25"),
+        Some("video-receipt-race"),
+    );
+    let first_thread = {
+        let store = Arc::clone(&first_store);
+        let barrier = Arc::clone(&barrier);
+        let parent = parent.clone();
+        let receipt_value = receipt_value.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            store.record_controlled_step(
+                &parent,
+                &parent,
+                ControlledStepKind::Video,
+                receipt_value,
+            )
+        })
+    };
+    let second_thread = {
+        let store = Arc::clone(&second_store);
+        let barrier = Arc::clone(&barrier);
+        let parent = parent.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            store.record_controlled_step(
+                &parent,
+                &parent,
+                ControlledStepKind::Video,
+                receipt_value,
+            )
+        })
+    };
+    barrier.wait();
+    let results = [first_thread.join().unwrap().unwrap(), second_thread.join().unwrap().unwrap()];
+    assert_eq!(
+        results.iter().filter(|result| **result == ControlledStepResult::Verified).count(),
+        1
+    );
+    assert_eq!(
+        results.iter().filter(|result| **result == ControlledStepResult::Duplicate).count(),
+        1
+    );
+    assert_eq!(
+        first_store
+            .finish_controlled_operation(&parent, Some(true))
+            .unwrap()
+            .actual_credits
+            .as_microcredits(),
+        25_000_000
+    );
+    let balance = first_store
+        .key_quota_balance_as_admin(&admin, &key, "credits")
+        .unwrap();
+    assert_eq!((balance.available, balance.held, balance.settled), (75_000_000, 0, 25_000_000));
+
+    drop(second_store);
+    drop(first_store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn concurrent_quote_reservations_admit_one_request_at_key_limit_one() {
+    let (store, dir, _, admin) = fixture("key-concurrency-race");
+    let limited_key = store
+        .issue_api_key_as_admin_with_max_concurrency(
+            "user",
+            "one-at-a-time",
+            BTreeSet::from(["chat:invoke".into(), "video:submit".into()]),
+            1,
+            &admin,
+        )
+        .unwrap();
+    store
+        .key_quota_grant_as_admin(
+            &admin,
+            KeyQuotaGrant {
+                api_key_id: limited_key.id.clone(),
+                resource_kind: "credits".into(),
+                amount: 100_000_000,
+                actor_user_id: "ignored".into(),
+                reason: "parallel quote reservation test".into(),
+            },
+        )
+        .unwrap();
+    let first = request(&store, &limited_key.id, "seedance", "parallel-quote-first");
+    let second = request(&store, &limited_key.id, "seedance", "parallel-quote-second");
+    let first_quote = billing_quote(&store, &first, "seedance", "parallel-quote-first");
+    let second_quote = billing_quote(&store, &second, "seedance", "parallel-quote-second");
+    let first_store = Arc::new(store);
+    let second_store = Arc::new(CoreStore::open(&dir).unwrap());
+    let barrier = Arc::new(Barrier::new(3));
+    let first_thread = {
+        let store = Arc::clone(&first_store);
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            store.reserve_credit_quote(first_quote)
+        })
+    };
+    let second_thread = {
+        let store = Arc::clone(&second_store);
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            store.reserve_credit_quote(second_quote)
+        })
+    };
+    barrier.wait();
+    let results = [first_thread.join().unwrap(), second_thread.join().unwrap()];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result.as_ref().err().is_some_and(|error| {
+                matches!(error, CoreError::KeyConcurrencyExceeded { max_concurrency: 1, .. })
+            }))
+            .count(),
+        1,
+        "exactly one paid request should acquire the only concurrency slot"
+    );
+    let balance = first_store
+        .key_quota_balance_as_admin(&admin, &limited_key.id, "credits")
+        .unwrap();
+    assert_eq!((balance.available, balance.held, balance.settled), (75_000_000, 25_000_000, 0));
+
+    drop(second_store);
+    drop(first_store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn seedance_assist_child_uses_parent_concurrency_slot() {
+    let (store, dir, _, admin) = fixture("assist-single-slot");
+    let key = store
+        .issue_api_key_as_admin_with_max_concurrency(
+            "user",
+            "seedance-one-slot",
+            BTreeSet::from(["chat:invoke".into(), "video:submit".into()]),
+            1,
+            &admin,
+        )
+        .unwrap();
+    store
+        .key_quota_grant_as_admin(
+            &admin,
+            KeyQuotaGrant {
+                api_key_id: key.id.clone(),
+                resource_kind: "credits".into(),
+                amount: 100_000_000,
+                actor_user_id: "ignored".into(),
+                reason: "single Seedance operation slot".into(),
+            },
+        )
+        .unwrap();
+    let parent = request(&store, &key.id, "seedance", "assist-single-slot-parent");
+    assert!(matches!(
+        store.reserve_credit_quote(billing_quote(
+            &store,
+            &parent,
+            "seedance",
+            "assist-single-slot-parent-quote",
+        )),
+        Ok(BillingReservationResult::Created { .. })
+    ));
+    let child = match store
+        .begin_seedance_assist_billed_request(
+            &parent,
+            BeginRequestInput {
+                user_id: "user".into(),
+                api_key_id: key.id.clone(),
+                protocol: "openai".into(),
+                endpoint: "/v1/chat/completions".into(),
+                model: "deepseek-v4-flash".into(),
+                idempotency_key: "assist-single-slot-child".into(),
+                body: json!({"model":"deepseek-v4-flash","messages":[{"role":"user","content":"cat"}]}),
+            },
+        )
+        .unwrap()
+    {
+        BeginRequest::Created(request) => request.id,
+        other => panic!("expected a newly linked assist request, got {other:?}"),
+    };
+
+    let result = store.reserve_credit_quote(billing_quote(
+        &store,
+        &child,
+        "deepseek-v4-flash",
+        "assist-single-slot-quote",
+    ));
+    assert!(
+        matches!(result, Ok(BillingReservationResult::Created { .. })),
+        "the internal text-assist step belongs to its active video parent and must not consume a second Key slot; got {result:?}"
+    );
+    let balance = store
+        .key_quota_balance_as_admin(&admin, &key.id, "credits")
+        .unwrap();
+    assert_eq!(
+        (balance.available, balance.held, balance.settled),
+        (50_000_000, 50_000_000, 0),
+        "parent and helper both reserve their charges while sharing one concurrency slot"
+    );
+
     drop(store);
     fs::remove_dir_all(dir).unwrap();
 }

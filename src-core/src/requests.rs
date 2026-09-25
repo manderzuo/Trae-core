@@ -854,14 +854,30 @@ impl CoreStore {
     }
 
     pub fn begin_request(&self, input: BeginRequestInput) -> Result<BeginRequest, CoreError> {
-        self.begin_request_internal(input, true, false)
+        self.begin_request_internal(input, true, false, None)
     }
 
     /// Creates an authenticated, Core-numbered request before an upstream
     /// quote is available. Callers must be behind the normal API-key auth
     /// boundary; paid dispatch still requires `reserve_credit_quote`.
     pub fn begin_billed_request(&self, input: BeginRequestInput) -> Result<BeginRequest, CoreError> {
-        self.begin_request_internal(input, false, false)
+        self.begin_request_internal(input, false, false, None)
+    }
+
+    /// Atomically creates and relates an internal Seedance helper request to
+    /// its client-visible parent. The child shares the parent's Key slot.
+    pub fn begin_seedance_assist_billed_request(
+        &self,
+        parent_request_id: &str,
+        input: BeginRequestInput,
+    ) -> Result<BeginRequest, CoreError> {
+        if parent_request_id.trim().is_empty() {
+            return Err(CoreError::InvalidConfiguration {
+                key: "request_relation.parent_request_id".into(),
+                value: "must not be empty".into(),
+            });
+        }
+        self.begin_request_internal(input, false, false, Some(parent_request_id))
     }
 
     /// Coalesce headerless video retries for the same Key and canonical body.
@@ -878,7 +894,7 @@ impl CoreStore {
             });
         }
         input.idempotency_key = format!("core-implicit:{}", Self::new_id("retry"));
-        self.begin_request_internal(input, false, true)
+        self.begin_request_internal(input, false, true, None)
     }
 
     /// Link a separately billed internal child call to its client-visible
@@ -1175,6 +1191,7 @@ impl CoreStore {
         input: BeginRequestInput,
         require_local_cost_policy: bool,
         coalesce_implicit_video_retry: bool,
+        assist_parent_request_id: Option<&str>,
     ) -> Result<BeginRequest, CoreError> {
         let request_hash = request_hash(&input.endpoint, &input.model, &input.body);
         let scope = format!("{}:{}:{}", input.user_id, input.api_key_id, input.endpoint);
@@ -1229,6 +1246,55 @@ impl CoreStore {
             };
         }
 
+        if let Some(parent_request_id) = assist_parent_request_id {
+            let parent = transaction
+                .query_row(
+                    "SELECT user_id, api_key_id, state FROM requests WHERE id = ?1",
+                    [parent_request_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| CoreError::RequestNotFound {
+                    request_id: parent_request_id.into(),
+                })?;
+            if parent.0 != input.user_id || parent.1 != input.api_key_id {
+                return Err(CoreError::InvalidRequestIdentity {
+                    user_id: parent.0,
+                    api_key_id: input.api_key_id.clone(),
+                });
+            }
+            let parent_state = RequestState::from_db(&parent.2).ok_or_else(|| {
+                CoreError::InvalidConfiguration {
+                    key: "requests.state".into(),
+                    value: parent.2.clone(),
+                }
+            })?;
+            if parent_state != RequestState::Reserved {
+                return Err(CoreError::InvalidTransition {
+                    request_id: parent_request_id.into(),
+                    expected: parent_state,
+                    next: RequestState::Reserved,
+                });
+            }
+            let existing_child = transaction
+                .query_row(
+                    "SELECT child_request_id FROM request_relations
+                     WHERE parent_request_id = ?1 AND relationship_kind = 'seedance_assist'",
+                    [parent_request_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if existing_child.is_some() {
+                return Err(CoreError::IdempotencyConflict);
+            }
+        }
+
         if require_local_cost_policy {
             Self::estimate_in_transaction(&transaction, &input.endpoint, &input.model, &input.body)?;
         }
@@ -1253,6 +1319,14 @@ impl CoreStore {
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![scope, input.idempotency_key, request_hash.to_vec(), request_id, now],
         )?;
+        if let Some(parent_request_id) = assist_parent_request_id {
+            transaction.execute(
+                "INSERT INTO request_relations
+                 (parent_request_id, child_request_id, relationship_kind, created_at_ms)
+                 VALUES (?1, ?2, 'seedance_assist', ?3)",
+                params![parent_request_id, request_id, now],
+            )?;
+        }
         let handle = Self::request_handle_in_transaction(&transaction, &request_id)?;
         transaction.commit()?;
         Ok(BeginRequest::Created(handle))
