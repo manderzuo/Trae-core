@@ -47,14 +47,22 @@ impl CoreStore {
             .collect::<Vec<_>>();
         let connection = self.connection.lock().expect("core store mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT s.settled_at_ms, s.actual_credits
+            "SELECT s.settled_at_ms AS settled_at_ms,
+                    s.actual_credits AS actual_credits,
+                    s.request_id AS request_id
              FROM billing_settlements s
              INNER JOIN billing_receipts r ON r.receipt_id = s.receipt_id
              INNER JOIN requests q ON q.id = s.request_id
              WHERE r.status IN ('final','failed_no_charge')
                AND s.settled_at_ms >= ?1 AND s.settled_at_ms < ?2
                AND (?3 IS NULL OR q.api_key_id = ?3)
-             ORDER BY s.settled_at_ms ASC, s.request_id ASC",
+             UNION ALL
+             SELECT o.updated_at_ms, o.actual_microcredits, o.parent_request_id
+             FROM controlled_billing_operations o
+             WHERE o.state = 'settled'
+               AND o.updated_at_ms >= ?1 AND o.updated_at_ms < ?2
+               AND (?3 IS NULL OR o.api_key_id = ?3)
+             ORDER BY settled_at_ms ASC, request_id ASC",
         )?;
         let rows = statement.query_map(
             rusqlite::params![start_ms, end_ms, api_key_id],

@@ -152,6 +152,20 @@ fn controlled_assist_and_video_commit_once() {
         (balance.available, balance.held, balance.settled),
         (54_250_000, 0, 45_750_000)
     );
+    let key_view = store
+        .list_api_keys_as_admin(&admin, None)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.id == key)
+        .unwrap();
+    assert_eq!(key_view.verified_credit_spent, 45_750_000);
+    let now = chrono::Utc::now().timestamp_millis();
+    let summary = store.admin_summary(now).unwrap();
+    assert_eq!(summary.verified_spent_credits.as_microcredits(), 45_750_000);
+    assert_eq!(summary.verified_spent_today_credits.as_microcredits(), 45_750_000);
+    let trend = store.usage_trend(now - 60_000, now + 60_000, 120_000, Some(&key)).unwrap();
+    assert_eq!(trend.len(), 1);
+    assert_eq!(trend[0].credits.as_microcredits(), 45_750_000);
 
     store
         .record_controlled_step(&parent, &child, ControlledStepKind::Assist, assist)

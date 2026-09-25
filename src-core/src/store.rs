@@ -1321,12 +1321,16 @@ impl CoreStore {
                     })
                     .collect::<Result<Vec<_>, rusqlite::Error>>()?;
                 let verified_credit_spent = transaction.query_row(
-                    "SELECT COALESCE(SUM(s.actual_credits), 0)
-                     FROM billing_settlements s
-                     INNER JOIN billing_receipts r ON r.receipt_id = s.receipt_id
-                     INNER JOIN requests q ON q.id = s.request_id
-                     WHERE q.api_key_id = ?1
-                       AND r.status IN ('final','failed_no_charge')",
+                    "SELECT
+                       (SELECT COALESCE(SUM(s.actual_credits), 0)
+                        FROM billing_settlements s
+                        INNER JOIN billing_receipts r ON r.receipt_id = s.receipt_id
+                        INNER JOIN requests q ON q.id = s.request_id
+                        WHERE q.api_key_id = ?1
+                          AND r.status IN ('final','failed_no_charge'))
+                     + (SELECT COALESCE(SUM(actual_microcredits), 0)
+                        FROM controlled_billing_operations
+                        WHERE api_key_id = ?1 AND state = 'settled')",
                     [&id],
                     |row| row.get::<_, i64>(0),
                 )?;
