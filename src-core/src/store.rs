@@ -12,7 +12,7 @@ use crate::{
     schema::{
         SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V6_FINISH,
         SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
-        SCHEMA_V16, SCHEMA_V17, SCHEMA_V19, SCHEMA_V20, SCHEMA_V21, SCHEMA_V22,
+        SCHEMA_V16, SCHEMA_V17, SCHEMA_V19, SCHEMA_V20, SCHEMA_V21, SCHEMA_V22, SCHEMA_V23,
     },
     upstream::{
         account_health_decision, audit_hash, audit_identifier, audit_label,
@@ -27,7 +27,7 @@ use crate::{
 };
 
 pub const CORE_DB_FILE: &str = "core.sqlite3";
-pub const CURRENT_SCHEMA_VERSION: u32 = 22;
+pub const CURRENT_SCHEMA_VERSION: u32 = 23;
 pub const DEFAULT_API_KEY_MAX_CONCURRENCY: i64 = 32;
 
 pub struct CoreStore {
@@ -254,7 +254,7 @@ impl CoreStore {
             11 => {}
             12 => {}
             13 => {}
-            14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | CURRENT_SCHEMA_VERSION => Self::harden_v6_records(&transaction)?,
+            14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | CURRENT_SCHEMA_VERSION => Self::harden_v6_records(&transaction)?,
                 version => return Err(CoreError::UnsupportedSchemaVersion { version }),
             }
 
@@ -290,6 +290,9 @@ impl CoreStore {
             }
             if version < 22 {
                 transaction.execute_batch(SCHEMA_V22).map_err(CoreError::migration)?;
+            }
+            if version < 23 {
+                transaction.execute_batch(SCHEMA_V23).map_err(CoreError::migration)?;
             }
             if version < CURRENT_SCHEMA_VERSION {
                 transaction

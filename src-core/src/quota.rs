@@ -1345,7 +1345,7 @@ impl CoreStore {
         })
     }
 
-    fn ensure_fresh_upstream_credit_snapshot(
+    pub(crate) fn ensure_fresh_upstream_credit_snapshot(
         snapshot: &UpstreamCreditSnapshot,
         now: i64,
     ) -> Result<(), CoreError> {
@@ -1361,7 +1361,7 @@ impl CoreStore {
         Ok(())
     }
 
-    fn upstream_credit_capacity_in_transaction(
+    pub(crate) fn upstream_credit_capacity_in_transaction(
         transaction: &Transaction<'_>,
         snapshot: &UpstreamCreditSnapshot,
     ) -> Result<(i64, i64, i64), CoreError> {
@@ -2332,7 +2332,7 @@ impl CoreStore {
         })
     }
 
-    fn insert_billing_receipt(
+    pub(crate) fn insert_billing_receipt(
         transaction: &Transaction<'_>,
         receipt: &BillingReceipt,
         receipt_hash: &[u8],
@@ -2778,7 +2778,7 @@ impl CoreStore {
         Ok(())
     }
 
-    fn insert_reservation_budget_event(
+    pub(crate) fn insert_reservation_budget_event(
         transaction: &Transaction<'_>,
         reservation: &Reservation,
         event_kind: &str,
@@ -3097,7 +3097,7 @@ impl CoreStore {
         })
     }
 
-    fn set_reservation_state(
+    pub(crate) fn set_reservation_state(
         transaction: &Transaction<'_>,
         reservation_id: &str,
         state: ReservationState,

@@ -1,10 +1,52 @@
 use std::{collections::{BTreeMap, BTreeSet}, fs, path::PathBuf};
 
 use aiwork_core::{
-    CoreError, CoreStore, LegacyMigrationAsset, LegacyMigrationBatch, LegacyMigrationJob,
+    BeginRequest, BeginRequestInput, CoreError, CoreStore, LegacyMigrationAsset, LegacyMigrationBatch, LegacyMigrationJob,
     LegacyMigrationKey, LegacyMigrationObservation, NewUser, Principal, QuotaGrant, UserRole,
 };
 use rusqlite::Connection;
+use serde_json::json;
+
+#[test]
+fn schema_v22_to_v23_preserves_old_reservations() {
+    let (store, dir, _) = store();
+    let key = store.issue_api_key("user", "old-key", BTreeSet::new(), "admin").unwrap();
+    let request = match store.begin_billed_request(BeginRequestInput {
+        user_id: "user".into(), api_key_id: key.id.clone(), protocol: "openai".into(),
+        endpoint: "/v1/chat/completions".into(), model: "text-model".into(),
+        idempotency_key: "migration-v22-request".into(),
+        body: json!({"model":"text-model","messages":[]}),
+    }).unwrap() {
+        BeginRequest::Created(handle) => handle,
+        other => panic!("unexpected request: {other:?}"),
+    };
+    drop(store);
+
+    let path = dir.join("data").join("core.sqlite3");
+    let connection = Connection::open(&path).unwrap();
+    connection.execute(
+        "INSERT INTO quota_reservations
+         (id, user_id, request_id, resource_kind, amount, state, expires_at_ms, created_at_ms,
+          api_key_id)
+         VALUES ('old-reservation', 'user', ?1, 'credits', 5000000, 'held', 9999999999999, 1, ?2)",
+        rusqlite::params![request.id, key.id],
+    ).unwrap();
+    connection.execute_batch(
+        "DROP TABLE IF EXISTS controlled_billing_steps;
+         DROP TABLE IF EXISTS controlled_billing_operations;
+         UPDATE schema_meta SET value = '22' WHERE key = 'schema_version';",
+    ).unwrap();
+    drop(connection);
+
+    let reopened = CoreStore::open(&dir).unwrap();
+    reopened.migrate().unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 23);
+    let reservation = reopened.reservation_for_request(&request.id).unwrap().unwrap();
+    assert_eq!(reservation.id, "old-reservation");
+    assert_eq!(reservation.amount, 5_000_000);
+    drop(reopened);
+    fs::remove_dir_all(dir).unwrap();
+}
 
 fn test_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("aiwork-core-migration-{name}-{}", rand::random::<u64>()));

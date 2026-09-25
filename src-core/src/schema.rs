@@ -614,3 +614,46 @@ CREATE TABLE IF NOT EXISTS request_relations (
 );
 CREATE INDEX IF NOT EXISTS request_relations_child_idx ON request_relations(child_request_id);
 "#;
+
+pub(crate) const SCHEMA_V23: &str = r#"
+CREATE TABLE IF NOT EXISTS controlled_billing_operations (
+  operation_id TEXT PRIMARY KEY,
+  parent_request_id TEXT NOT NULL UNIQUE REFERENCES requests(id),
+  api_key_id TEXT NOT NULL REFERENCES api_keys(id),
+  hold_reservation_id TEXT NOT NULL UNIQUE REFERENCES quota_reservations(id),
+  held_microcredits INTEGER NOT NULL CHECK(held_microcredits > 0),
+  actual_microcredits INTEGER CHECK(actual_microcredits IS NULL OR actual_microcredits >= 0),
+  state TEXT NOT NULL CHECK(state IN ('held','submitted','unknown','settled','released')),
+  created_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS controlled_billing_active_key_idx
+  ON controlled_billing_operations(api_key_id)
+  WHERE state IN ('held','submitted','unknown');
+CREATE TABLE IF NOT EXISTS controlled_billing_steps (
+  request_id TEXT PRIMARY KEY REFERENCES requests(id),
+  operation_id TEXT NOT NULL REFERENCES controlled_billing_operations(operation_id),
+  kind TEXT NOT NULL CHECK(kind IN ('assist','video')),
+  receipt_hash BLOB,
+  actual_microcredits INTEGER CHECK(actual_microcredits IS NULL OR actual_microcredits >= 0),
+  task_ref TEXT,
+  state TEXT NOT NULL CHECK(state IN ('pending','verified','unknown','conflict')),
+  UNIQUE(operation_id, kind)
+);
+CREATE TABLE api_key_billing_blocks_next (
+  key_id TEXT PRIMARY KEY REFERENCES api_keys(id),
+  request_id TEXT NOT NULL REFERENCES requests(id),
+  reason TEXT NOT NULL CHECK(reason IN ('over_quote','receipt_conflict','over_authorized_hold')),
+  quote_max_credits INTEGER NOT NULL CHECK(quote_max_credits >= 0),
+  actual_credits INTEGER NOT NULL CHECK(actual_credits >= 0),
+  excess_credits INTEGER NOT NULL CHECK(excess_credits >= 0),
+  source_ref TEXT NOT NULL,
+  blocked_at_ms INTEGER NOT NULL
+);
+INSERT INTO api_key_billing_blocks_next
+  (key_id, request_id, reason, quote_max_credits, actual_credits, excess_credits, source_ref, blocked_at_ms)
+  SELECT key_id, request_id, reason, quote_max_credits, actual_credits, excess_credits, source_ref, blocked_at_ms
+  FROM api_key_billing_blocks;
+DROP TABLE api_key_billing_blocks;
+ALTER TABLE api_key_billing_blocks_next RENAME TO api_key_billing_blocks;
+"#;
