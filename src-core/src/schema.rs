@@ -657,3 +657,22 @@ INSERT INTO api_key_billing_blocks_next
 DROP TABLE api_key_billing_blocks;
 ALTER TABLE api_key_billing_blocks_next RENAME TO api_key_billing_blocks;
 "#;
+
+pub(crate) const SCHEMA_V24: &str = r#"
+CREATE TABLE controlled_billing_steps_next (
+  request_id TEXT PRIMARY KEY REFERENCES requests(id),
+  operation_id TEXT NOT NULL REFERENCES controlled_billing_operations(operation_id),
+  kind TEXT NOT NULL CHECK(kind IN ('assist','video','chat')),
+  receipt_hash BLOB,
+  actual_microcredits INTEGER CHECK(actual_microcredits IS NULL OR actual_microcredits >= 0),
+  task_ref TEXT,
+  state TEXT NOT NULL CHECK(state IN ('pending','verified','unknown','conflict')),
+  UNIQUE(operation_id, kind)
+);
+INSERT INTO controlled_billing_steps_next
+  (request_id, operation_id, kind, receipt_hash, actual_microcredits, task_ref, state)
+  SELECT request_id, operation_id, kind, receipt_hash, actual_microcredits, task_ref, state
+  FROM controlled_billing_steps;
+DROP TABLE controlled_billing_steps;
+ALTER TABLE controlled_billing_steps_next RENAME TO controlled_billing_steps;
+"#;

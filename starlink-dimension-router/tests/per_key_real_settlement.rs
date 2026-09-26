@@ -479,8 +479,9 @@ fn fixture() -> Fixture {
 }
 
 #[tokio::test]
-async fn unavailable_quote_fails_unreserved_chat_request_without_upstream_charge() {
+async fn unavailable_quote_chat_uses_controlled_hold_and_settles_exact_request_receipt() {
     let fixture = fixture();
+    fixture.bridge.set_receipt("final", Some("1.250000"));
     let client_request_id = "client-forged-request-id";
     let idempotency_key = "quote-unavailable-chat";
     let response = fixture
@@ -505,11 +506,14 @@ async fn unavailable_quote_fails_unreserved_chat_request_without_upstream_charge
     )
     .unwrap();
 
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(response_body["error"]["code"], "quote_unavailable");
+    assert_eq!(status, StatusCode::OK,
+        "response={response_body}; operations={:?}; billing_count={}",
+        fixture.store.controlled_operation_summaries(10).unwrap(),
+        fixture.bridge.count_prefix("/internal/bridge/requests/"));
+    assert_eq!(response_body["id"], "chatcmpl-upstream");
     assert_eq!(fixture.bridge.requests_to("/internal/bridge/summary").len(), 1);
     assert_eq!(fixture.bridge.requests_to("/internal/bridge/quotes").len(), 1);
-    assert_eq!(fixture.bridge.requests_to("/v1/chat/completions").len(), 0);
+    assert_eq!(fixture.bridge.requests_to("/v1/chat/completions").len(), 1);
 
     let quote = fixture
         .bridge
@@ -528,6 +532,14 @@ async fn unavailable_quote_fails_unreserved_chat_request_without_upstream_charge
     assert_eq!(quote_body["model"], "test-chat");
     assert!(!quote_body.to_string().contains("private prompt"));
     assert!(!quote_body.to_string().contains(&fixture.key));
+
+    let generation = fixture.bridge.requests_to("/v1/chat/completions").pop().unwrap();
+    assert_eq!(generation.headers["x-core-request-id"], request_id);
+    assert_eq!(generation.headers["x-core-key-id"], fixture.key_id);
+    assert!(!generation.headers.contains_key("x-core-quote-id"));
+    let operation_id = generation.headers["x-core-controlled-operation-id"].clone();
+    assert!(!operation_id.is_empty());
+    assert_eq!(fixture.bridge.requests_to(&format!("/internal/bridge/requests/{request_id}/billing")).len(), 1);
 
     let request = match fixture
         .store
@@ -551,15 +563,54 @@ async fn unavailable_quote_fails_unreserved_chat_request_without_upstream_charge
         other => panic!("expected persisted Core request, got {other:?}"),
     };
     assert_eq!(request.id, request_id);
-    assert_eq!(fixture.store.request_state(request_id).unwrap(), aiwork_core::RequestState::Failed);
-    assert!(fixture.store.reservation_for_request(request_id).unwrap().is_none());
+    assert_eq!(fixture.store.request_state(request_id).unwrap(), aiwork_core::RequestState::Settled);
+    assert_eq!(fixture.store.reservation_for_request(request_id).unwrap().unwrap().state, aiwork_core::ReservationState::Committed);
     let principal = fixture.store.authenticate_api_key(&fixture.key).unwrap();
     let quota = fixture
         .store
         .key_quota_usage_for_principal(&principal, 20)
         .unwrap();
     assert_eq!(quota.balances[0].held, 0);
-    assert_eq!(quota.balances[0].settled, 0);
+    assert_eq!(quota.balances[0].settled, 1_250_000);
+}
+
+#[tokio::test]
+async fn unresolved_unquoted_chat_holds_only_its_key_and_blocks_its_next_request() {
+    let fixture = fixture();
+    let first = post_chat(&fixture, &fixture.key, "unknown-unquoted-first", false).await;
+    assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+    let first_body: Value = serde_json::from_slice(
+        &to_bytes(first.into_body(), 1024 * 1024).await.unwrap(),
+    ).unwrap();
+    assert_eq!(first_body["error"]["code"], "reconcile_required");
+    assert_eq!(quota_for(&fixture, &fixture.key).balances[0].held, 10_000_000);
+
+    let same_key_retry = post_chat(&fixture, &fixture.key, "unknown-unquoted-retry", false).await;
+    assert_eq!(same_key_retry.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(quota_for(&fixture, &fixture.key).balances[0].held, 10_000_000);
+    assert_eq!(fixture.bridge.requests_to("/v1/chat/completions").len(), 1);
+
+    let other_key = post_chat(&fixture, &fixture.second_key, "other-key-unquoted", false).await;
+    assert_eq!(other_key.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(quota_for(&fixture, &fixture.second_key).balances[0].held, 10_000_000);
+    assert_eq!(fixture.bridge.requests_to("/v1/chat/completions").len(), 2);
+}
+
+#[tokio::test]
+async fn unquoted_streaming_chat_settles_the_final_receipt_for_its_request() {
+    let fixture = fixture();
+    fixture.bridge.set_receipt("final", Some("0.375000"));
+    let response = post_chat(&fixture, &fixture.key, "unquoted-stream", true).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("data: [DONE]"));
+    assert_eq!(quota_for(&fixture, &fixture.key).balances[0].settled, 375_000);
+    assert_eq!(quota_for(&fixture, &fixture.key).balances[0].held, 0);
+
+    let generation = fixture.bridge.requests_to("/v1/chat/completions").pop().unwrap();
+    assert_eq!(generation.headers["x-core-key-id"], fixture.key_id);
+    assert!(!generation.headers.contains_key("x-core-quote-id"));
+    assert!(generation.headers.contains_key("x-core-controlled-operation-id"));
 }
 
 async fn post_chat(fixture: &Fixture, key: &str, idempotency_key: &str, stream: bool) -> axum::response::Response<Body> {

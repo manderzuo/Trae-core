@@ -516,17 +516,37 @@ async fn one_shot_unrelated_quote_error_fails_unreserved_video_request() {
 }
 
 #[tokio::test]
-async fn active_seedance_chat_without_quote_fails_unreserved_parent_request() {
+async fn active_seedance_chat_uses_controlled_hold_when_quote_is_unavailable() {
     let fixture = fixture("active-seedance-unquoted");
     fixture.bridge.set_quote_unavailable(true);
 
     let response = post_seedance_chat(&fixture).await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.status(), StatusCode::OK);
     let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
-    let request_id = body["error"]["request_id"].as_str().unwrap();
-    assert_eq!(fixture.store.request_state(request_id).unwrap(), aiwork_core::RequestState::Failed);
-    assert_eq!(quota(&fixture).balances[0].held, 0);
-    assert_eq!(fixture.bridge.request_count("/v1/chat/completions"), 0);
+    assert_eq!(body["task"]["id"], "video-test");
+    let job = fixture.state.jobs.lock().unwrap()["video-test"].clone();
+    assert!(job.controlled_operation_id.is_some());
+    assert_eq!(quota(&fixture).balances[0].held, 100_000_000);
+    assert_eq!(fixture.bridge.request_count("/v1/chat/completions"), 2);
+
+    assert_eq!(post_seedance_chat(&fixture).await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(fixture.bridge.request_count("/v1/chat/completions"), 2);
+}
+
+#[tokio::test]
+async fn active_native_video_uses_controlled_hold_when_quote_is_unavailable() {
+    let fixture = fixture("active-native-unquoted");
+    fixture.bridge.set_quote_unavailable(true);
+
+    let response = post_video(&fixture).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let job = fixture.state.jobs.lock().unwrap()["video-test"].clone();
+    assert!(job.controlled_operation_id.is_some());
+    assert_eq!(quota(&fixture).balances[0].held, 100_000_000);
+    assert_eq!(fixture.bridge.request_count("/v1/videos/generations"), 1);
+
+    assert_eq!(post_video(&fixture).await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(fixture.bridge.request_count("/v1/videos/generations"), 1);
 }
 
 #[tokio::test]

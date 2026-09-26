@@ -213,6 +213,88 @@ fn controlled_assist_and_video_commit_once() {
 }
 
 #[test]
+fn controlled_direct_chat_commits_its_exact_receipt_without_a_video_task() {
+    let (store, dir, key, admin) = fixture("direct-chat");
+    let parent = request(&store, &key, "text-model", "direct-chat-parent");
+    let operation = store
+        .begin_controlled_operation(&parent, snapshot())
+        .unwrap();
+    assert_eq!(operation.held.as_microcredits(), 100_000_000);
+    store
+        .mark_controlled_step_dispatched(&parent, &parent, ControlledStepKind::Chat)
+        .unwrap();
+    assert_eq!(
+        store
+            .record_controlled_step(
+                &parent,
+                &parent,
+                ControlledStepKind::Chat,
+                receipt(&parent, BillingReceiptStatus::Final, Some("2.5"), None),
+            )
+            .unwrap(),
+        ControlledStepResult::Verified
+    );
+
+    let settled = store.finish_controlled_operation(&parent, None).unwrap();
+    assert_eq!(settled.actual_credits.as_microcredits(), 2_500_000);
+    let balance = store
+        .key_quota_balance_as_admin(&admin, &key, "credits")
+        .unwrap();
+    assert_eq!((balance.available, balance.held, balance.settled), (97_500_000, 0, 2_500_000));
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn schema_v24_preserves_existing_controlled_steps_when_adding_chat_kind() {
+    let (store, dir, key, _) = fixture("schema-v24-preserve");
+    let parent = request(&store, &key, "seedance", "schema-v24-parent");
+    let child = request(&store, &key, "deepseek-v4-flash", "schema-v24-child");
+    store.link_seedance_assist_request(&parent, &child).unwrap();
+    store.begin_controlled_operation(&parent, snapshot()).unwrap();
+    store
+        .mark_controlled_step_dispatched(&parent, &child, ControlledStepKind::Assist)
+        .unwrap();
+    drop(store);
+
+    let database_path = dir.join("data").join(aiwork_core::CORE_DB_FILE);
+    let connection = rusqlite::Connection::open(&database_path).unwrap();
+    connection.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    connection.execute_batch(
+        "ALTER TABLE controlled_billing_steps RENAME TO controlled_billing_steps_v24;
+         CREATE TABLE controlled_billing_steps (
+           request_id TEXT PRIMARY KEY REFERENCES requests(id),
+           operation_id TEXT NOT NULL REFERENCES controlled_billing_operations(operation_id),
+           kind TEXT NOT NULL CHECK(kind IN ('assist','video')),
+           receipt_hash BLOB,
+           actual_microcredits INTEGER CHECK(actual_microcredits IS NULL OR actual_microcredits >= 0),
+           task_ref TEXT,
+           state TEXT NOT NULL CHECK(state IN ('pending','verified','unknown','conflict')),
+           UNIQUE(operation_id, kind)
+         );
+         INSERT INTO controlled_billing_steps
+           (request_id, operation_id, kind, receipt_hash, actual_microcredits, task_ref, state)
+           SELECT request_id, operation_id, kind, receipt_hash, actual_microcredits, task_ref, state
+           FROM controlled_billing_steps_v24;
+         DROP TABLE controlled_billing_steps_v24;
+         UPDATE schema_meta SET value = '23' WHERE key = 'schema_version';",
+    ).unwrap();
+    connection.pragma_update(None, "foreign_keys", "ON").unwrap();
+    drop(connection);
+
+    let upgraded = CoreStore::open(&dir).unwrap();
+    upgraded.migrate().unwrap();
+    assert_eq!(upgraded.schema_version().unwrap(), aiwork_core::CURRENT_SCHEMA_VERSION);
+    let steps = upgraded.recoverable_controlled_steps(10).unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].parent_request_id, parent);
+    assert_eq!(steps[0].request_id, child);
+    assert_eq!(steps[0].kind, ControlledStepKind::Assist);
+    drop(upgraded);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn controlled_assist_only_failure_commits_assist() {
     let (store, dir, key, admin) = fixture("assist-only");
     let parent = request(&store, &key, "seedance", "assist-only-parent");

@@ -10,6 +10,7 @@ use crate::{
 pub enum ControlledStepKind {
     Assist,
     Video,
+    Chat,
 }
 
 impl ControlledStepKind {
@@ -17,6 +18,7 @@ impl ControlledStepKind {
         match self {
             Self::Assist => "assist",
             Self::Video => "video",
+            Self::Chat => "chat",
         }
     }
 }
@@ -166,6 +168,7 @@ impl CoreStore {
             let kind = match kind.as_str() {
                 "assist" => ControlledStepKind::Assist,
                 "video" => ControlledStepKind::Video,
+                "chat" => ControlledStepKind::Chat,
                 _ => {
                     return Err(rusqlite::Error::InvalidColumnType(
                         2,
@@ -448,7 +451,9 @@ impl CoreStore {
 
         let mut assist_verified = false;
         let mut video_verified = false;
+        let mut chat_verified = false;
         let mut video_failed_no_charge = false;
+        let mut chat_failed_no_charge = false;
         let mut total = 0_i64;
         for (kind, step_state, amount, receipt_status) in steps {
             if step_state != "verified"
@@ -472,6 +477,10 @@ impl CoreStore {
                     video_verified = true;
                     video_failed_no_charge = receipt_status.as_deref() == Some("failed_no_charge");
                 }
+                "chat" => {
+                    chat_verified = true;
+                    chat_failed_no_charge = receipt_status.as_deref() == Some("failed_no_charge");
+                }
                 _ => {
                     return Err(CoreError::BillingReceiptInvalid {
                         reason: "unknown controlled step kind".into(),
@@ -482,6 +491,7 @@ impl CoreStore {
         if (has_assist && !assist_verified)
             || (video_submitted && !video_verified)
             || (!video_submitted && video_verified)
+            || (chat_verified && (has_assist || video_verified))
         {
             return Err(CoreError::BillingReceiptInvalid {
                 reason:
@@ -560,15 +570,22 @@ impl CoreStore {
                 value: request_state,
             }
         })?;
-        Self::settle_request_state(
-            &transaction,
-            parent_request_id,
-            request_state,
+        let final_request_state = if video_submitted {
             if video_outcome == Some(true) && !video_failed_no_charge {
                 RequestState::Succeeded
             } else {
                 RequestState::Failed
-            },
+            }
+        } else if chat_verified && !chat_failed_no_charge {
+            RequestState::Succeeded
+        } else {
+            RequestState::Failed
+        };
+        Self::settle_request_state(
+            &transaction,
+            parent_request_id,
+            request_state,
+            final_request_state,
             (video_outcome == Some(false)).then(|| RequestResult {
                 status: Some(502),
                 error_code: Some("video_generation_failed".into()),
@@ -609,15 +626,14 @@ impl CoreStore {
                 reason: "controlled operation cannot dispatch another step".into(),
             });
         }
-        let valid_step: bool = if kind == ControlledStepKind::Video {
-            step_request_id == parent_request_id
-        } else {
-            transaction.query_row(
+        let valid_step: bool = match kind {
+            ControlledStepKind::Video | ControlledStepKind::Chat => step_request_id == parent_request_id,
+            ControlledStepKind::Assist => transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM request_relations WHERE parent_request_id = ?1
                  AND child_request_id = ?2 AND relationship_kind = 'seedance_assist')",
                 params![parent_request_id, step_request_id],
                 |row| row.get(0),
-            )?
+            )?,
         };
         let step_key: String = transaction
             .query_row(
@@ -735,14 +751,13 @@ impl CoreStore {
             .ok_or_else(|| CoreError::RequestNotFound {
                 request_id: step_request_id.into(),
             })?;
-        let relation_matches = if kind == ControlledStepKind::Video {
-            step_request_id == parent_request_id
-        } else {
-            transaction.query_row(
+        let relation_matches = match kind {
+            ControlledStepKind::Video | ControlledStepKind::Chat => step_request_id == parent_request_id,
+            ControlledStepKind::Assist => transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM request_relations
                  WHERE parent_request_id = ?1 AND child_request_id = ?2 AND relationship_kind = 'seedance_assist')",
                 params![parent_request_id, step_request_id], |row| row.get::<_, bool>(0),
-            )?
+            )?,
         };
         if step_key != api_key_id || !relation_matches {
             return Err(CoreError::BillingReceiptInvalid {

@@ -82,7 +82,7 @@ fn input(id: &str, expires_at_ms: i64, token: u8) -> CreateAssetInput {
 fn bootstrap_and_migration_create_authoritative_assets_table() {
     let (store, _principal_a, _principal_b, dir) = fixture();
     assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
-    assert_eq!(CURRENT_SCHEMA_VERSION, 23);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 24);
     assert_eq!(store.table_count("assets").unwrap(), 1);
     assert_eq!(store.count_rows("assets").unwrap(), 0);
     drop(store);

@@ -40,7 +40,7 @@ fn schema_v22_to_v23_preserves_old_reservations() {
 
     let reopened = CoreStore::open(&dir).unwrap();
     reopened.migrate().unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 23);
+    assert_eq!(reopened.schema_version().unwrap(), aiwork_core::CURRENT_SCHEMA_VERSION);
     let reservation = reopened.reservation_for_request(&request.id).unwrap().unwrap();
     assert_eq!(reservation.id, "old-reservation");
     assert_eq!(reservation.amount, 5_000_000);
