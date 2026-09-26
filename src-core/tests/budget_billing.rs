@@ -6,6 +6,7 @@ use std::{
     thread,
 };
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use aiwork_core::{
     BeginRequest, BeginRequestInput, BillingQuote, BillingReceipt, BillingReceiptResult,
     BillingReceiptStatus, BillingReservationResult, CoreStore, CreditAmount, KeyQuotaGrant,
@@ -214,6 +215,24 @@ fn begin_video_parent(store: &CoreStore, key_id: &str, idempotency_key: &str) ->
     }
 }
 
+fn begin_chat_parent(store: &CoreStore, key_id: &str, idempotency_key: &str) -> String {
+    match store
+        .begin_billed_request(BeginRequestInput {
+            user_id: "budget-user".into(),
+            api_key_id: key_id.into(),
+            protocol: "openai".into(),
+            endpoint: "chat".into(),
+            model: "chat-model".into(),
+            idempotency_key: idempotency_key.into(),
+            body: json!({"model":"chat-model","messages":[{"role":"user","content":"hello"}]}),
+        })
+        .unwrap()
+    {
+        BeginRequest::Created(request) => request.id,
+        other => panic!("expected a new chat parent, got {other:?}"),
+    }
+}
+
 fn budget_assist_input(key_id: &str, idempotency_key: &str) -> BeginRequestInput {
     BeginRequestInput {
         user_id: "budget-user".into(),
@@ -247,6 +266,32 @@ fn video_budget_step(
             profile_fingerprint: "profile-hash".into(),
             policy_version: "policy-v1".into(),
             hold_credits: CreditAmount::parse("2", "credits").unwrap(),
+            expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
+        },
+    }
+}
+
+fn chat_budget_step(
+    store: &CoreStore,
+    key_id: &str,
+    parent_request_id: &str,
+    budget_id: &str,
+) -> aiwork_core::BudgetStepInput {
+    aiwork_core::BudgetStepInput {
+        kind: aiwork_core::BudgetStepKind::Chat,
+        authorization: aiwork_core::BudgetAuthorization {
+            budget_id: budget_id.into(),
+            parent_request_id: parent_request_id.into(),
+            request_id: parent_request_id.into(),
+            core_key_id: key_id.into(),
+            request_fingerprint: store.request_fingerprint_for_billing(parent_request_id).unwrap(),
+            endpoint: "chat".into(),
+            model: "chat-model".into(),
+            account_ref: "account-test".into(),
+            bridge_instance_id: "bridge-test".into(),
+            profile_fingerprint: "profile-hash".into(),
+            policy_version: "policy-v1".into(),
+            hold_credits: CreditAmount::parse("1", "credits").unwrap(),
             expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
         },
     }
@@ -1393,6 +1438,221 @@ fn reconcile_v2_corrupt_authorization_hash_quarantines_accounts_and_blocks_admis
 }
 
 #[test]
+fn explicit_conflict_evidence_does_not_quarantine_shared_user_cap_but_bad_shape_does() {
+    let (directory, store, key_id, admin) = budget_fixture("v2-explicit-conflict-evidence", 5, 100_000_000);
+    store
+        .quota_pool_grant_as_admin(
+            &admin,
+            aiwork_core::QuotaGrant {
+                user_id: "budget-user".into(),
+                resource_kind: "credits".into(),
+                amount: 20_000_000,
+                actor_user_id: "budget-admin".into(),
+                reason: "conflict evidence shared user-cap fixture".into(),
+            },
+        )
+        .unwrap();
+    let first_parent = begin_video_parent(&store, &key_id, "v2-explicit-conflict-first");
+    let mut first_step = video_budget_step(&store, &key_id, &first_parent, "v2-explicit-conflict-first-budget");
+    first_step.authorization.hold_credits = CreditAmount::parse("2", "credits").unwrap();
+    store.begin_budget_operation(&first_parent, first_step).unwrap();
+    store.mark_budget_step_dispatched(&first_parent).unwrap();
+    store
+        .mark_budget_receipt_conflict(aiwork_core::BudgetReceiptConflict {
+            request_id: first_parent.clone(),
+            budget_id: "v2-explicit-conflict-first-budget".into(),
+            account_ref: "account-test".into(),
+            bridge_instance_id: "bridge-test".into(),
+            source_ref: "explicit-conflict-source".into(),
+            evidence_hash: "explicit-conflict-hash".into(),
+            observed_at_ms: chrono::Utc::now().timestamp_millis(),
+        })
+        .unwrap();
+
+    let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+    assert_eq!(store.reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis()).unwrap(), 0);
+    let user_cap_state: String = connection
+        .query_row(
+            "SELECT account.migration_state
+             FROM quota_budget_accounts account
+             JOIN quota_reservations reservation ON reservation.user_cap_account_id = account.id
+             WHERE reservation.request_id = ?1",
+            [&first_parent],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(user_cap_state, "ready");
+
+    let blocked_retry = begin_video_parent(&store, &key_id, "v2-explicit-conflict-blocked-retry");
+    let blocked_step = video_budget_step(&store, &key_id, &blocked_retry, "v2-explicit-conflict-blocked-retry-budget");
+    assert!(store.begin_budget_operation(&blocked_retry, blocked_step).is_err());
+
+    let other_key = store
+        .issue_api_key_as_admin_with_max_concurrency(
+            "budget-user",
+            "conflict-isolated-other-key",
+            BTreeSet::from(["video:submit".into()]),
+            3,
+            &admin,
+        )
+        .unwrap();
+    store
+        .key_quota_grant_as_admin(
+            &admin,
+            KeyQuotaGrant {
+                api_key_id: other_key.id.clone(),
+                resource_kind: "credits".into(),
+                amount: 5_000_000,
+                actor_user_id: "budget-admin".into(),
+                reason: "other Key remains eligible under shared user-cap".into(),
+            },
+        )
+        .unwrap();
+    let other_parent = begin_video_parent(&store, &other_key.id, "v2-explicit-conflict-other-key");
+    let mut other_step = video_budget_step(&store, &other_key.id, &other_parent, "v2-explicit-conflict-other-key-budget");
+    other_step.authorization.hold_credits = CreditAmount::parse("1", "credits").unwrap();
+    store.begin_budget_operation(&other_parent, other_step).unwrap();
+
+    let changed = connection
+        .execute(
+            "UPDATE budget_receipt_evidence SET receipt_status = 'final'
+             WHERE request_id = ?1 AND record_kind = 'conflict'",
+            [&first_parent],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    assert_eq!(store.reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis()).unwrap(), 1);
+    let quarantined_user_cap: String = connection
+        .query_row(
+            "SELECT account.migration_state
+             FROM quota_budget_accounts account
+             JOIN quota_reservations reservation ON reservation.user_cap_account_id = account.id
+             WHERE reservation.request_id = ?1",
+            [&first_parent],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(quarantined_user_cap, "reconcile_required");
+}
+
+#[test]
+fn reconcile_v2_explicit_conflict_wrong_owner_quarantines_accounts() {
+    let (directory, store, key_id, admin) = budget_fixture("v2-explicit-conflict-owner", 3, 20_000_000);
+    store
+        .quota_pool_grant_as_admin(
+            &admin,
+            aiwork_core::QuotaGrant {
+                user_id: "budget-user".into(),
+                resource_kind: "credits".into(),
+                amount: 20_000_000,
+                actor_user_id: "budget-admin".into(),
+                reason: "explicit conflict owner validation fixture".into(),
+            },
+        )
+        .unwrap();
+    let parent = begin_video_parent(&store, &key_id, "v2-explicit-conflict-owner-parent");
+    store
+        .begin_budget_operation(
+            &parent,
+            video_budget_step(&store, &key_id, &parent, "v2-explicit-conflict-owner-budget"),
+        )
+        .unwrap();
+    store.mark_budget_step_dispatched(&parent).unwrap();
+    store
+        .mark_budget_receipt_conflict(aiwork_core::BudgetReceiptConflict {
+            request_id: parent.clone(),
+            budget_id: "v2-explicit-conflict-owner-budget".into(),
+            account_ref: "account-test".into(),
+            bridge_instance_id: "bridge-test".into(),
+            source_ref: "explicit-conflict-owner-source".into(),
+            evidence_hash: "explicit-conflict-owner-hash".into(),
+            observed_at_ms: chrono::Utc::now().timestamp_millis(),
+        })
+        .unwrap();
+
+    let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+    let changed = connection
+        .execute(
+            "UPDATE budget_receipt_evidence SET account_ref = 'wrong-account'
+             WHERE request_id = ?1 AND record_kind = 'conflict'",
+            [&parent],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    assert_eq!(store.reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis()).unwrap(), 1);
+    let (key_state, user_cap_state): (String, String) = connection
+        .query_row(
+            "SELECT key_account.migration_state, user_account.migration_state
+             FROM quota_budget_accounts key_account
+             JOIN quota_reservations reservation ON reservation.key_budget_account_id = key_account.id
+             JOIN quota_budget_accounts user_account ON user_account.id = reservation.user_cap_account_id
+             WHERE reservation.request_id = ?1",
+            [&parent],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((key_state.as_str(), user_cap_state.as_str()), ("reconcile_required", "reconcile_required"));
+}
+
+#[test]
+fn reconcile_v2_explicit_conflict_tampered_hash_quarantines_accounts() {
+    let (directory, store, key_id, admin) = budget_fixture("v2-explicit-conflict-hash", 3, 20_000_000);
+    store
+        .quota_pool_grant_as_admin(
+            &admin,
+            aiwork_core::QuotaGrant {
+                user_id: "budget-user".into(),
+                resource_kind: "credits".into(),
+                amount: 20_000_000,
+                actor_user_id: "budget-admin".into(),
+                reason: "explicit conflict hash validation fixture".into(),
+            },
+        )
+        .unwrap();
+    let parent = begin_video_parent(&store, &key_id, "v2-explicit-conflict-hash-parent");
+    store
+        .begin_budget_operation(
+            &parent,
+            video_budget_step(&store, &key_id, &parent, "v2-explicit-conflict-hash-budget"),
+        )
+        .unwrap();
+    store.mark_budget_step_dispatched(&parent).unwrap();
+    store
+        .mark_budget_receipt_conflict(aiwork_core::BudgetReceiptConflict {
+            request_id: parent.clone(),
+            budget_id: "v2-explicit-conflict-hash-budget".into(),
+            account_ref: "account-test".into(),
+            bridge_instance_id: "bridge-test".into(),
+            source_ref: "explicit-conflict-hash-source".into(),
+            evidence_hash: "opaque-explicit-conflict-hash".into(),
+            observed_at_ms: chrono::Utc::now().timestamp_millis(),
+        })
+        .unwrap();
+
+    let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+    let changed = connection
+        .execute(
+            "UPDATE budget_receipt_evidence SET evidence_hash = 'tampered-explicit-conflict-hash'
+             WHERE request_id = ?1 AND record_kind = 'conflict'",
+            [&parent],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    assert_eq!(store.reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis()).unwrap(), 1);
+    let user_cap_state: String = connection
+        .query_row(
+            "SELECT account.migration_state
+             FROM quota_budget_accounts account
+             JOIN quota_reservations reservation ON reservation.user_cap_account_id = account.id
+             WHERE reservation.request_id = ?1",
+            [&parent],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(user_cap_state, "reconcile_required");
+}
+
+#[test]
 fn reconcile_v1_commit_and_release_event_groups_without_quarantining_key() {
     let (_directory, store, _fixture_key, admin) = budget_fixture("v1-event-group-reconcile", 3, 10_000_000);
     let issued_key = store
@@ -2373,7 +2633,9 @@ fn video_final_wrong_task_after_binding_is_conflict_with_evidence() {
     store.bind_budget_video_task(&parent_request_id, "stored-video-task").unwrap();
     let mut wrong_task = final_budget_receipt(&parent_request_id, budget_id, "1");
     wrong_task.receipt.task_ref = Some("unrelated-video-task".into());
-    assert_eq!(store.apply_budget_receipt(wrong_task).unwrap(), aiwork_core::BudgetReceiptResult::Conflict);
+    assert_eq!(store.apply_budget_receipt(wrong_task.clone()).unwrap(), aiwork_core::BudgetReceiptResult::Conflict);
+    wrong_task.receipt.observed_at_ms += 1;
+    assert_eq!(store.apply_budget_receipt(wrong_task).unwrap(), aiwork_core::BudgetReceiptResult::Duplicate);
 
     let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
     let (financial_state, settlements, evidence, blocks): (String, i64, i64, i64) = connection
@@ -2388,8 +2650,112 @@ fn video_final_wrong_task_after_binding_is_conflict_with_evidence() {
         )
         .unwrap();
     assert_eq!((financial_state.as_str(), settlements, evidence, blocks), ("conflict", 0, 1, 1));
+    let blocked_retry = begin_video_parent(&store, &key_id, "receipt-task-wrong-binding-retry");
+    let blocked_step = video_budget_step(&store, &key_id, &blocked_retry, "receipt-task-wrong-binding-retry-budget");
+    assert!(store.begin_budget_operation(&blocked_retry, blocked_step).is_err());
     let balance = store.key_quota_balance_as_admin(&admin, &key_id, "credits").unwrap();
     assert_eq!((balance.available, balance.held), (998_000_000, 2_000_000));
+    assert_eq!(store.reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis()).unwrap(), 0);
+    let changed = connection
+        .execute(
+            "UPDATE budget_receipt_evidence SET evidence_hash = 'corrupt-conflict-receipt-hash'
+             WHERE request_id = ?1 AND record_kind = 'conflict'",
+            [&parent_request_id],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    assert_eq!(store.reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis()).unwrap(), 1);
+}
+
+#[test]
+fn opaque_conflict_hash_collision_is_not_a_receipt_duplicate() {
+    let (directory, store, key_id, admin) = budget_fixture("receipt-opaque-conflict-hash-collision", 2, 20_000_000);
+    let parent = begin_video_parent(&store, &key_id, "receipt-opaque-conflict-hash-collision-parent");
+    let budget_id = "receipt-opaque-conflict-hash-collision-budget";
+    store
+        .begin_budget_operation(
+            &parent,
+            video_budget_step(&store, &key_id, &parent, budget_id),
+        )
+        .unwrap();
+    store.mark_budget_step_dispatched(&parent).unwrap();
+    store.bind_budget_video_task(&parent, "opaque-conflict-collision-task").unwrap();
+
+    let mut receipt = final_budget_receipt(&parent, budget_id, "1");
+    receipt.receipt.task_ref = Some("opaque-conflict-collision-task".into());
+    receipt.receipt.source_ref = "opaque-conflict-collision-source".into();
+    let evidence_hash = URL_SAFE_NO_PAD.encode(aiwork_core::canonical_json_hash(&json!({
+        "request_id": parent.as_str(),
+        "budget_id": budget_id,
+        "account_ref": receipt.account_ref.as_str(),
+        "bridge_instance_id": receipt.bridge_instance_id.as_str(),
+        "status": "final",
+        "actual_microcredits": 1_000_000,
+        "unit": receipt.receipt.unit.as_str(),
+        "source_ref": receipt.receipt.source_ref.as_str(),
+        "task_ref": receipt.receipt.task_ref.as_deref(),
+    })));
+    store
+        .mark_budget_receipt_conflict(aiwork_core::BudgetReceiptConflict {
+            request_id: parent.clone(),
+            budget_id: budget_id.into(),
+            account_ref: "account-test".into(),
+            bridge_instance_id: "bridge-test".into(),
+            source_ref: "opaque-conflict-collision-source".into(),
+            evidence_hash,
+            observed_at_ms: chrono::Utc::now().timestamp_millis(),
+        })
+        .unwrap();
+
+    assert_eq!(store.apply_budget_receipt(receipt).unwrap(), aiwork_core::BudgetReceiptResult::Conflict);
+    let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+    let (financial_state, conflicts, receipts, settlements, blocks): (String, i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT step.financial_state,
+                    (SELECT COUNT(*) FROM budget_receipt_evidence WHERE request_id = step.request_id AND record_kind = 'conflict'),
+                    (SELECT COUNT(*) FROM budget_receipt_evidence WHERE request_id = step.request_id AND record_kind = 'receipt'),
+                    (SELECT COUNT(*) FROM budget_settlements WHERE request_id = step.request_id),
+                    (SELECT COUNT(*) FROM api_key_billing_blocks WHERE key_id = step.core_key_id)
+             FROM budget_steps step WHERE request_id = ?1",
+            [&parent],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!((financial_state.as_str(), conflicts, receipts, settlements, blocks), ("conflict", 1, 0, 0, 1));
+    let balance = store.key_quota_balance_as_admin(&admin, &key_id, "credits").unwrap();
+    assert_eq!((balance.available, balance.held), (18_000_000, 2_000_000));
+}
+
+#[test]
+fn begin_chat_step_kind_must_match_chat_endpoint_without_leaving_a_hold() {
+    let (directory, store, key_id, admin) = budget_fixture("begin-chat-endpoint-kind", 3, 20_000_000);
+    let video_parent = begin_video_parent(&store, &key_id, "begin-chat-kind-video-parent");
+    let mut wrong_kind = video_budget_step(&store, &key_id, &video_parent, "begin-chat-kind-wrong-budget");
+    wrong_kind.kind = aiwork_core::BudgetStepKind::Chat;
+    let balance_before = store.key_quota_balance_as_admin(&admin, &key_id, "credits").unwrap();
+    assert!(store.begin_budget_operation(&video_parent, wrong_kind).is_err());
+    assert!(store.budget_operation(&video_parent).unwrap().is_none());
+    let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+    let (operations, steps, reservations, request_state): (i64, i64, i64, String) = connection
+        .query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM budget_operations WHERE parent_request_id = ?1),
+               (SELECT COUNT(*) FROM budget_steps WHERE request_id = ?1),
+               (SELECT COUNT(*) FROM quota_reservations WHERE request_id = ?1),
+               (SELECT state FROM requests WHERE id = ?1)",
+            [&video_parent],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!((operations, steps, reservations, request_state.as_str()), (0, 0, 0, "received"));
+    let balance_after = store.key_quota_balance_as_admin(&admin, &key_id, "credits").unwrap();
+    assert_eq!(balance_after, balance_before);
+
+    let chat_parent = begin_chat_parent(&store, &key_id, "begin-chat-kind-chat-parent");
+    let chat_step = chat_budget_step(&store, &key_id, &chat_parent, "begin-chat-kind-chat-budget");
+    let operation = store.begin_budget_operation(&chat_parent, chat_step).unwrap();
+    assert_eq!(operation.parent_request_id, chat_parent);
+    assert!(store.budget_operation(&operation.parent_request_id).unwrap().is_some());
 }
 
 #[test]

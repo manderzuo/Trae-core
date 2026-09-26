@@ -1268,6 +1268,59 @@ impl CoreStore {
                 reason: "video task binding is not yet available for final receipt verification".into(),
             });
         }
+        let existing_evidence: Option<(
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+        )> = transaction
+            .query_row(
+                "SELECT record_kind, receipt_status, actual_microcredits, unit,
+                        source_ref, task_ref, conflict_reason, evidence_id
+                 FROM budget_receipt_evidence WHERE request_id = ?1 AND evidence_hash = ?2",
+                params![&receipt.request_id, &evidence_hash],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let duplicate = existing_evidence.is_some_and(
+            |(record_kind, status, actual, unit, source_ref, task_ref, conflict_reason, evidence_id)| {
+                let receipt_semantics_match = evidence_id == format!("{}:{evidence_hash}", receipt.request_id)
+                    && status.as_deref() == Some(receipt.status.as_str())
+                    && actual == reported_actual
+                    && unit.as_deref() == Some(receipt.unit.as_str())
+                    && source_ref.as_str() == receipt.source_ref.as_str()
+                    && task_ref.as_deref() == receipt.task_ref.as_deref();
+                match record_kind.as_str() {
+                    "receipt" => receipt_semantics_match && conflict_reason.is_none(),
+                    "conflict" => {
+                        receipt_semantics_match
+                            && status.is_some()
+                            && unit.as_deref() == Some("credits")
+                            && conflict_reason.as_deref().is_some_and(|reason| !reason.trim().is_empty())
+                    }
+                    _ => false,
+                }
+            },
+        );
+        if duplicate {
+            transaction.commit()?;
+            return Ok(BudgetReceiptResult::Duplicate);
+        }
         let video_task_conflict = if context.kind == BudgetStepKind::Video.as_str() {
             match receipt.status {
                 BillingReceiptStatus::Final => receipt.task_ref != context.task_ref,
@@ -1296,16 +1349,6 @@ impl CoreStore {
             )?;
             transaction.commit()?;
             return Ok(BudgetReceiptResult::Conflict);
-        }
-        let duplicate: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM budget_receipt_evidence
-             WHERE request_id = ?1 AND evidence_hash = ?2)",
-            params![&receipt.request_id, &evidence_hash],
-            |row| row.get(0),
-        )?;
-        if duplicate {
-            transaction.commit()?;
-            return Ok(BudgetReceiptResult::Duplicate);
         }
         let existing_settlement: Option<(i64, String, String, Option<String>, Option<String>)> = transaction
             .query_row(
@@ -1812,6 +1855,16 @@ impl CoreStore {
         }
         let now = Utc::now().timestamp_millis();
         validate_budget_authorization(&input, now, true)?;
+        let expected_endpoint = match input.kind {
+            BudgetStepKind::Chat => Some("chat"),
+            BudgetStepKind::Video => Some("videos"),
+            BudgetStepKind::Assist => None,
+        };
+        if expected_endpoint.is_some_and(|endpoint| input.authorization.endpoint != endpoint) {
+            return Err(CoreError::BillingQuoteMismatch {
+                request_id: input.authorization.request_id,
+            });
+        }
         let authorization_hash = canonical_json_hash(&serde_json::to_value(&input.authorization)?).to_vec();
 
         let mut connection = self.connection.lock().expect("core store mutex poisoned");

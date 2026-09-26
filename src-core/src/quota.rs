@@ -1261,7 +1261,7 @@ impl CoreStore {
 
         let evidences = {
             let mut statement = transaction.prepare(
-                "SELECT budget_id, account_ref, bridge_instance_id, record_kind, receipt_status,
+                "SELECT evidence_id, budget_id, account_ref, bridge_instance_id, record_kind, receipt_status,
                         actual_microcredits, unit, source_ref, evidence_hash, task_ref,
                         conflict_reason, observed_at_ms, recorded_at_ms
                  FROM budget_receipt_evidence WHERE request_id = ?1 ORDER BY evidence_id",
@@ -1269,22 +1269,21 @@ impl CoreStore {
             let rows = statement.query_map([&reservation.request_id], |row| {
                 Ok((
                     row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<i64>>(5)?, row.get::<_, Option<String>>(6)?,
-                    row.get::<_, String>(7)?, row.get::<_, String>(8)?,
-                    row.get::<_, Option<String>>(9)?, row.get::<_, Option<String>>(10)?,
-                    row.get::<_, i64>(11)?, row.get::<_, i64>(12)?,
+                    row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(6)?, row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?, row.get::<_, String>(9)?,
+                    row.get::<_, Option<String>>(10)?, row.get::<_, Option<String>>(11)?,
+                    row.get::<_, i64>(12)?, row.get::<_, i64>(13)?,
                 ))
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         let mut has_conflict_evidence = false;
         let mut has_settlement_evidence = false;
-        for (budget_id, account_ref, instance_id, record_kind, receipt_status, actual, unit, source_ref, evidence_hash, task_ref, conflict_reason, observed_at, recorded_at) in &evidences {
+        for (evidence_id, budget_id, account_ref, instance_id, record_kind, receipt_status, actual, unit, source_ref, evidence_hash, task_ref, conflict_reason, observed_at, recorded_at) in &evidences {
             if budget_id != &step.budget_id
                 || account_ref != &step.account_ref
                 || instance_id != &step.bridge_instance_id
-                || unit.as_deref() != Some("credits")
                 || source_ref.trim().is_empty()
                 || evidence_hash.trim().is_empty()
                 || *observed_at <= 0
@@ -1292,32 +1291,38 @@ impl CoreStore {
             {
                 return Ok((false, "v2_receipt_evidence_owner_or_fields_mismatch".into()));
             }
-            let Some(status) = receipt_status.as_deref() else {
-                return Ok((false, "v2_receipt_evidence_status_missing".into()));
-            };
-            let actual_candidates = if status == "failed_no_charge" {
-                [None, Some(0)]
-            } else {
-                [*actual, *actual]
-            };
-            let hash_matches = actual_candidates.into_iter().any(|candidate_actual| {
-                URL_SAFE_NO_PAD.encode(crate::canonical_json_hash(&serde_json::json!({
-                    "request_id": reservation.request_id,
-                    "budget_id": budget_id,
-                    "account_ref": account_ref,
-                    "bridge_instance_id": instance_id,
-                    "status": status,
-                    "actual_microcredits": candidate_actual,
-                    "unit": unit,
-                    "source_ref": source_ref,
-                    "task_ref": task_ref,
-                }))) == *evidence_hash
-            });
-            if !hash_matches {
+            if evidence_id != &format!("{}:{evidence_hash}", reservation.request_id) {
                 return Ok((false, "v2_receipt_evidence_hash_mismatch".into()));
             }
             match record_kind.as_str() {
                 "receipt" => {
+                    let Some(status) = receipt_status.as_deref() else {
+                        return Ok((false, "v2_receipt_evidence_status_missing".into()));
+                    };
+                    if unit.as_deref() != Some("credits") || conflict_reason.is_some() {
+                        return Ok((false, "v2_receipt_evidence_shape_mismatch".into()));
+                    }
+                    let actual_candidates = if status == "failed_no_charge" {
+                        [None, Some(0)]
+                    } else {
+                        [*actual, *actual]
+                    };
+                    let hash_matches = actual_candidates.into_iter().any(|candidate_actual| {
+                        URL_SAFE_NO_PAD.encode(crate::canonical_json_hash(&serde_json::json!({
+                            "request_id": reservation.request_id,
+                            "budget_id": budget_id,
+                            "account_ref": account_ref,
+                            "bridge_instance_id": instance_id,
+                            "status": status,
+                            "actual_microcredits": candidate_actual,
+                            "unit": unit,
+                            "source_ref": source_ref,
+                            "task_ref": task_ref,
+                        }))) == *evidence_hash
+                    });
+                    if !hash_matches {
+                        return Ok((false, "v2_receipt_evidence_hash_mismatch".into()));
+                    }
                     if !matches!(status, "final" | "failed_no_charge" | "pending" | "unknown" | "unverified")
                         || (status == "final" && actual.is_none_or(|amount| amount < 0))
                         || (status == "failed_no_charge" && *actual != Some(0))
@@ -1345,11 +1350,47 @@ impl CoreStore {
                     }
                 }
                 "conflict" => {
-                    if conflict_reason.as_deref().is_none_or(str::is_empty)
-                        || actual.is_some_and(|amount| amount < 0)
-                        || (status == "failed_no_charge" && actual.is_some_and(|amount| amount != 0))
-                    {
+                    if conflict_reason.as_deref().is_none_or(str::is_empty) {
                         return Ok((false, "v2_conflict_evidence_shape_mismatch".into()));
+                    }
+                    if receipt_status.is_none() {
+                        // mark_budget_receipt_conflict writes opaque conflict evidence with
+                        // receipt-only fields NULL; its supplied evidence hash is not a receipt hash.
+                        if actual.is_some() || unit.is_some() || task_ref.is_some() {
+                            return Ok((false, "v2_conflict_evidence_shape_mismatch".into()));
+                        }
+                    } else {
+                        // A wrong-task receipt conflict retains the original receipt fields and
+                        // canonical evidence hash, so validate that shape as a receipt would be.
+                        let status = receipt_status.as_deref().expect("status checked above");
+                        if !matches!(status, "final" | "failed_no_charge")
+                            || unit.as_deref() != Some("credits")
+                            || (status == "final" && actual.is_none_or(|amount| amount < 0))
+                            || (status == "failed_no_charge" && actual.is_some_and(|amount| amount != 0))
+                        {
+                            return Ok((false, "v2_conflict_evidence_shape_mismatch".into()));
+                        }
+                        let actual_candidates = if status == "failed_no_charge" {
+                            [None, Some(0)]
+                        } else {
+                            [*actual, *actual]
+                        };
+                        let hash_matches = actual_candidates.into_iter().any(|candidate_actual| {
+                            URL_SAFE_NO_PAD.encode(crate::canonical_json_hash(&serde_json::json!({
+                                "request_id": reservation.request_id,
+                                "budget_id": budget_id,
+                                "account_ref": account_ref,
+                                "bridge_instance_id": instance_id,
+                                "status": status,
+                                "actual_microcredits": candidate_actual,
+                                "unit": unit,
+                                "source_ref": source_ref,
+                                "task_ref": task_ref,
+                            }))) == *evidence_hash
+                        });
+                        if !hash_matches {
+                            return Ok((false, "v2_receipt_evidence_hash_mismatch".into()));
+                        }
                     }
                     has_conflict_evidence = true;
                 }
