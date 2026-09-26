@@ -62,6 +62,12 @@ impl CoreStore {
              WHERE o.state = 'settled'
                AND o.updated_at_ms >= ?1 AND o.updated_at_ms < ?2
                AND (?3 IS NULL OR o.api_key_id = ?3)
+             UNION ALL
+             SELECT s.settled_at_ms, s.actual_microcredits, s.request_id
+             FROM budget_settlements s
+             INNER JOIN budget_steps step ON step.request_id = s.request_id
+             WHERE s.settled_at_ms >= ?1 AND s.settled_at_ms < ?2
+               AND (?3 IS NULL OR step.core_key_id = ?3)
              ORDER BY settled_at_ms ASC, request_id ASC",
         )?;
         let rows = statement.query_map(

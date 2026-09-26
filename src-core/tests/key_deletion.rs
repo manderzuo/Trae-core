@@ -89,9 +89,13 @@ fn v20_to_v21_migration_preserves_keys_and_quota_history_and_is_idempotent() {
             .unwrap();
     }
     connection
-        .execute(
-            "UPDATE schema_meta SET value = '20' WHERE key = 'schema_version'",
-            [],
+        .execute_batch(
+            "DROP TABLE budget_settlements;
+             DROP TABLE budget_receipt_evidence;
+             DROP TABLE budget_steps;
+             DROP TABLE budget_operations;
+             DROP TABLE budget_preparations;
+             UPDATE schema_meta SET value = '20' WHERE key = 'schema_version';",
         )
         .unwrap();
     drop(connection);
@@ -99,7 +103,7 @@ fn v20_to_v21_migration_preserves_keys_and_quota_history_and_is_idempotent() {
     let upgraded = CoreStore::open(&dir.0).unwrap();
     upgraded.migrate().unwrap();
     assert_eq!(upgraded.schema_version().unwrap(), aiwork_core::CURRENT_SCHEMA_VERSION);
-    assert_eq!(aiwork_core::CURRENT_SCHEMA_VERSION, 24);
+    assert_eq!(aiwork_core::CURRENT_SCHEMA_VERSION, 25);
 
     let listed = upgraded
         .list_api_keys_as_admin(&admin, Some(&key.user_id))

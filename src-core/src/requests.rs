@@ -724,7 +724,15 @@ impl CoreStore {
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut statement = transaction.prepare(
-            "SELECT id, request_id, account_ref, resource_kind, predicted_units, observation_id, state, lease_expires_at_ms, reconcile_until_ms, upstream_request_ref, error_kind, created_at_ms, updated_at_ms, settled_at_ms FROM upstream_leases WHERE state IN ('held', 'active') AND lease_expires_at_ms <= ?1 ORDER BY created_at_ms, id",
+            "SELECT lease.id, lease.request_id, lease.account_ref, lease.resource_kind,
+                    lease.predicted_units, lease.observation_id, lease.state, lease.lease_expires_at_ms,
+                    lease.reconcile_until_ms, lease.upstream_request_ref, lease.error_kind,
+                    lease.created_at_ms, lease.updated_at_ms, lease.settled_at_ms
+             FROM upstream_leases lease
+             WHERE lease.state IN ('held', 'active') AND lease.lease_expires_at_ms <= ?1
+               AND NOT EXISTS(SELECT 1 FROM budget_steps step WHERE step.request_id = lease.request_id)
+               AND NOT EXISTS(SELECT 1 FROM budget_operations operation WHERE operation.parent_request_id = lease.request_id)
+             ORDER BY lease.created_at_ms, lease.id",
         )?;
         let expired = statement.query_map([now_ms], Self::upstream_lease_from_row)?.collect::<Result<Vec<_>, _>>()?;
         drop(statement);
@@ -762,7 +770,15 @@ impl CoreStore {
                 serde_json::json!({"request_id": lease.request_id, "lease_id": lease.id, "reason": "lease_expired"}), now_ms)?;
         }
         let mut statement = transaction.prepare(
-            "SELECT id, request_id, account_ref, resource_kind, predicted_units, observation_id, state, lease_expires_at_ms, reconcile_until_ms, upstream_request_ref, error_kind, created_at_ms, updated_at_ms, settled_at_ms FROM upstream_leases WHERE state IN ('held', 'active', 'unknown') ORDER BY created_at_ms, id",
+            "SELECT lease.id, lease.request_id, lease.account_ref, lease.resource_kind,
+                    lease.predicted_units, lease.observation_id, lease.state, lease.lease_expires_at_ms,
+                    lease.reconcile_until_ms, lease.upstream_request_ref, lease.error_kind,
+                    lease.created_at_ms, lease.updated_at_ms, lease.settled_at_ms
+             FROM upstream_leases lease
+             WHERE lease.state IN ('held', 'active', 'unknown')
+               AND NOT EXISTS(SELECT 1 FROM budget_steps step WHERE step.request_id = lease.request_id)
+               AND NOT EXISTS(SELECT 1 FROM budget_operations operation WHERE operation.parent_request_id = lease.request_id)
+             ORDER BY lease.created_at_ms, lease.id",
         )?;
         let recoverable = statement.query_map([], Self::upstream_lease_from_row)?.collect::<Result<Vec<_>, _>>()?;
         drop(statement);
@@ -854,14 +870,14 @@ impl CoreStore {
     }
 
     pub fn begin_request(&self, input: BeginRequestInput) -> Result<BeginRequest, CoreError> {
-        self.begin_request_internal(input, true, false, None)
+        self.begin_request_internal(input, true, false, None, false)
     }
 
     /// Creates an authenticated, Core-numbered request before an upstream
     /// quote is available. Callers must be behind the normal API-key auth
     /// boundary; paid dispatch still requires `reserve_credit_quote`.
     pub fn begin_billed_request(&self, input: BeginRequestInput) -> Result<BeginRequest, CoreError> {
-        self.begin_request_internal(input, false, false, None)
+        self.begin_request_internal(input, false, false, None, false)
     }
 
     /// Atomically creates and relates an internal Seedance helper request to
@@ -877,7 +893,7 @@ impl CoreStore {
                 value: "must not be empty".into(),
             });
         }
-        self.begin_request_internal(input, false, false, Some(parent_request_id))
+        self.begin_request_internal(input, false, false, Some(parent_request_id), false)
     }
 
     /// Coalesce headerless video retries for the same Key and canonical body.
@@ -894,7 +910,7 @@ impl CoreStore {
             });
         }
         input.idempotency_key = format!("core-implicit:{}", Self::new_id("retry"));
-        self.begin_request_internal(input, false, true, None)
+        self.begin_request_internal(input, false, true, None, false)
     }
 
     /// Link a separately billed internal child call to its client-visible
@@ -1186,13 +1202,25 @@ impl CoreStore {
         Ok(candidates.len())
     }
 
-    fn begin_request_internal(
+    pub(crate) fn begin_request_internal(
         &self,
         input: BeginRequestInput,
         require_local_cost_policy: bool,
         coalesce_implicit_video_retry: bool,
         assist_parent_request_id: Option<&str>,
+        budget_preparation: bool,
     ) -> Result<BeginRequest, CoreError> {
+        if budget_preparation && assist_parent_request_id.is_none() {
+            return Err(CoreError::InvalidConfiguration {
+                key: "budget_preparations.parent_request_id".into(),
+                value: "required".into(),
+            });
+        }
+        if budget_preparation && input.endpoint != "chat" {
+            return Err(CoreError::BillingQuoteMismatch {
+                request_id: assist_parent_request_id.unwrap_or_default().into(),
+            });
+        }
         let request_hash = request_hash(&input.endpoint, &input.model, &input.body);
         let scope = format!("{}:{}:{}", input.user_id, input.api_key_id, input.endpoint);
         let now = Utc::now().timestamp_millis();
@@ -1239,23 +1267,54 @@ impl CoreStore {
             .optional()?
         {
             let handle = Self::request_handle_in_transaction(&transaction, &request_id)?;
-            return if stored_hash == request_hash {
-                Ok(BeginRequest::Existing(handle))
-            } else {
-                Ok(BeginRequest::Conflict)
-            };
+            if stored_hash == request_hash {
+                if budget_preparation {
+                    let parent_request_id = assist_parent_request_id.expect("validated above");
+                    let parent = transaction
+                        .query_row(
+                            "SELECT user_id, api_key_id, endpoint FROM requests WHERE id = ?1",
+                            [parent_request_id],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+                        )
+                        .optional()?
+                        .ok_or_else(|| CoreError::RequestNotFound {
+                            request_id: parent_request_id.into(),
+                        })?;
+                    if parent.0 != input.user_id || parent.1 != input.api_key_id {
+                        return Err(CoreError::InvalidRequestIdentity {
+                            user_id: parent.0,
+                            api_key_id: input.api_key_id.clone(),
+                        });
+                    }
+                    let relation_matches: bool = transaction.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM request_relations
+                                  WHERE parent_request_id = ?1 AND child_request_id = ?2
+                                    AND relationship_kind = 'seedance_assist')
+                                 AND EXISTS(SELECT 1 FROM budget_preparations
+                                  WHERE parent_request_id = ?1 AND child_request_id = ?2)",
+                                params![parent_request_id, &request_id],
+                                |row| row.get::<_, bool>(0),
+                            )?;
+                    if parent.2 != "videos" || handle.endpoint != "chat" || !relation_matches {
+                        return Err(CoreError::IdempotencyConflict);
+                    }
+                }
+                return Ok(BeginRequest::Existing(handle));
+            }
+            return Ok(BeginRequest::Conflict);
         }
 
         if let Some(parent_request_id) = assist_parent_request_id {
             let parent = transaction
                 .query_row(
-                    "SELECT user_id, api_key_id, state FROM requests WHERE id = ?1",
+                    "SELECT user_id, api_key_id, state, endpoint FROM requests WHERE id = ?1",
                     [parent_request_id],
                     |row| {
                         Ok((
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
                         ))
                     },
                 )
@@ -1275,12 +1334,39 @@ impl CoreStore {
                     value: parent.2.clone(),
                 }
             })?;
-            if parent_state != RequestState::Reserved {
+            let required_parent_state = if budget_preparation {
+                RequestState::Received
+            } else {
+                RequestState::Reserved
+            };
+            if parent_state != required_parent_state {
                 return Err(CoreError::InvalidTransition {
                     request_id: parent_request_id.into(),
                     expected: parent_state,
-                    next: RequestState::Reserved,
+                    next: required_parent_state,
                 });
+            }
+            if budget_preparation {
+                if parent.3 != "videos" {
+                    return Err(CoreError::BillingQuoteMismatch {
+                        request_id: parent_request_id.into(),
+                    });
+                }
+                let financial_overlap: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM billing_quotes WHERE request_id = ?1)
+                     OR EXISTS(SELECT 1 FROM quota_reservations WHERE request_id = ?1)
+                     OR EXISTS(SELECT 1 FROM controlled_billing_operations WHERE parent_request_id = ?1)
+                     OR EXISTS(SELECT 1 FROM controlled_billing_steps step
+                       JOIN controlled_billing_operations operation USING(operation_id)
+                       WHERE operation.parent_request_id = ?1 OR step.request_id = ?1)
+                     OR EXISTS(SELECT 1 FROM budget_operations WHERE parent_request_id = ?1)
+                     OR EXISTS(SELECT 1 FROM budget_preparations WHERE parent_request_id = ?1)",
+                    [parent_request_id],
+                    |row| row.get(0),
+                )?;
+                if financial_overlap {
+                    return Err(CoreError::IdempotencyConflict);
+                }
             }
             let existing_child = transaction
                 .query_row(
@@ -1326,6 +1412,14 @@ impl CoreStore {
                  VALUES (?1, ?2, 'seedance_assist', ?3)",
                 params![parent_request_id, request_id, now],
             )?;
+            if budget_preparation {
+                transaction.execute(
+                    "INSERT INTO budget_preparations
+                     (parent_request_id, child_request_id, state, created_at_ms, updated_at_ms)
+                     VALUES (?1, ?2, 'open', ?3, ?3)",
+                    params![parent_request_id, request_id, now],
+                )?;
+            }
         }
         let handle = Self::request_handle_in_transaction(&transaction, &request_id)?;
         transaction.commit()?;
@@ -1426,12 +1520,10 @@ impl CoreStore {
             };
         }
 
-        let active_concurrency: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM requests
-             WHERE api_key_id = ?1
-               AND state IN ('received','validating','reserved','queued','dispatched','completing','unknown')",
-            [&input.request.api_key_id],
-            |row| row.get(0),
+        let active_concurrency = Self::active_execution_count_in_connection(
+            &transaction,
+            &input.request.api_key_id,
+            None,
         )?;
         if active_concurrency >= max_concurrency {
             return Err(CoreError::KeyConcurrencyExceeded {

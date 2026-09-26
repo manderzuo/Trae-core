@@ -21,6 +21,11 @@ fn prepare_v17_database(label: &str) -> (CoreStore, PathBuf) {
         .execute_batch(
             "ALTER TABLE api_keys DROP COLUMN secret_key_version;
              ALTER TABLE api_keys DROP COLUMN secret_ciphertext;
+             DROP TABLE budget_settlements;
+             DROP TABLE budget_receipt_evidence;
+             DROP TABLE budget_steps;
+             DROP TABLE budget_operations;
+             DROP TABLE budget_preparations;
              UPDATE schema_meta SET value = '17' WHERE key = 'schema_version';
              INSERT INTO users (id, name, role, status, created_at_ms, updated_at_ms)
                VALUES ('credit-user', 'Credit User', 'user', 'active', 1, 1);

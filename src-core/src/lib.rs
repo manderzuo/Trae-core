@@ -1,4 +1,5 @@
 mod cost;
+mod budget_billing;
 mod credits;
 mod controlled_billing;
 mod admin_summary;
@@ -17,6 +18,11 @@ mod usage_trend;
 mod video_billing;
 
 pub use cost::{CostError, CostEstimate, CostPolicy};
+pub use budget_billing::{
+    BudgetAuthorization, BudgetExecutionState, BudgetFinancialState, BudgetMutation,
+    BudgetOperationView, BudgetReceiptConflict, BudgetReceiptInput, BudgetReceiptResult,
+    BudgetStepInput, BudgetStepKind, BudgetStepRecoveryView, BudgetStepView,
+};
 pub use credits::CreditAmount;
 pub use controlled_billing::{ControlledOperation, ControlledRecoverableStep, ControlledSettlement, ControlledStepKind, ControlledStepResult};
 pub use error::CoreError;

@@ -39,6 +39,11 @@ fn v19_migration_adds_encrypted_api_key_storage_columns() {
         .execute_batch(
             "ALTER TABLE api_keys DROP COLUMN secret_key_version;
              ALTER TABLE api_keys DROP COLUMN secret_ciphertext;
+             DROP TABLE budget_settlements;
+             DROP TABLE budget_receipt_evidence;
+             DROP TABLE budget_steps;
+             DROP TABLE budget_operations;
+             DROP TABLE budget_preparations;
              UPDATE schema_meta SET value = '19' WHERE key = 'schema_version';",
         )
         .unwrap();

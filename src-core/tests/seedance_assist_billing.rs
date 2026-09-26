@@ -185,7 +185,12 @@ fn schema_v21_upgrades_request_relations_without_losing_existing_data() {
     let database = dir.join("data").join(aiwork_core::CORE_DB_FILE);
     let connection = Connection::open(&database).unwrap();
     connection.execute_batch(
-        "DROP TABLE request_relations;
+        "DROP TABLE budget_settlements;
+         DROP TABLE budget_receipt_evidence;
+         DROP TABLE budget_steps;
+         DROP TABLE budget_operations;
+         DROP TABLE budget_preparations;
+         DROP TABLE request_relations;
          UPDATE schema_meta SET value = '21' WHERE key = 'schema_version';",
     ).unwrap();
     drop(connection);

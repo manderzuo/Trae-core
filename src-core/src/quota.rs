@@ -23,6 +23,49 @@ struct BudgetAccountRecord {
     migration_state: QuotaMigrationState,
 }
 
+struct BudgetEventGroupStep {
+    kind: String,
+    budget_id: String,
+    core_key_id: String,
+    request_fingerprint: String,
+    endpoint: String,
+    model: String,
+    account_ref: String,
+    bridge_instance_id: String,
+    profile_fingerprint: String,
+    policy_version: String,
+    authorization_hash: Vec<u8>,
+    hold_microcredits: i64,
+    expires_at_ms: i64,
+    dispatch_attempted: i64,
+    financial_state: String,
+    actual_microcredits: Option<i64>,
+    task_ref: Option<String>,
+    release_reason: Option<String>,
+    reservation_id: String,
+    parent_request_id: String,
+    operation_key_id: String,
+    request_user_id: String,
+    request_key_id: String,
+    request_endpoint: String,
+    request_model: String,
+    request_hash: Vec<u8>,
+    parent_user_id: String,
+    parent_key_id: String,
+}
+
+struct BudgetLedgerEvent {
+    account_id: Option<String>,
+    event_kind: String,
+    amount: i64,
+    delta: i64,
+    request_id: Option<String>,
+    user_id: String,
+    resource_kind: String,
+    api_key_id: Option<String>,
+    budget_version: Option<i64>,
+}
+
 impl CoreStore {
     /// Return a bounded, owner-checked quota projection for a user.
     ///
@@ -777,6 +820,16 @@ impl CoreStore {
         if event_group_id.is_empty() {
             return Ok((false, "empty_event_group_id".into()));
         }
+        let is_v2: bool = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM budget_steps WHERE reservation_id = ?1 AND request_id = ?2
+             )",
+            params![&reservation.id, &reservation.request_id],
+            |row| row.get(0),
+        )?;
+        if is_v2 {
+            return Self::validate_v2_quota_event_group(transaction, reservation, event_group_id);
+        }
         let Some(key_account_id) = reservation.key_budget_account_id.as_deref() else {
             return Ok((false, "missing_key_budget_account_id".into()));
         };
@@ -835,7 +888,7 @@ impl CoreStore {
             ReservationState::Committed => Some("commit"),
             ReservationState::Unknown => None,
         };
-        let expected_event_count = account_ids.len() * usize::from(final_kind.is_some() || reservation.state == ReservationState::Unknown);
+        let expected_event_count = account_ids.len() * (1 + usize::from(final_kind.is_some()));
         if reservation.state == ReservationState::Held && events.len() != account_ids.len() {
             return Ok((false, "reserve_event_count_mismatch".into()));
         }
@@ -891,6 +944,423 @@ impl CoreStore {
                     return Ok((false, "settlement_event_missing_or_duplicate".into()));
                 }
             }
+        }
+        Ok((true, String::new()))
+    }
+
+    fn validate_v2_quota_event_group(
+        transaction: &Transaction<'_>,
+        reservation: &Reservation,
+        event_group_id: &str,
+    ) -> Result<(bool, String), CoreError> {
+        let step = transaction
+            .query_row(
+                "SELECT step.kind, step.budget_id, step.core_key_id,
+                        step.request_fingerprint, step.endpoint, step.model,
+                        step.account_ref, step.bridge_instance_id, step.profile_fingerprint,
+                        step.policy_version, step.authorization_hash, step.hold_microcredits,
+                        step.expires_at_ms, step.dispatch_attempted, step.financial_state, step.actual_microcredits,
+                        step.task_ref, step.release_reason, step.reservation_id,
+                        operation.parent_request_id, operation.api_key_id,
+                        request.user_id, request.api_key_id, request.endpoint, request.model,
+                        request.request_hash, parent.user_id, parent.api_key_id
+                 FROM budget_steps step
+                 JOIN budget_operations operation ON operation.operation_id = step.operation_id
+                 JOIN requests request ON request.id = step.request_id
+                 JOIN requests parent ON parent.id = operation.parent_request_id
+                 WHERE step.reservation_id = ?1 AND step.request_id = ?2",
+                params![&reservation.id, &reservation.request_id],
+                |row| {
+                    Ok(BudgetEventGroupStep {
+                        kind: row.get(0)?,
+                        budget_id: row.get(1)?,
+                        core_key_id: row.get(2)?,
+                        request_fingerprint: row.get(3)?,
+                        endpoint: row.get(4)?,
+                        model: row.get(5)?,
+                        account_ref: row.get(6)?,
+                        bridge_instance_id: row.get(7)?,
+                        profile_fingerprint: row.get(8)?,
+                        policy_version: row.get(9)?,
+                        authorization_hash: row.get(10)?,
+                        hold_microcredits: row.get(11)?,
+                        expires_at_ms: row.get(12)?,
+                        dispatch_attempted: row.get(13)?,
+                        financial_state: row.get(14)?,
+                        actual_microcredits: row.get(15)?,
+                        task_ref: row.get(16)?,
+                        release_reason: row.get(17)?,
+                        reservation_id: row.get(18)?,
+                        parent_request_id: row.get(19)?,
+                        operation_key_id: row.get(20)?,
+                        request_user_id: row.get(21)?,
+                        request_key_id: row.get(22)?,
+                        request_endpoint: row.get(23)?,
+                        request_model: row.get(24)?,
+                        request_hash: row.get(25)?,
+                        parent_user_id: row.get(26)?,
+                        parent_key_id: row.get(27)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(step) = step else {
+            return Ok((false, "v2_step_or_request_missing".into()));
+        };
+        let Some(key_account_id) = reservation.key_budget_account_id.as_deref() else {
+            return Ok((false, "missing_key_budget_account_id".into()));
+        };
+        if step.reservation_id != reservation.id
+            || step.hold_microcredits != reservation.amount
+            || reservation.request_id.is_empty()
+            || reservation.resource_kind != "credits"
+            || reservation.user_id != step.request_user_id
+            || reservation.api_key_id.as_deref() != Some(step.core_key_id.as_str())
+            || step.operation_key_id != step.core_key_id
+            || step.request_key_id != step.core_key_id
+            || step.parent_key_id != step.core_key_id
+            || step.parent_user_id != step.request_user_id
+            || step.endpoint != step.request_endpoint
+            || step.model != step.request_model
+            || URL_SAFE_NO_PAD.encode(&step.request_hash) != step.request_fingerprint
+        {
+            return Ok((false, "v2_step_request_or_reservation_owner_mismatch".into()));
+        }
+        let Some(hold_credits) = CreditAmount::try_from_microcredits(step.hold_microcredits) else {
+            return Ok((false, "v2_step_hold_invalid".into()));
+        };
+        let expected_authorization_hash = crate::canonical_json_hash(&serde_json::to_value(
+            crate::BudgetAuthorization {
+                budget_id: step.budget_id.clone(),
+                parent_request_id: step.parent_request_id.clone(),
+                request_id: reservation.request_id.clone(),
+                core_key_id: step.core_key_id.clone(),
+                request_fingerprint: step.request_fingerprint.clone(),
+                endpoint: step.endpoint.clone(),
+                model: step.model.clone(),
+                account_ref: step.account_ref.clone(),
+                bridge_instance_id: step.bridge_instance_id.clone(),
+                profile_fingerprint: step.profile_fingerprint.clone(),
+                policy_version: step.policy_version.clone(),
+                hold_credits,
+                expires_at_ms: step.expires_at_ms,
+            },
+        )?);
+        if expected_authorization_hash.as_slice() != step.authorization_hash.as_slice() {
+            return Ok((false, "v2_authorization_hash_mismatch".into()));
+        }
+        match step.kind.as_str() {
+            "assist" => {
+                let admitted_child: Option<String> = transaction
+                    .query_row(
+                        "SELECT child_request_id FROM budget_preparations
+                         WHERE parent_request_id = ?1 AND state = 'admitted'",
+                        [&step.parent_request_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if admitted_child.as_deref() != Some(reservation.request_id.as_str()) {
+                    return Ok((false, "v2_assist_parent_child_mismatch".into()));
+                }
+            }
+            "video" | "chat" if step.parent_request_id == reservation.request_id => {}
+            _ => return Ok((false, "v2_step_kind_parent_mismatch".into())),
+        }
+
+        let mut account_ids = vec![key_account_id.to_owned()];
+        if let Some(user_account_id) = reservation.user_cap_account_id.as_deref() {
+            if user_account_id == key_account_id {
+                return Ok((false, "duplicate_budget_account_id".into()));
+            }
+            account_ids.push(user_account_id.to_owned());
+        }
+        let mut account_versions = Vec::with_capacity(account_ids.len());
+        for (index, account_id) in account_ids.iter().enumerate() {
+            let account = transaction
+                .query_row(
+                    "SELECT scope, user_id, api_key_id, resource_kind, version
+                     FROM quota_budget_accounts WHERE id = ?1",
+                    [account_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((scope, user_id, api_key_id, resource_kind, version)) = account else {
+                return Ok((false, format!("missing_budget_account:{account_id}")));
+            };
+            let expected_scope = if index == 0 { "key" } else { "user_cap" };
+            let expected_key = (index == 0).then_some(step.core_key_id.as_str());
+            if scope != expected_scope
+                || user_id != reservation.user_id
+                || api_key_id.as_deref() != expected_key
+                || resource_kind != "credits"
+                || version <= 0
+            {
+                return Ok((false, format!("v2_budget_account_owner_mismatch:{account_id}")));
+            }
+            account_versions.push(version);
+        }
+
+        let final_kind = match (reservation.state, step.financial_state.as_str()) {
+            (ReservationState::Held, "held" | "conflict")
+            | (ReservationState::Unknown, "unknown" | "conflict") => None,
+            (ReservationState::Released, "released") => Some("release"),
+            (ReservationState::Committed, "settled" | "conflict") => Some("commit"),
+            _ => return Ok((false, "v2_reservation_financial_state_mismatch".into())),
+        };
+        if matches!(reservation.state, ReservationState::Held | ReservationState::Unknown)
+            && step.actual_microcredits.is_some()
+        {
+            return Ok((false, "v2_unsettled_step_has_actual_amount".into()));
+        }
+        if reservation.state == ReservationState::Released
+            && (step.dispatch_attempted != 0
+                || step.actual_microcredits.is_some()
+                || step.release_reason.as_deref().is_none_or(str::is_empty))
+        {
+            return Ok((false, "v2_release_state_invalid".into()));
+        }
+        if reservation.state == ReservationState::Committed
+            && (step.dispatch_attempted != 1 || step.actual_microcredits.is_none_or(|actual| actual < 0))
+        {
+            return Ok((false, "v2_settlement_state_invalid".into()));
+        }
+
+        let events = {
+            let mut statement = transaction.prepare(
+                "SELECT budget_account_id, event_kind, amount, delta, request_id,
+                        user_id, resource_kind, api_key_id, budget_version
+                 FROM quota_ledger WHERE event_group_id = ?1 ORDER BY entry_id",
+            )?;
+            let rows = statement.query_map([event_group_id], |row| {
+                Ok(BudgetLedgerEvent {
+                    account_id: row.get(0)?,
+                    event_kind: row.get(1)?,
+                    amount: row.get(2)?,
+                    delta: row.get(3)?,
+                    request_id: row.get(4)?,
+                    user_id: row.get(5)?,
+                    resource_kind: row.get(6)?,
+                    api_key_id: row.get(7)?,
+                    budget_version: row.get(8)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let expected_event_count = account_ids.len() * (1 + usize::from(final_kind.is_some()));
+        if events.len() != expected_event_count {
+            return Ok((false, "v2_ledger_event_count_mismatch".into()));
+        }
+        let mut reserve_versions = vec![None; account_ids.len()];
+        let mut final_versions = vec![None; account_ids.len()];
+        for event in &events {
+            let Some(event_account_id) = event.account_id.as_deref() else {
+                return Ok((false, "ledger_event_missing_budget_account".into()));
+            };
+            let Some(account_index) = account_ids.iter().position(|id| id == event_account_id) else {
+                return Ok((false, "ledger_event_has_unexpected_budget_account".into()));
+            };
+            let Some(event_version) = event.budget_version else {
+                return Ok((false, "v2_ledger_event_missing_budget_version".into()));
+            };
+            if event.request_id.as_deref() != Some(reservation.request_id.as_str())
+                || event.user_id != reservation.user_id
+                || event.resource_kind != "credits"
+                || event.api_key_id.as_deref() != reservation.api_key_id.as_deref()
+                || event_version <= 0
+                || event_version > account_versions[account_index]
+            {
+                return Ok((false, "v2_ledger_event_owner_or_version_mismatch".into()));
+            }
+            match event.event_kind.as_str() {
+                "reserve" if event.amount == reservation.amount && event.delta == -reservation.amount => {
+                    if reserve_versions[account_index].replace(event_version).is_some() {
+                        return Ok((false, "reserve_event_missing_or_duplicate".into()));
+                    }
+                }
+                "release"
+                    if final_kind == Some("release")
+                        && event.amount == reservation.amount
+                        && event.delta == reservation.amount =>
+                {
+                    if final_versions[account_index].replace(event_version).is_some() {
+                        return Ok((false, "settlement_event_missing_or_duplicate".into()));
+                    }
+                }
+                "commit"
+                    if final_kind == Some("commit")
+                        && Some(event.amount) == step.actual_microcredits
+                        && step.hold_microcredits.checked_sub(event.amount) == Some(event.delta) =>
+                {
+                    if final_versions[account_index].replace(event_version).is_some() {
+                        return Ok((false, "settlement_event_missing_or_duplicate".into()));
+                    }
+                }
+                _ => return Ok((false, "v2_ledger_event_shape_mismatch".into())),
+            }
+        }
+        for index in 0..account_ids.len() {
+            let Some(reserve_version) = reserve_versions[index] else {
+                return Ok((false, "reserve_event_missing_or_duplicate".into()));
+            };
+            if final_kind.is_some() {
+                let Some(final_version) = final_versions[index] else {
+                    return Ok((false, "settlement_event_missing_or_duplicate".into()));
+                };
+                if final_version < reserve_version {
+                    return Ok((false, "v2_ledger_event_version_order_mismatch".into()));
+                }
+            }
+        }
+
+        let settlement: Option<(String, String, String, String, String, String, String, Option<String>, i64, i64, i64, i64, i64)> = transaction
+            .query_row(
+                "SELECT request_id, reservation_id, budget_id, account_ref, bridge_instance_id,
+                        source_ref, evidence_hash, task_ref, hold_microcredits, actual_microcredits,
+                        released_microcredits, debt, settled_at_ms
+                 FROM budget_settlements WHERE request_id = ?1",
+                [&reservation.request_id],
+                |row| {
+                    Ok((
+                        row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                        row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
+                        row.get(10)?, row.get(11)?, row.get(12)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if reservation.state == ReservationState::Committed {
+            let Some((request_id, reservation_id, budget_id, account_ref, instance_id, source_ref, evidence_hash, _settled_task_ref, hold, actual, released, debt, settled_at)) = settlement.as_ref() else {
+                return Ok((false, "v2_settlement_record_missing".into()));
+            };
+            if request_id != &reservation.request_id
+                || reservation_id != &reservation.id
+                || budget_id != &step.budget_id
+                || account_ref != &step.account_ref
+                || instance_id != &step.bridge_instance_id
+                || source_ref.trim().is_empty()
+                || evidence_hash.trim().is_empty()
+                || *hold != step.hold_microcredits
+                || Some(*actual) != step.actual_microcredits
+                || step.hold_microcredits.checked_sub(*actual) != Some(*released)
+                || !matches!(*debt, 0 | 1)
+                || *settled_at <= 0
+            {
+                return Ok((false, "v2_settlement_record_mismatch".into()));
+            }
+        } else if settlement.is_some() {
+            return Ok((false, "v2_uncommitted_reservation_has_settlement".into()));
+        }
+
+        let evidences = {
+            let mut statement = transaction.prepare(
+                "SELECT budget_id, account_ref, bridge_instance_id, record_kind, receipt_status,
+                        actual_microcredits, unit, source_ref, evidence_hash, task_ref,
+                        conflict_reason, observed_at_ms, recorded_at_ms
+                 FROM budget_receipt_evidence WHERE request_id = ?1 ORDER BY evidence_id",
+            )?;
+            let rows = statement.query_map([&reservation.request_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?, row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?, row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?, row.get::<_, Option<String>>(10)?,
+                    row.get::<_, i64>(11)?, row.get::<_, i64>(12)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut has_conflict_evidence = false;
+        let mut has_settlement_evidence = false;
+        for (budget_id, account_ref, instance_id, record_kind, receipt_status, actual, unit, source_ref, evidence_hash, task_ref, conflict_reason, observed_at, recorded_at) in &evidences {
+            if budget_id != &step.budget_id
+                || account_ref != &step.account_ref
+                || instance_id != &step.bridge_instance_id
+                || unit.as_deref() != Some("credits")
+                || source_ref.trim().is_empty()
+                || evidence_hash.trim().is_empty()
+                || *observed_at <= 0
+                || *recorded_at <= 0
+            {
+                return Ok((false, "v2_receipt_evidence_owner_or_fields_mismatch".into()));
+            }
+            let Some(status) = receipt_status.as_deref() else {
+                return Ok((false, "v2_receipt_evidence_status_missing".into()));
+            };
+            let actual_candidates = if status == "failed_no_charge" {
+                [None, Some(0)]
+            } else {
+                [*actual, *actual]
+            };
+            let hash_matches = actual_candidates.into_iter().any(|candidate_actual| {
+                URL_SAFE_NO_PAD.encode(crate::canonical_json_hash(&serde_json::json!({
+                    "request_id": reservation.request_id,
+                    "budget_id": budget_id,
+                    "account_ref": account_ref,
+                    "bridge_instance_id": instance_id,
+                    "status": status,
+                    "actual_microcredits": candidate_actual,
+                    "unit": unit,
+                    "source_ref": source_ref,
+                    "task_ref": task_ref,
+                }))) == *evidence_hash
+            });
+            if !hash_matches {
+                return Ok((false, "v2_receipt_evidence_hash_mismatch".into()));
+            }
+            match record_kind.as_str() {
+                "receipt" => {
+                    if !matches!(status, "final" | "failed_no_charge" | "pending" | "unknown" | "unverified")
+                        || (status == "final" && actual.is_none_or(|amount| amount < 0))
+                        || (status == "failed_no_charge" && *actual != Some(0))
+                        || (status != "final" && status != "failed_no_charge" && actual.is_some_and(|amount| amount < 0))
+                    {
+                        return Ok((false, "v2_receipt_evidence_shape_mismatch".into()));
+                    }
+                    if let Some((_, _, _, _, _, source, hash, settled_task, _, settled_actual, _, _, _)) = settlement.as_ref() {
+                        if hash == evidence_hash {
+                            if source != source_ref
+                                || settled_task != task_ref
+                                || *settled_actual != actual.unwrap_or(0)
+                                || !matches!(status, "final" | "failed_no_charge")
+                            {
+                                return Ok((false, "v2_settlement_receipt_evidence_mismatch".into()));
+                            }
+                            if step.kind == "video"
+                                && ((status == "final" && (step.task_ref.is_none() || task_ref != &step.task_ref))
+                                    || (status == "failed_no_charge" && (step.task_ref.is_some() || task_ref.is_some())))
+                            {
+                                return Ok((false, "v2_video_settlement_task_mismatch".into()));
+                            }
+                            has_settlement_evidence = true;
+                        }
+                    }
+                }
+                "conflict" => {
+                    if conflict_reason.as_deref().is_none_or(str::is_empty)
+                        || actual.is_some_and(|amount| amount < 0)
+                        || (status == "failed_no_charge" && actual.is_some_and(|amount| amount != 0))
+                    {
+                        return Ok((false, "v2_conflict_evidence_shape_mismatch".into()));
+                    }
+                    has_conflict_evidence = true;
+                }
+                _ => return Ok((false, "v2_receipt_evidence_kind_mismatch".into())),
+            }
+        }
+        if (step.financial_state == "conflict") != has_conflict_evidence {
+            return Ok((false, "v2_conflict_evidence_state_mismatch".into()));
+        }
+        if reservation.state == ReservationState::Committed && !has_settlement_evidence {
+            return Ok((false, "v2_settlement_receipt_evidence_missing".into()));
         }
         Ok((true, String::new()))
     }
@@ -1423,6 +1893,25 @@ impl CoreStore {
         Ok(())
     }
 
+    pub(crate) fn ensure_budget_account_ready_in_transaction(
+        transaction: &Transaction<'_>,
+        account_id: &str,
+    ) -> Result<(), CoreError> {
+        let account = transaction
+            .query_row(
+                "SELECT id, scope, user_id, api_key_id, resource_kind, enabled, version, migration_state
+                 FROM quota_budget_accounts WHERE id = ?1",
+                [account_id],
+                Self::budget_account_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::InvalidConfiguration {
+                key: "quota_budget_accounts.id".into(),
+                value: account_id.into(),
+            })?;
+        Self::ensure_ready_budget_account(&account)
+    }
+
     fn ensure_ready_or_legacy_account(account: &BudgetAccountRecord) -> Result<(), CoreError> {
         if account.version <= 0 {
             return Err(CoreError::InvalidConfiguration {
@@ -1795,7 +2284,7 @@ impl CoreStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let request = transaction
             .query_row(
-                "SELECT user_id, api_key_id, endpoint, model, request_hash, state, created_at_ms
+                "SELECT user_id, api_key_id, endpoint, model, request_hash, state
                  FROM requests WHERE id = ?1",
                 [&quote.request_id],
                 |row| {
@@ -1806,7 +2295,6 @@ impl CoreStore {
                         row.get::<_, String>(3)?,
                         row.get::<_, Vec<u8>>(4)?,
                         row.get::<_, String>(5)?,
-                        row.get::<_, i64>(6)?,
                     ))
                 },
             )
@@ -1915,33 +2403,11 @@ impl CoreStore {
             });
         }
 
-        let is_seedance_assist_child: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM request_relations
-             WHERE child_request_id = ?1 AND relationship_kind = 'seedance_assist')",
-            [&quote.request_id],
-            |row| row.get(0),
+        let active_concurrency = Self::active_execution_count_for_budget_admission_in_connection(
+            &transaction,
+            &request.1,
+            &quote.request_id,
         )?;
-        let active_concurrency: i64 = if is_seedance_assist_child {
-            0
-        } else {
-            transaction.query_row(
-                "SELECT COUNT(*) FROM requests active
-                 WHERE active.api_key_id = ?1 AND active.id <> ?2
-                   AND active.state IN ('received','validating','reserved','queued','dispatched','completing','unknown')
-                   AND NOT EXISTS (
-                     SELECT 1 FROM request_relations relation
-                     WHERE relation.child_request_id = active.id
-                       AND relation.relationship_kind = 'seedance_assist'
-                   )
-                   AND (
-                     active.state <> 'received'
-                     OR active.created_at_ms < ?3
-                     OR (active.created_at_ms = ?3 AND active.id < ?2)
-                   )",
-                params![&request.1, &quote.request_id, request.6],
-                |row| row.get(0),
-            )?
-        };
         if active_concurrency >= active_key {
             return Err(CoreError::KeyConcurrencyExceeded {
                 api_key_id: request.1,
@@ -2428,6 +2894,7 @@ impl CoreStore {
         Self::validate_reservation_owner(&transaction, &reservation, principal)?;
 
         if reservation.state != ReservationState::Held {
+            Self::reject_v2_reservation_settlement(&transaction, &reservation)?;
             if reservation.key_budget_account_id.is_some() {
                 Self::validate_dual_settlement_replay(&transaction, &reservation, &settlement)?;
             }
@@ -2739,11 +3206,27 @@ impl CoreStore {
         settlement: Settlement,
         now: i64,
     ) -> Result<(), CoreError> {
+        Self::reject_v2_reservation_settlement(transaction, reservation)?;
         if reservation.key_budget_account_id.is_some() {
             Self::apply_dual_settlement(transaction, reservation, settlement, now)
         } else {
             Self::apply_settlement(transaction, reservation, settlement, now)
         }
+    }
+
+    fn reject_v2_reservation_settlement(
+        connection: &rusqlite::Connection,
+        reservation: &Reservation,
+    ) -> Result<(), CoreError> {
+        let is_v2_owned: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM budget_steps WHERE reservation_id = ?1)",
+            [&reservation.id],
+            |row| row.get(0),
+        )?;
+        if is_v2_owned {
+            return Err(CoreError::IdempotencyConflict);
+        }
+        Ok(())
     }
 
     fn apply_dual_settlement(

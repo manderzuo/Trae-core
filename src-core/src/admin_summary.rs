@@ -66,26 +66,31 @@ impl CoreStore {
         )?;
         let verified_spent = connection.query_row(
             "SELECT
-               (SELECT COALESCE(SUM(s.actual_credits), 0)
+             (SELECT COALESCE(SUM(s.actual_credits), 0)
                 FROM billing_settlements s
                 INNER JOIN billing_receipts r ON r.receipt_id = s.receipt_id
                 WHERE r.status IN ('final','failed_no_charge'))
              + (SELECT COALESCE(SUM(actual_microcredits), 0)
-                FROM controlled_billing_operations WHERE state = 'settled')",
+                FROM controlled_billing_operations WHERE state = 'settled')
+             + (SELECT COALESCE(SUM(actual_microcredits), 0)
+                FROM budget_settlements)",
             [],
             |row| row.get::<_, i64>(0),
         )?;
         let day_start = now_ms - now_ms.rem_euclid(86_400_000);
         let verified_spent_today = connection.query_row(
             "SELECT
-               (SELECT COALESCE(SUM(s.actual_credits), 0)
+             (SELECT COALESCE(SUM(s.actual_credits), 0)
                 FROM billing_settlements s
                 INNER JOIN billing_receipts r ON r.receipt_id = s.receipt_id
                 WHERE r.status IN ('final','failed_no_charge')
                   AND s.settled_at_ms >= ?1 AND s.settled_at_ms <= ?2)
              + (SELECT COALESCE(SUM(actual_microcredits), 0)
                 FROM controlled_billing_operations
-                WHERE state = 'settled' AND updated_at_ms >= ?1 AND updated_at_ms <= ?2)",
+                WHERE state = 'settled' AND updated_at_ms >= ?1 AND updated_at_ms <= ?2)
+             + (SELECT COALESCE(SUM(actual_microcredits), 0)
+                FROM budget_settlements
+                WHERE settled_at_ms >= ?1 AND settled_at_ms <= ?2)",
             rusqlite::params![day_start, now_ms],
             |row| row.get::<_, i64>(0),
         )?;

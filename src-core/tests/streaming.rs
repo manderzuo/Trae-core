@@ -235,7 +235,12 @@ fn downgrade_request_tables_to_v6(dir: &PathBuf) {
     connection.pragma_update(None, "foreign_keys", "OFF").unwrap();
     connection
         .execute_batch(
-            "CREATE TABLE requests_v6 (
+            "DROP TABLE budget_settlements;
+             DROP TABLE budget_receipt_evidence;
+             DROP TABLE budget_steps;
+             DROP TABLE budget_operations;
+             DROP TABLE budget_preparations;
+             CREATE TABLE requests_v6 (
                id TEXT PRIMARY KEY,
                user_id TEXT NOT NULL REFERENCES users(id),
                api_key_id TEXT NOT NULL REFERENCES api_keys(id),

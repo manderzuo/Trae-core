@@ -277,6 +277,11 @@ fn schema_v24_preserves_existing_controlled_steps_when_adding_chat_kind() {
            SELECT request_id, operation_id, kind, receipt_hash, actual_microcredits, task_ref, state
            FROM controlled_billing_steps_v24;
          DROP TABLE controlled_billing_steps_v24;
+         DROP TABLE IF EXISTS budget_settlements;
+         DROP TABLE IF EXISTS budget_receipt_evidence;
+         DROP TABLE IF EXISTS budget_steps;
+         DROP TABLE IF EXISTS budget_operations;
+         DROP TABLE IF EXISTS budget_preparations;
          UPDATE schema_meta SET value = '23' WHERE key = 'schema_version';",
     ).unwrap();
     connection.pragma_update(None, "foreign_keys", "ON").unwrap();

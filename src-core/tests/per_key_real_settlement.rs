@@ -207,7 +207,12 @@ fn v18_migration_rekeys_existing_idempotency_records_to_their_original_key() {
     connection
         .execute_batch(
             "ALTER TABLE api_keys DROP COLUMN secret_key_version;
-             ALTER TABLE api_keys DROP COLUMN secret_ciphertext;",
+             ALTER TABLE api_keys DROP COLUMN secret_ciphertext;
+             DROP TABLE budget_settlements;
+             DROP TABLE budget_receipt_evidence;
+             DROP TABLE budget_steps;
+             DROP TABLE budget_operations;
+             DROP TABLE budget_preparations;",
         )
         .unwrap();
     drop(connection);

@@ -281,6 +281,23 @@ impl CoreStore {
         if blocked || already_running {
             return Err(CoreError::ApiKeyBillingBlocked { api_key_id });
         }
+        let max_concurrency: i64 = transaction.query_row(
+            "SELECT max_concurrency FROM api_keys WHERE id = ?1 AND user_id = ?2 AND status = 'active'",
+            params![&api_key_id, &user_id],
+            |row| row.get(0),
+        )?;
+        let active_concurrency = Self::active_execution_count_for_budget_admission_in_connection(
+            &transaction,
+            &api_key_id,
+            parent_request_id,
+        )?;
+        if active_concurrency >= max_concurrency {
+            return Err(CoreError::KeyConcurrencyExceeded {
+                api_key_id,
+                active_concurrency,
+                max_concurrency,
+            });
+        }
 
         let key_account_id: String = transaction.query_row(
             "SELECT id FROM quota_budget_accounts

@@ -676,3 +676,98 @@ INSERT INTO controlled_billing_steps_next
 DROP TABLE controlled_billing_steps;
 ALTER TABLE controlled_billing_steps_next RENAME TO controlled_billing_steps;
 "#;
+
+pub(crate) const SCHEMA_V25: &str = r#"
+CREATE TABLE budget_preparations (
+  parent_request_id TEXT PRIMARY KEY REFERENCES requests(id),
+  child_request_id TEXT NOT NULL UNIQUE REFERENCES requests(id),
+  state TEXT NOT NULL CHECK(state IN ('open','admitted','aborted')),
+  abort_reason TEXT,
+  created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms),
+  CHECK((state = 'aborted' AND abort_reason IS NOT NULL AND length(trim(abort_reason)) > 0)
+     OR (state <> 'aborted' AND abort_reason IS NULL))
+);
+CREATE INDEX budget_preparations_recovery ON budget_preparations(state, created_at_ms, parent_request_id);
+
+CREATE TABLE budget_operations (
+  operation_id TEXT PRIMARY KEY,
+  parent_request_id TEXT NOT NULL UNIQUE REFERENCES requests(id),
+  api_key_id TEXT NOT NULL REFERENCES api_keys(id),
+  execution_state TEXT NOT NULL CHECK(execution_state IN ('ready','running','unknown','succeeded','failed','canceled')),
+  created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms)
+);
+CREATE INDEX budget_operations_by_key_state ON budget_operations(api_key_id, execution_state, updated_at_ms, operation_id);
+
+CREATE TABLE budget_steps (
+  request_id TEXT PRIMARY KEY REFERENCES requests(id),
+  operation_id TEXT NOT NULL REFERENCES budget_operations(operation_id),
+  kind TEXT NOT NULL CHECK(kind IN ('assist','video','chat')),
+  budget_id TEXT NOT NULL UNIQUE CHECK(length(trim(budget_id)) > 0),
+  core_key_id TEXT NOT NULL REFERENCES api_keys(id),
+  request_fingerprint TEXT NOT NULL CHECK(length(trim(request_fingerprint)) > 0),
+  endpoint TEXT NOT NULL CHECK(length(trim(endpoint)) > 0),
+  model TEXT NOT NULL CHECK(length(trim(model)) > 0),
+  account_ref TEXT NOT NULL CHECK(length(trim(account_ref)) > 0),
+  bridge_instance_id TEXT NOT NULL CHECK(length(trim(bridge_instance_id)) > 0),
+  profile_fingerprint TEXT NOT NULL CHECK(length(trim(profile_fingerprint)) > 0),
+  policy_version TEXT NOT NULL CHECK(length(trim(policy_version)) > 0),
+  authorization_hash BLOB NOT NULL CHECK(length(authorization_hash) > 0),
+  hold_microcredits INTEGER NOT NULL CHECK(hold_microcredits > 0),
+  expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms > created_at_ms),
+  reservation_id TEXT NOT NULL UNIQUE REFERENCES quota_reservations(id),
+  dispatch_attempted INTEGER NOT NULL DEFAULT 0 CHECK(dispatch_attempted IN (0,1)),
+  execution_state TEXT NOT NULL CHECK(execution_state IN ('ready','running','unknown','succeeded','failed','canceled')),
+  financial_state TEXT NOT NULL CHECK(financial_state IN ('held','unknown','settled','released','conflict')),
+  actual_microcredits INTEGER CHECK(actual_microcredits IS NULL OR actual_microcredits >= 0),
+  task_ref TEXT,
+  release_reason TEXT,
+  created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms),
+  UNIQUE(operation_id, kind),
+  CHECK(dispatch_attempted = 0 OR execution_state <> 'ready'),
+  CHECK(financial_state <> 'settled' OR actual_microcredits IS NOT NULL),
+  CHECK(kind <> 'video' OR execution_state <> 'succeeded' OR task_ref IS NOT NULL),
+  CHECK(financial_state <> 'released' OR (dispatch_attempted = 0 AND release_reason IS NOT NULL))
+);
+CREATE INDEX budget_steps_recovery ON budget_steps(financial_state, execution_state, updated_at_ms, request_id);
+
+CREATE TABLE budget_receipt_evidence (
+  evidence_id TEXT PRIMARY KEY,
+  request_id TEXT NOT NULL REFERENCES budget_steps(request_id),
+  budget_id TEXT NOT NULL,
+  account_ref TEXT NOT NULL,
+  bridge_instance_id TEXT NOT NULL,
+  record_kind TEXT NOT NULL CHECK(record_kind IN ('receipt','conflict')),
+  receipt_status TEXT CHECK(receipt_status IS NULL OR receipt_status IN ('final','failed_no_charge','pending','unknown','unverified')),
+  actual_microcredits INTEGER CHECK(actual_microcredits IS NULL OR actual_microcredits >= 0),
+  unit TEXT,
+  source_ref TEXT NOT NULL CHECK(length(trim(source_ref)) > 0),
+  evidence_hash TEXT NOT NULL CHECK(length(trim(evidence_hash)) > 0),
+  task_ref TEXT,
+  observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms > 0),
+  conflict_reason TEXT,
+  recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms > 0),
+  UNIQUE(request_id, evidence_hash),
+  CHECK((record_kind = 'receipt' AND receipt_status IS NOT NULL)
+     OR (record_kind = 'conflict' AND conflict_reason IS NOT NULL AND length(trim(conflict_reason)) > 0))
+);
+CREATE INDEX budget_receipt_evidence_by_budget ON budget_receipt_evidence(budget_id, observed_at_ms, evidence_id);
+
+CREATE TABLE budget_settlements (
+  request_id TEXT PRIMARY KEY REFERENCES budget_steps(request_id),
+  reservation_id TEXT NOT NULL UNIQUE REFERENCES quota_reservations(id),
+  budget_id TEXT NOT NULL UNIQUE,
+  account_ref TEXT NOT NULL,
+  bridge_instance_id TEXT NOT NULL,
+  source_ref TEXT NOT NULL CHECK(length(trim(source_ref)) > 0),
+  evidence_hash TEXT NOT NULL CHECK(length(trim(evidence_hash)) > 0),
+  task_ref TEXT,
+  hold_microcredits INTEGER NOT NULL CHECK(hold_microcredits > 0),
+  actual_microcredits INTEGER NOT NULL CHECK(actual_microcredits >= 0),
+  released_microcredits INTEGER NOT NULL,
+  debt INTEGER NOT NULL CHECK(debt IN (0,1)),
+  settled_at_ms INTEGER NOT NULL CHECK(settled_at_ms > 0)
+);
+"#;

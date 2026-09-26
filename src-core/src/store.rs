@@ -13,7 +13,7 @@ use crate::{
         SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V6_FINISH,
         SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
         SCHEMA_V16, SCHEMA_V17, SCHEMA_V19, SCHEMA_V20, SCHEMA_V21, SCHEMA_V22, SCHEMA_V23,
-        SCHEMA_V24,
+        SCHEMA_V24, SCHEMA_V25,
     },
     upstream::{
         account_health_decision, audit_hash, audit_identifier, audit_label,
@@ -28,7 +28,7 @@ use crate::{
 };
 
 pub const CORE_DB_FILE: &str = "core.sqlite3";
-pub const CURRENT_SCHEMA_VERSION: u32 = 24;
+pub const CURRENT_SCHEMA_VERSION: u32 = 25;
 pub const DEFAULT_API_KEY_MAX_CONCURRENCY: i64 = 32;
 
 pub struct CoreStore {
@@ -255,7 +255,7 @@ impl CoreStore {
             11 => {}
             12 => {}
             13 => {}
-            14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | CURRENT_SCHEMA_VERSION => Self::harden_v6_records(&transaction)?,
+            14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | CURRENT_SCHEMA_VERSION => Self::harden_v6_records(&transaction)?,
                 version => return Err(CoreError::UnsupportedSchemaVersion { version }),
             }
 
@@ -297,6 +297,9 @@ impl CoreStore {
             }
             if version < 24 {
                 transaction.execute_batch(SCHEMA_V24).map_err(CoreError::migration)?;
+            }
+            if version < 25 {
+                transaction.execute_batch(SCHEMA_V25).map_err(CoreError::migration)?;
             }
             if version < CURRENT_SCHEMA_VERSION {
                 transaction
@@ -915,7 +918,9 @@ impl CoreStore {
             "SELECT id, request_id, account_ref, resource_kind, predicted_units, observation_id,
                     state, lease_expires_at_ms, reconcile_until_ms, upstream_request_ref, error_kind,
                     created_at_ms, updated_at_ms, settled_at_ms
-             FROM upstream_leases WHERE state IN ('held', 'active', 'unknown')
+             FROM upstream_leases lease WHERE state IN ('held', 'active', 'unknown')
+               AND NOT EXISTS(SELECT 1 FROM budget_steps step WHERE step.request_id = lease.request_id)
+               AND NOT EXISTS(SELECT 1 FROM budget_operations operation WHERE operation.parent_request_id = lease.request_id)
              ORDER BY created_at_ms, id",
         )?;
         let leases = statement
@@ -1256,13 +1261,12 @@ impl CoreStore {
         let keys = key_records
             .into_iter()
             .map(|(id, user_id, user_name, name, prefix, scopes, status, max_concurrency, created_at_ms, revoked_at_ms, billing_blocked)| {
-                let current_concurrency = transaction.query_row(
-                    "SELECT COUNT(*) FROM requests
-                     WHERE api_key_id = ?1
-                       AND state IN ('received','validating','reserved','queued','dispatched','completing','unknown')",
-                    [&id],
-                    |row| row.get::<_, i64>(0),
-                )?;
+                let current_concurrency = Self::active_execution_count_in_connection(
+                    &transaction,
+                    &id,
+                    None,
+                )
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
                 let resource_kinds = {
                     let mut statement = transaction.prepare(
                         "SELECT resource_kind FROM quota_ledger WHERE user_id = ?1
@@ -1334,7 +1338,11 @@ impl CoreStore {
                           AND r.status IN ('final','failed_no_charge'))
                      + (SELECT COALESCE(SUM(actual_microcredits), 0)
                         FROM controlled_billing_operations
-                        WHERE api_key_id = ?1 AND state = 'settled')",
+                        WHERE api_key_id = ?1 AND state = 'settled')
+                     + (SELECT COALESCE(SUM(settlement.actual_microcredits), 0)
+                        FROM budget_settlements settlement
+                        INNER JOIN budget_steps step ON step.request_id = settlement.request_id
+                        WHERE step.core_key_id = ?1)",
                     [&id],
                     |row| row.get::<_, i64>(0),
                 )?;
