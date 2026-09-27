@@ -249,6 +249,7 @@ pub(crate) async fn video_content(state:Arc<StarlinkRouterState>,principal:Princ
         s.bridge_client().budget_content(&step).map(|upstream|Some((upstream,permit)))
     }).await;
     let (upstream,permit)=match result {Ok(Ok(Some((value,permit)))) if value.status==200=>(value,permit),Ok(Ok(None))=>return StatusCode::NOT_FOUND.into_response(),
+        Ok(Ok(Some((value,_)))) if value.status==429=>return fail("video_download_busy"),
         Ok(Err(code)) if code=="video_not_ready"=>return fail(&code),_=>return fail("video_content_unavailable")};
     let (send,receive)=tokio::sync::mpsc::channel(2);
     tokio::task::spawn_blocking(move || {
@@ -277,21 +278,20 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
     let begun=if supplied.is_some() {state.store.begin_billed_request(input)} else {state.store.begin_implicit_billed_video_request(input)};
     let (request,fresh)=match begun {Ok(BeginRequest::Created(r))=>(r.id,true),Ok(BeginRequest::Existing(r))=>(r.id,false),Ok(BeginRequest::Conflict)=>return StatusCode::CONFLICT.into_response(),Err(_)=>return fail("budget_request_rejected")};
     if crate::budget_continuation::save(&state,&principal,&request,&body).is_err() {return fail("budget_checkpoint_unavailable");}
-    {
-        let mut observers=state.video_stream_observers.lock().unwrap_or_else(|e|e.into_inner());
-        if observers.len()>=128 || !observers.insert(request.clone()) {return (StatusCode::TOO_MANY_REQUESTS,Json(json!({"error":{"code":"budget_observer_busy"}}))).into_response();}
-    }
+    let Some(observer)=crate::budget_observer::Observer::acquire(state.video_stream_observers.clone(),request.clone()) else {
+        return (StatusCode::TOO_MANY_REQUESTS,Json(json!({"error":{"code":"budget_observer_busy"}}))).into_response();
+    };
     let stream=body["stream"].as_bool().unwrap_or(false);
     let (done,receive)=tokio::sync::oneshot::channel();
     let rid=request.clone();
     tokio::spawn(async move {
+        let _observer=observer;
         let outcome=seedance_work(state.clone(),principal,rid.clone(),body,fresh,images,false).await;
         if outcome.is_err() {
             // Only terminal steps may release execution. Unknown paid execution
             // is retained; its budget and receipt remain recoverable.
             finish_definite_failure(&state,&rid,outcome.as_ref().err().unwrap());
         }
-        state.video_stream_observers.lock().unwrap_or_else(|e|e.into_inner()).remove(&rid);
         let _=done.send(outcome);
     });
     if !stream {

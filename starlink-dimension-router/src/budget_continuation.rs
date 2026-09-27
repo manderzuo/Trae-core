@@ -10,10 +10,6 @@ pub(crate) fn save(state:&StarlinkRouterState,principal:&aiwork_core::Principal,
     state.store.save_budget_continuation(principal,request,body,encrypted.key_version,&encrypted.ciphertext).map_err(|_|"checkpoint persistence failed")?;
     Ok(())
 }
-struct Observer {state:Arc<StarlinkRouterState>,request:String}
-impl Drop for Observer {
-    fn drop(&mut self) {self.state.video_stream_observers.lock().unwrap_or_else(|e|e.into_inner()).remove(&self.request);}
-}
 pub(crate) fn spawn(state:&Arc<StarlinkRouterState>) {
     if !state.config.budget_billing_v2 {return;}
     let maintenance=Arc::downgrade(state);
@@ -48,11 +44,8 @@ pub(crate) fn spawn(state:&Arc<StarlinkRouterState>) {
                 // Advance only across candidates actually visited. Advancing to
                 // row 100 after using four slots would starve the other 96.
                 after=request.clone();
-                {
-                    let mut busy=state.video_stream_observers.lock().unwrap_or_else(|e|e.into_inner());
-                    if busy.len()>=128 || !busy.insert(request.clone()) {continue;}
-                }
-                let observer=Observer {state:state.clone(),request:request.clone()};let state=state.clone();
+                let Some(observer)=crate::budget_observer::Observer::acquire(state.video_stream_observers.clone(),request.clone()) else {continue};
+                let state=state.clone();
                 tokio::spawn(async move {
                     let _permit=permit;let _observer=observer;
                     let store=state.store.clone();let id=request.clone();

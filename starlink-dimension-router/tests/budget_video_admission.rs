@@ -5,7 +5,7 @@ use serde_json::{json,Value};
 use starlink_dimension_router::{bridge_client::{BridgeClient,BridgeTransport,BridgeResponse},config::RouterConfig,state::StarlinkRouterState,user_routes};
 
 struct Bridge {claims:Mutex<BTreeMap<String,Value>>,sends:AtomicUsize,video_intent:bool,
-    large_downloads:std::sync::atomic::AtomicBool,active_downloads:Arc<AtomicUsize>}
+    large_downloads:std::sync::atomic::AtomicBool,active_downloads:Arc<AtomicUsize>,download_status:AtomicUsize}
 struct DownloadReader {active:Arc<AtomicUsize>}
 impl std::io::Read for DownloadReader {
     fn read(&mut self,buffer:&mut [u8])->std::io::Result<usize> {buffer.fill(0);Ok(buffer.len())}
@@ -24,7 +24,7 @@ impl BridgeTransport for Bridge {
     }
     fn send(&self,_method:&str,url:&str,headers:&BTreeMap<String,String>,body:&[u8])->Result<BridgeResponse,String> {
         assert_eq!(headers.get("authorization").map(String::as_str),Some("Bearer bridge-only"));
-        if url.contains("/content?") {return Ok(BridgeResponse {status:200,headers:BTreeMap::from([("content-type".into(),"video/mp4".into())]),body:b"fixture-mp4".to_vec()});}
+        if url.contains("/content?") {return Ok(BridgeResponse {status:self.download_status.load(Ordering::SeqCst) as u16,headers:BTreeMap::from([("content-type".into(),"video/mp4".into())]),body:b"fixture-mp4".to_vec()});}
         let value=if url.ends_with("/v1/assets") {
             let upload:Value=serde_json::from_slice(body).unwrap();
             assert_eq!(upload["mime_type"],"image/png");
@@ -67,7 +67,7 @@ async fn ten_keys_each_admit_two_reject_third_and_reuse_terminal_slot_before_rec
         principals.push(store.authenticate_api_key(&issued.plaintext).unwrap());
     }
     store.set_video_billing_control(aiwork_core::VideoBillingControlInput {mode:aiwork_core::VideoBillingMode::Active,reason:"fixture".into(),diagnostic_key_id:None,diagnostic_request_hash:None}).unwrap();
-    let bridge=Arc::new(Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent:true,large_downloads:std::sync::atomic::AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0))});
+    let bridge=Arc::new(Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent:true,large_downloads:std::sync::atomic::AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0)),download_status:AtomicUsize::new(200)});
     let mut cfg=RouterConfig::defaults(dir.path().into());cfg.budget_billing_v2=true;
     let state=StarlinkRouterState::for_test(store.clone(),BridgeClient::from_transport("http://bridge","bridge-only",bridge.clone()),cfg);
     let body=Bytes::from(json!({"model":"seedance","prompt":"fixture cat","duration":5,"resolution":"480p"}).to_string());
@@ -170,7 +170,7 @@ async fn run_case_with_fault(probe:bool,stream:bool,video_intent:bool,reference:
     let k=store.issue_api_key_as_admin_with_max_concurrency("user","Key",BTreeSet::from(["videos:submit".into(),"assets:write".into()]),if corrupt_neighbor {2} else {1},&admin).unwrap();
     store.key_quota_grant_as_admin(&admin,KeyQuotaGrant {api_key_id:k.id.clone(),resource_kind:"credits".into(),amount:100_000_000,actor_user_id:"admin".into(),reason:"isolated test".into()}).unwrap();
     store.set_video_billing_control(aiwork_core::VideoBillingControlInput {mode:aiwork_core::VideoBillingMode::Active,reason:"fixture".into(),diagnostic_key_id:None,diagnostic_request_hash:None}).unwrap();
-    let bridge=Arc::new(Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent,large_downloads:std::sync::atomic::AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0))});
+    let bridge=Arc::new(Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent,large_downloads:std::sync::atomic::AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0)),download_status:AtomicUsize::new(200)});
     let mut cfg=RouterConfig::defaults(dir.path().into());cfg.budget_billing_v2=true;
     let state=StarlinkRouterState::for_test(store.clone(),BridgeClient::from_transport("http://bridge","bridge-only",bridge.clone()),cfg);
     let principal=store.authenticate_api_key(&k.plaintext).unwrap();
@@ -314,6 +314,13 @@ async fn run_case_with_fault(probe:bool,stream:bool,video_intent:bool,reference:
     let r=user_routes::video_content(State(state.clone()),Path(id.to_string()),HeaderMap::new(),Extension(principal.clone())).await;
     assert_eq!(r.status(),StatusCode::OK,"video download must not wait for its financial receipt");
     assert_eq!(&axum::body::to_bytes(r.into_body(),65536).await.unwrap()[..],b"fixture-mp4");
+    bridge.download_status.store(429,Ordering::SeqCst);
+    let busy=user_routes::video_content(State(state.clone()),Path(id.to_string()),HeaderMap::new(),Extension(principal.clone())).await;
+    assert_eq!(busy.status(),StatusCode::TOO_MANY_REQUESTS,"upstream artifact recovery contention is retryable, not a misleading 503");
+    assert!(busy.headers().contains_key("retry-after"));drop(busy);
+    assert_eq!(store.active_execution_count_for_key(&k.id).unwrap(),0);
+    assert_eq!(bridge.sends.load(Ordering::SeqCst),1,"download retries must not generate again");
+    bridge.download_status.store(200,Ordering::SeqCst);
     bridge.large_downloads.store(true,Ordering::SeqCst);
     let mut downloads=Vec::new();
     for _ in 0..4 {
