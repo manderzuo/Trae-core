@@ -1,4 +1,10 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    time::Instant,
+};
+
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
@@ -11,6 +17,48 @@ use crate::{
     Reservation, ReservationState, ReserveResult, Settlement, UpstreamCreditSnapshot,
     UPSTREAM_CREDIT_SNAPSHOT_MAX_AGE_MS,
 };
+
+pub const DEFAULT_QUOTA_RECONCILE_BATCH_SIZE: usize = 100;
+pub const MAX_QUOTA_RECONCILE_BATCH_SIZE: usize = 500;
+
+/// Stable, replay-safe position within one bounded reconciliation sweep.
+/// The high-water mark is fixed by the first batch; records created after that
+/// point are picked up by the next sweep rather than extending this one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaReconcileCursor {
+    after_created_at_ms: i64,
+    after_reservation_id: String,
+    through_created_at_ms: i64,
+    through_reservation_id: String,
+    database_identity: u64,
+}
+
+impl QuotaReconcileCursor {
+    pub fn last_scanned(&self) -> (i64, &str) {
+        (self.after_created_at_ms, &self.after_reservation_id)
+    }
+
+    pub fn high_watermark(&self) -> (i64, &str) {
+        (self.through_created_at_ms, &self.through_reservation_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaReconcileBatch {
+    /// Raw reservation rows consumed and used to advance the cursor (at most `limit`).
+    pub scanned: usize,
+    /// Raw reservation rows fetched, including at most one look-ahead row.
+    pub raw_rows_read: usize,
+    /// Candidate event groups validated from the consumed raw rows.
+    pub processed: usize,
+    pub invalid_groups: u64,
+    pub next_cursor: Option<QuotaReconcileCursor>,
+    pub complete: bool,
+    /// Wait to acquire the IMMEDIATE transaction's SQLite write reservation, in microseconds.
+    pub write_lock_wait_micros: u64,
+    /// Time while the IMMEDIATE transaction is active, from acquisition through commit.
+    pub write_transaction_elapsed_micros: u64,
+}
 
 struct BudgetAccountRecord {
     id: String,
@@ -749,98 +797,359 @@ impl CoreStore {
     /// ledger event is synthesized and no hold is released, so recovery never
     /// guesses about an upstream outcome.
     pub fn reconcile_quota_event_groups(&self, now_ms: i64) -> Result<u64, CoreError> {
-        let mut connection = self.connection.lock().expect("core store mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut statement = transaction.prepare(
-            "SELECT id, user_id, request_id, resource_kind, amount, state, expires_at_ms,
-                    api_key_id, key_budget_account_id, user_cap_account_id, event_group_id
-             FROM quota_reservations reservation
-             WHERE key_budget_account_id IS NOT NULL
-                OR EXISTS (
-                    SELECT 1 FROM budget_steps step
-                    WHERE step.reservation_id = reservation.id
-                      AND step.request_id = reservation.request_id
-                )
-                OR EXISTS (
-                    SELECT 1 FROM budget_operations operation
-                    WHERE operation.parent_request_id = reservation.request_id
-                )
-                OR EXISTS (
-                    SELECT 1 FROM request_relations relation
-                    JOIN budget_operations operation
-                      ON operation.parent_request_id = relation.parent_request_id
-                    WHERE relation.child_request_id = reservation.request_id
-                      AND relation.relationship_kind = 'seedance_assist'
-                )
-             ORDER BY created_at_ms, id",
-        )?;
-        let reservations = statement
-            .query_map([], Self::reservation_from_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-
+        let mut cursor = None;
         let mut invalid_groups = 0_u64;
-        for reservation in reservations {
-            let is_v2 = Self::reservation_has_v2_context(&transaction, &reservation)?;
-            let (consistent, reason) = Self::validate_quota_event_group(&transaction, &reservation)?;
-            if consistent {
-                continue;
-            }
-
-            invalid_groups += 1;
-            let account_ids = if is_v2 {
-                Self::v2_owner_account_ids_in_transaction(&transaction, &reservation)?
-                    .unwrap_or_default()
-            } else {
-                let mut account_ids = Vec::new();
-                if let Some(account_id) = reservation.key_budget_account_id.as_deref() {
-                    account_ids.push(account_id.to_owned());
-                }
-                if let Some(account_id) = reservation.user_cap_account_id.as_deref() {
-                    if !account_ids.iter().any(|existing| existing == account_id) {
-                        account_ids.push(account_id.to_owned());
-                    }
-                }
-                account_ids
-            };
-            let mut transitioned = false;
-            for account_id in &account_ids {
-                transitioned |= transaction.execute(
-                    "UPDATE quota_budget_accounts
-                     SET migration_state = 'reconcile_required', updated_at_ms = ?1
-                     WHERE id = ?2 AND migration_state <> 'reconcile_required'",
-                    params![now_ms, account_id],
-                )? > 0;
-            }
-            let audit_exists: bool = transaction.query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM audit_events
-                    WHERE action = 'quota.reconcile_required'
-                      AND target_type = 'quota_reservation' AND target_id = ?1
-                 )",
-                [&reservation.id],
-                |row| row.get(0),
+        loop {
+            let batch = self.reconcile_quota_event_groups_batch(
+                now_ms,
+                cursor.as_ref(),
+                DEFAULT_QUOTA_RECONCILE_BATCH_SIZE,
             )?;
-            if transitioned || !audit_exists {
-                Self::insert_audit_event(
-                    &transaction,
-                    "system",
-                    "quota.reconcile_required",
-                    "quota_reservation",
-                    &reservation.id,
-                    serde_json::json!({
-                        "request_id": reservation.request_id,
-                        "event_group_id": reservation.event_group_id,
-                        "reason": reason,
-                        "hold_preserved": true,
-                    }),
-                    now_ms,
-                )?;
+            invalid_groups = invalid_groups
+                .checked_add(batch.invalid_groups)
+                .ok_or_else(|| CoreError::InvalidConfiguration {
+                    key: "quota_reconcile.invalid_group_count".into(),
+                    value: "overflow".into(),
+                })?;
+            if batch.complete {
+                return Ok(invalid_groups);
+            }
+            cursor = batch.next_cursor;
+            if cursor.is_none() {
+                return Err(CoreError::InvalidConfiguration {
+                    key: "quota_reconcile.cursor".into(),
+                    value: "incomplete batch omitted its continuation cursor".into(),
+                });
             }
         }
+    }
 
+    /// Validate at most `limit` reservations in one IMMEDIATE transaction.
+    /// The returned cursor is committed only after the batch succeeds. Replaying
+    /// a prior cursor is safe: ledger/hold facts are immutable and quarantine
+    /// state plus audit insertion are idempotent.
+    pub fn reconcile_quota_event_groups_batch(
+        &self,
+        now_ms: i64,
+        cursor: Option<&QuotaReconcileCursor>,
+        limit: usize,
+    ) -> Result<QuotaReconcileBatch, CoreError> {
+        self.reconcile_quota_event_groups_batch_with_hook(now_ms, cursor, limit, |_| {})
+    }
+
+    fn reconcile_quota_event_groups_batch_with_hook<F>(
+        &self,
+        now_ms: i64,
+        cursor: Option<&QuotaReconcileCursor>,
+        limit: usize,
+        mut after_reservation: F,
+    ) -> Result<QuotaReconcileBatch, CoreError>
+    where
+        F: FnMut(usize),
+    {
+        if limit == 0 || limit > MAX_QUOTA_RECONCILE_BATCH_SIZE {
+            return Err(CoreError::InvalidConfiguration {
+                key: "quota_reconcile.batch_limit".into(),
+                value: format!("{limit} (allowed: 1..={MAX_QUOTA_RECONCILE_BATCH_SIZE})"),
+            });
+        }
+        if cursor.is_some_and(|cursor| {
+            !Self::quota_reconcile_cursor_id_is_valid(&cursor.after_reservation_id)
+                || !Self::quota_reconcile_cursor_id_is_valid(&cursor.through_reservation_id)
+                || (cursor.after_created_at_ms, cursor.after_reservation_id.as_str())
+                    >= (cursor.through_created_at_ms, cursor.through_reservation_id.as_str())
+        }) {
+            return Err(CoreError::InvalidConfiguration {
+                key: "quota_reconcile.cursor".into(),
+                value: "invalid cursor boundary or range".into(),
+            });
+        }
+
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let lock_wait_started = Instant::now();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let write_lock_wait_micros = lock_wait_started
+            .elapsed()
+            .as_micros()
+            .min(u64::MAX as u128) as u64;
+        let transaction_started = Instant::now();
+        let database_path: String = transaction.query_row(
+            "SELECT file FROM pragma_database_list WHERE name = 'main'",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut hasher = DefaultHasher::new();
+        database_path.hash(&mut hasher);
+        let database_identity = hasher.finish();
+
+        let (through_created_at_ms, through_reservation_id) = match cursor {
+            Some(cursor) if cursor.database_identity != database_identity => {
+                return Err(CoreError::InvalidConfiguration {
+                    key: "quota_reconcile.cursor".into(),
+                    value: "cursor belongs to a different Core database".into(),
+                });
+            }
+            Some(cursor) => {
+                for (created_at_ms, reservation_id) in [
+                    (cursor.after_created_at_ms, cursor.after_reservation_id.as_str()),
+                    (cursor.through_created_at_ms, cursor.through_reservation_id.as_str()),
+                ] {
+                    let boundary_exists: bool = transaction.query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM quota_reservations
+                            INDEXED BY quota_reservations_by_created_id
+                            WHERE created_at_ms = ?1 AND id = ?2
+                         )",
+                        params![created_at_ms, reservation_id],
+                        |row| row.get(0),
+                    )?;
+                    if !boundary_exists {
+                        return Err(CoreError::InvalidConfiguration {
+                            key: "quota_reconcile.cursor".into(),
+                            value: "cursor boundary no longer exists".into(),
+                        });
+                    }
+                }
+                (
+                    cursor.through_created_at_ms,
+                    cursor.through_reservation_id.clone(),
+                )
+            }
+            None => {
+                let high_watermark: Option<(i64, String)> = transaction
+                    .query_row(
+                        "SELECT created_at_ms, id FROM quota_reservations
+                         INDEXED BY quota_reservations_by_created_id
+                         ORDER BY created_at_ms DESC, id DESC LIMIT 1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((created_at_ms, reservation_id)) = high_watermark else {
+                    transaction.commit()?;
+                    return Ok(QuotaReconcileBatch {
+                        scanned: 0,
+                        raw_rows_read: 0,
+                        processed: 0,
+                        invalid_groups: 0,
+                        next_cursor: None,
+                        complete: true,
+                        write_lock_wait_micros,
+                        write_transaction_elapsed_micros: transaction_started
+                            .elapsed()
+                            .as_micros()
+                            .min(u64::MAX as u128) as u64,
+                    });
+                };
+                if !Self::quota_reconcile_cursor_id_is_valid(&reservation_id) {
+                    return Err(CoreError::InvalidConfiguration {
+                        key: "quota_reconcile.cursor".into(),
+                        value: "database high-watermark has a malformed reservation id".into(),
+                    });
+                }
+                (created_at_ms, reservation_id)
+            }
+        };
+
+        let mut batch = Self::reconcile_quota_event_group_batch_in_transaction(
+            &transaction,
+            now_ms,
+            cursor,
+            through_created_at_ms,
+            &through_reservation_id,
+            database_identity,
+            limit,
+            &mut after_reservation,
+        )?;
         transaction.commit()?;
-        Ok(invalid_groups)
+        batch.write_lock_wait_micros = write_lock_wait_micros;
+        batch.write_transaction_elapsed_micros = transaction_started
+            .elapsed()
+            .as_micros()
+            .min(u64::MAX as u128) as u64;
+        Ok(batch)
+    }
+
+    fn reconcile_quota_event_group_batch_in_transaction<F>(
+        transaction: &Transaction<'_>,
+        now_ms: i64,
+        cursor: Option<&QuotaReconcileCursor>,
+        through_created_at_ms: i64,
+        through_reservation_id: &str,
+        database_identity: u64,
+        limit: usize,
+        after_reservation: &mut F,
+    ) -> Result<QuotaReconcileBatch, CoreError>
+    where
+        F: FnMut(usize),
+    {
+        const SELECT_RAW_RESERVATIONS: &str = "SELECT reservation.id, reservation.user_id,
+                    reservation.request_id, reservation.resource_kind, reservation.amount,
+                    reservation.state, reservation.expires_at_ms, reservation.api_key_id,
+                    reservation.key_budget_account_id, reservation.user_cap_account_id,
+                    reservation.event_group_id, reservation.created_at_ms
+             FROM quota_reservations AS reservation
+             INDEXED BY quota_reservations_by_created_id";
+
+        let query_limit = i64::try_from(limit + 1).map_err(|_| CoreError::InvalidConfiguration {
+            key: "quota_reconcile.batch_limit".into(),
+            value: "look-ahead limit does not fit SQLite INTEGER".into(),
+        })?;
+        let raw_rows = match cursor {
+            Some(cursor) => {
+                let sql = format!(
+                    "{SELECT_RAW_RESERVATIONS}
+                     WHERE (reservation.created_at_ms, reservation.id) > (?1, ?2)
+                       AND (reservation.created_at_ms, reservation.id) <= (?3, ?4)
+                     ORDER BY reservation.created_at_ms, reservation.id LIMIT ?5"
+                );
+                let mut statement = transaction.prepare(&sql)?;
+                let rows = statement
+                    .query_map(
+                        params![
+                            cursor.after_created_at_ms,
+                            &cursor.after_reservation_id,
+                            through_created_at_ms,
+                            through_reservation_id,
+                            query_limit,
+                        ],
+                        |row| Ok((row.get::<_, i64>(11)?, Self::reservation_from_row(row)?)),
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            }
+            None => {
+                let sql = format!(
+                    "{SELECT_RAW_RESERVATIONS}
+                     WHERE (reservation.created_at_ms, reservation.id) <= (?1, ?2)
+                     ORDER BY reservation.created_at_ms, reservation.id LIMIT ?3"
+                );
+                let mut statement = transaction.prepare(&sql)?;
+                let rows = statement
+                    .query_map(
+                        params![through_created_at_ms, through_reservation_id, query_limit],
+                        |row| Ok((row.get::<_, i64>(11)?, Self::reservation_from_row(row)?)),
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            }
+        };
+
+        let raw_rows_read = raw_rows.len();
+        let has_more = raw_rows_read > limit;
+        let mut reservations = raw_rows;
+        reservations.truncate(limit);
+        let scanned = reservations.len();
+        let last_scanned = reservations
+            .last()
+            .map(|(created_at_ms, reservation)| (*created_at_ms, reservation.id.clone()));
+
+        let mut invalid_groups = 0_u64;
+        let mut processed = 0_usize;
+        for (index, reservation) in reservations.into_iter().enumerate() {
+            let (_created_at_ms, reservation) = reservation;
+            let is_v2 = Self::reservation_has_v2_context(transaction, &reservation)?;
+            if reservation.key_budget_account_id.is_some() || is_v2 {
+                processed += 1;
+                let (consistent, reason) =
+                    Self::validate_quota_event_group(transaction, &reservation)?;
+                if !consistent {
+                    invalid_groups += 1;
+                    let account_ids = if is_v2 {
+                        Self::v2_owner_account_ids_in_transaction(transaction, &reservation)?
+                            .unwrap_or_default()
+                    } else {
+                        let mut account_ids = Vec::new();
+                        if let Some(account_id) = reservation.key_budget_account_id.as_deref() {
+                            account_ids.push(account_id.to_owned());
+                        }
+                        if let Some(account_id) = reservation.user_cap_account_id.as_deref() {
+                            if !account_ids.iter().any(|existing| existing == account_id) {
+                                account_ids.push(account_id.to_owned());
+                            }
+                        }
+                        account_ids
+                    };
+                    let mut transitioned = false;
+                    for account_id in &account_ids {
+                        transitioned |= transaction.execute(
+                            "UPDATE quota_budget_accounts
+                             SET migration_state = 'reconcile_required', updated_at_ms = ?1
+                             WHERE id = ?2 AND migration_state <> 'reconcile_required'",
+                            params![now_ms, account_id],
+                        )? > 0;
+                    }
+                    let audit_exists: bool = transaction.query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM audit_events
+                            WHERE action = 'quota.reconcile_required'
+                              AND target_type = 'quota_reservation' AND target_id = ?1
+                         )",
+                        [&reservation.id],
+                        |row| row.get(0),
+                    )?;
+                    if transitioned || !audit_exists {
+                        Self::insert_audit_event(
+                            transaction,
+                            "system",
+                            "quota.reconcile_required",
+                            "quota_reservation",
+                            &reservation.id,
+                            serde_json::json!({
+                                "request_id": reservation.request_id,
+                                "event_group_id": reservation.event_group_id,
+                                "reason": reason,
+                                "hold_preserved": true,
+                            }),
+                            now_ms,
+                        )?;
+                    }
+                }
+            }
+            after_reservation(index + 1);
+        }
+
+        let next_cursor = match (has_more, last_scanned) {
+            (true, Some((after_created_at_ms, after_reservation_id))) => {
+                if !Self::quota_reconcile_cursor_id_is_valid(&after_reservation_id) {
+                    return Err(CoreError::InvalidConfiguration {
+                        key: "quota_reconcile.cursor".into(),
+                        value: "last scanned reservation id is malformed".into(),
+                    });
+                }
+                Some(QuotaReconcileCursor {
+                    after_created_at_ms,
+                    after_reservation_id,
+                    through_created_at_ms,
+                    through_reservation_id: through_reservation_id.to_owned(),
+                    database_identity,
+                })
+            }
+            (true, None) => {
+                return Err(CoreError::InvalidConfiguration {
+                    key: "quota_reconcile.cursor".into(),
+                    value: "look-ahead row exists without a scanned boundary".into(),
+                });
+            }
+            _ => None,
+        };
+        Ok(QuotaReconcileBatch {
+            scanned,
+            raw_rows_read,
+            processed,
+            invalid_groups,
+            complete: !has_more,
+            next_cursor,
+            write_lock_wait_micros: 0,
+            write_transaction_elapsed_micros: 0,
+        })
+    }
+
+    fn quota_reconcile_cursor_id_is_valid(id: &str) -> bool {
+        !id.is_empty()
+            && id.trim() == id
+            && id.len() <= 1024
+            && !id.chars().any(char::is_control)
     }
 
     pub(crate) fn reservation_has_v2_context(
@@ -952,91 +1261,61 @@ impl CoreStore {
         transaction: &Transaction<'_>,
         reservation: &Reservation,
     ) -> Result<Option<Vec<String>>, CoreError> {
+        // A bad step/operation/parent linkage must not make a V2 reservation
+        // lose its Key-level admission gate. The request's API-key foreign key
+        // plus the API-key row is an independent, durable identity source; use
+        // the API key's owner rather than trusting mutable reservation/account
+        // pointers or a potentially inconsistent operation pointer.
         let owner = transaction
             .query_row(
-                "SELECT request.user_id, request.api_key_id, step.core_key_id,
-                        operation.api_key_id, parent.user_id, parent.api_key_id
-                 FROM budget_steps step
-                 JOIN budget_operations operation ON operation.operation_id = step.operation_id
-                 JOIN requests request ON request.id = step.request_id
-                 JOIN requests parent ON parent.id = operation.parent_request_id
-                 WHERE step.reservation_id = ?1 AND step.request_id = ?2",
-                params![&reservation.id, &reservation.request_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                },
+                "SELECT api_key.user_id, request.api_key_id
+                 FROM requests request
+                 JOIN api_keys api_key ON api_key.id = request.api_key_id
+                 WHERE request.id = ?1",
+                [&reservation.request_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
-        let Some((request_user_id, request_key_id, step_key_id, operation_key_id, parent_user_id, parent_key_id)) = owner
-        else {
+        let Some((request_user_id, request_key_id)) = owner else {
             return Ok(None);
         };
-        if reservation.resource_kind != "credits"
-            || reservation.user_id != request_user_id
-            || reservation.api_key_id.as_deref() != Some(request_key_id.as_str())
-            || step_key_id != request_key_id
-            || operation_key_id != request_key_id
-            || parent_user_id != request_user_id
-            || parent_key_id != request_key_id
-        {
+        if reservation.resource_kind != "credits" {
             return Ok(None);
         }
 
-        let Some(event_group_id) = reservation.event_group_id.as_deref() else {
-            return Ok(None);
+        // The reserve ledger is the hold-time account set. If its Key entry is
+        // missing, recover only the canonical Key account above; never infer a
+        // user-cap account from the reservation pointer, which could name an
+        // account created after this hold.
+        let ledger_accounts = match reservation.event_group_id.as_deref() {
+            Some(event_group_id) => Self::v2_hold_accounts_from_ledger_in_transaction(
+                transaction,
+                event_group_id,
+                &request_user_id,
+                &request_key_id,
+            )?
+            .unwrap_or_default(),
+            None => Vec::new(),
         };
-        let ledger_accounts = Self::v2_hold_accounts_from_ledger_in_transaction(
-            transaction,
-            event_group_id,
-            &request_user_id,
-            &request_key_id,
-        )?
-        .unwrap_or_default();
         let mut accounts = ledger_accounts;
-        for (pointer, expected_scope) in [
-            (reservation.key_budget_account_id.as_deref(), "key"),
-            (reservation.user_cap_account_id.as_deref(), "user_cap"),
-        ] {
-            let Some(account_id) = pointer else {
-                continue;
-            };
-            if accounts.iter().any(|(id, _, _)| id == account_id) {
-                continue;
-            }
-            let account = transaction
+        if !accounts.iter().any(|(_, scope, _)| scope == "key") {
+            // The partial unique index makes this the sole Key account for
+            // the request principal and resource. A NULL hold-time account ID
+            // must not leave that Key ready after a malformed V2 hold. Do not
+            // infer a user-cap account here: it may have been created later.
+            let key_account = transaction
                 .query_row(
-                    "SELECT scope, user_id, api_key_id, resource_kind, version
-                     FROM quota_budget_accounts WHERE id = ?1",
-                    [account_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, Option<String>>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, i64>(4)?,
-                        ))
-                    },
+                    "SELECT id, version FROM quota_budget_accounts
+                     WHERE scope = 'key' AND user_id = ?1 AND api_key_id = ?2
+                       AND resource_kind = ?3",
+                    params![&request_user_id, &request_key_id, &reservation.resource_kind],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()?;
-            let Some((scope, user_id, api_key_id, resource_kind, version)) = account else {
-                continue;
-            };
-            let expected_account_key = (expected_scope == "key").then_some(request_key_id.as_str());
-            if scope == expected_scope
-                && user_id == request_user_id
-                && api_key_id.as_deref() == expected_account_key
-                && resource_kind == reservation.resource_kind
-                && version > 0
-            {
-                accounts.push((account_id.to_owned(), scope, version));
+            if let Some((account_id, version)) = key_account {
+                if version > 0 {
+                    accounts.push((account_id, "key".into(), version));
+                }
             }
         }
         accounts.sort_by_key(|(_, scope, _)| if scope == "key" { 0 } else { 1 });
@@ -4097,5 +4376,198 @@ impl CoreStore {
             ],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod quota_reconcile_batch_tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
+
+    use rusqlite::{Connection, ErrorCode};
+
+    use super::*;
+
+    struct Fixture(PathBuf);
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture(label: &str) -> (Fixture, CoreStore, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "quota-reconcile-{label}-{}",
+            CoreStore::new_id("test")
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let store = CoreStore::open(&root).unwrap();
+        store.migrate().unwrap();
+        store
+            .create_user(
+                crate::NewUser {
+                    id: "reconcile-test-user".into(),
+                    name: "Reconcile Test User".into(),
+                    role: crate::UserRole::User,
+                },
+                "bootstrap",
+            )
+            .unwrap();
+        let database = root.join("data").join(crate::CORE_DB_FILE);
+        let mut connection = Connection::open(&database).unwrap();
+        let transaction = connection.transaction().unwrap();
+        {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO quota_reservations
+                     (id, user_id, request_id, resource_kind, amount, state, expires_at_ms,
+                      created_at_ms, api_key_id, key_budget_account_id, user_cap_account_id, event_group_id)
+                     VALUES (?1, 'reconcile-test-user', ?2, 'credits', 1, 'held', 1000,
+                             ?3, NULL, NULL, NULL, NULL)",
+                )
+                .unwrap();
+            for (id, request_id, created_at_ms) in [
+                ("raw-reservation-1", "raw-request-1", 100_i64),
+                ("raw-reservation-2", "raw-request-2", 101_i64),
+            ] {
+                insert.execute(params![id, request_id, created_at_ms]).unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+        (Fixture(root), store, database)
+    }
+
+    fn is_cursor_error(result: Result<QuotaReconcileBatch, CoreError>) -> bool {
+        matches!(
+            result,
+            Err(CoreError::InvalidConfiguration { key, .. }) if key == "quota_reconcile.cursor"
+        )
+    }
+
+    #[test]
+    fn reconcile_batch_rejects_invalid_limits_and_forged_or_stale_cursors() {
+        let (_fixture, store, _) = fixture("invalid-cursor");
+        for limit in [0, MAX_QUOTA_RECONCILE_BATCH_SIZE + 1] {
+            assert!(matches!(
+                store.reconcile_quota_event_groups_batch(200, None, limit),
+                Err(CoreError::InvalidConfiguration { key, .. }) if key == "quota_reconcile.batch_limit"
+            ));
+        }
+
+        let first = store
+            .reconcile_quota_event_groups_batch(200, None, 1)
+            .unwrap();
+        let valid = first.next_cursor.expect("two raw rows require a continuation");
+
+        let mut reversed = valid.clone();
+        reversed.after_created_at_ms = valid.through_created_at_ms + 1;
+        assert!(is_cursor_error(store.reconcile_quota_event_groups_batch(
+            200,
+            Some(&reversed),
+            1,
+        )));
+
+        let mut empty_after = valid.clone();
+        empty_after.after_reservation_id.clear();
+        assert!(is_cursor_error(store.reconcile_quota_event_groups_batch(
+            200,
+            Some(&empty_after),
+            1,
+        )));
+
+        let mut malformed_through = valid.clone();
+        malformed_through.through_reservation_id = "bad\nidentifier".into();
+        assert!(is_cursor_error(store.reconcile_quota_event_groups_batch(
+            200,
+            Some(&malformed_through),
+            1,
+        )));
+
+        let mut stale_boundary = valid.clone();
+        stale_boundary.after_reservation_id = "missing-raw-reservation".into();
+        assert!(is_cursor_error(store.reconcile_quota_event_groups_batch(
+            200,
+            Some(&stale_boundary),
+            1,
+        )));
+
+        let (_other_fixture, other_store, _) = fixture("other-database");
+        assert!(is_cursor_error(other_store.reconcile_quota_event_groups_batch(
+            200,
+            Some(&valid),
+            1,
+        )));
+    }
+
+    #[test]
+    fn reconcile_batch_holds_write_lock_only_inside_each_immediate_batch() {
+        let (_fixture, store, database) = fixture("write-lock-boundary");
+        let probe = Connection::open(&database).unwrap();
+        probe.busy_timeout(Duration::ZERO).unwrap();
+        probe
+            .execute_batch("CREATE TABLE batch_write_lock_probe (value INTEGER NOT NULL);")
+            .unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let first_batch = thread::scope(|scope| {
+            let store_ref = &store;
+            let worker = scope.spawn(move || {
+                store_ref.reconcile_quota_event_groups_batch_with_hook(
+                    200,
+                    None,
+                    1,
+                    |consumed| {
+                        if consumed == 1 {
+                            entered_tx.send(()).unwrap();
+                            release_rx.recv().unwrap();
+                        }
+                    },
+                )
+            });
+
+            if entered_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                let _ = release_tx.send(());
+                let result = worker.join();
+                panic!("batch did not reach its in-transaction barrier: {result:?}");
+            }
+
+            let lock_error = probe.execute("INSERT INTO batch_write_lock_probe VALUES (1)", []);
+            let lock_error_text = lock_error.as_ref().err().map(ToString::to_string);
+            let was_busy = matches!(
+                &lock_error,
+                Err(rusqlite::Error::SqliteFailure(failure, _))
+                    if matches!(failure.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+            );
+            release_tx.send(()).unwrap();
+            let batch = worker.join().unwrap().unwrap();
+            assert!(
+                was_busy,
+                "competing write was not excluded by the batch write lock: {lock_error_text:?}"
+            );
+            batch
+        });
+
+        assert_eq!(first_batch.scanned, 1);
+        assert!(!first_batch.complete);
+        let cursor = first_batch.next_cursor.expect("second raw row remains");
+        probe
+            .execute("INSERT INTO batch_write_lock_probe VALUES (2)", [])
+            .expect("the writer must proceed after the batch commits");
+        let second_batch = store
+            .reconcile_quota_event_groups_batch(200, Some(&cursor), 1)
+            .unwrap();
+        assert_eq!(second_batch.scanned, 1);
+        assert!(second_batch.complete);
+        eprintln!(
+            "controlled batch lock timing: wait_us={}, active_immediate_transaction_us={}",
+            first_batch.write_lock_wait_micros, first_batch.write_transaction_elapsed_micros
+        );
     }
 }

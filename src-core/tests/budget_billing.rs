@@ -4,6 +4,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Barrier},
     thread,
+    time::Instant,
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -1401,6 +1402,108 @@ fn v2_budget_account_snapshot(connection: &Connection, account_id: &str) -> (i64
         .unwrap()
 }
 
+type V2ReservationFacts = (String, String, String, i64, Option<String>, Option<String>, Option<String>);
+type V2LedgerFacts = (String, Option<String>, String, i64, i64, Option<String>, Option<String>);
+
+fn v2_hold_ledger_facts_snapshot(
+    connection: &Connection,
+) -> (Vec<V2ReservationFacts>, Vec<V2LedgerFacts>) {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, request_id, state, amount, key_budget_account_id,
+                    user_cap_account_id, event_group_id
+             FROM quota_reservations ORDER BY id",
+        )
+        .unwrap();
+    let reservations = statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    drop(statement);
+
+    let mut statement = connection
+        .prepare(
+            "SELECT entry_id, request_id, event_kind, amount, delta,
+                    budget_account_id, event_group_id
+             FROM quota_ledger ORDER BY entry_id",
+        )
+        .unwrap();
+    let ledger = statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    (reservations, ledger)
+}
+
+fn assert_reconcile_required_key_rejects_budget_admission(
+    store: &CoreStore,
+    connection: &Connection,
+    key_id: &str,
+    key_account_id: &str,
+    parent_idempotency_key: &str,
+    budget_id: &str,
+) {
+    let parent = begin_video_parent(store, key_id, parent_idempotency_key);
+    let financial_facts_before = v2_hold_ledger_facts_snapshot(connection);
+    let result = store.begin_budget_operation(
+        &parent,
+        video_budget_step(store, key_id, &parent, budget_id),
+    );
+    assert!(
+        matches!(
+            result,
+            Err(aiwork_core::CoreError::QuotaMigrationPending { ref account_id })
+                if account_id == key_account_id
+        ),
+        "admission must fail specifically because this Key account requires reconciliation; got {result:?}",
+    );
+
+    let new_reservations: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM quota_reservations WHERE request_id = ?1",
+            [&parent],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let new_ledger_entries: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM quota_ledger WHERE request_id = ?1",
+            [&parent],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(new_reservations, 0, "a rejected request must not acquire a hold");
+    assert_eq!(new_ledger_entries, 0, "a rejected request must not write ledger entries");
+    assert_eq!(
+        v2_hold_ledger_facts_snapshot(connection),
+        financial_facts_before,
+        "rejecting a new request must not mutate any existing hold or ledger fact",
+    );
+}
+
 #[test]
 fn v2_key_only_hold_remains_valid_after_user_cap_account_is_created() {
     let (directory, store, key_id, admin) = budget_fixture("v2-key-only-then-cap", 5, 100_000_000);
@@ -1471,6 +1574,688 @@ fn v2_key_only_hold_remains_valid_after_user_cap_account_is_created() {
     assert_eq!(
         store.mark_budget_step_dispatched(&request_id, budget_id).unwrap(),
         aiwork_core::BudgetMutation::Applied,
+    );
+}
+
+#[test]
+fn reconcile_v2_double_null_key_account_pointer_quarantines_key_without_rewriting_hold() {
+    let (directory, store, key_id, admin) = budget_fixture("v2-double-null-key", 5, 100_000_000);
+    let request_id = begin_video_parent(&store, &key_id, "v2-double-null-key");
+    let budget_id = "v2-double-null-key-budget";
+    let mut step = video_budget_step(&store, &key_id, &request_id, budget_id);
+    step.authorization.hold_credits = CreditAmount::parse("2", "credits").unwrap();
+    store.begin_budget_operation(&request_id, step).unwrap();
+
+    let database = directory.0.join("data").join(CORE_DB_FILE);
+    let connection = Connection::open(&database).unwrap();
+    let (reservation_id, key_account_id, event_group_id, user_cap_account_id):
+        (String, String, String, Option<String>) = connection
+        .query_row(
+            "SELECT id, key_budget_account_id, event_group_id, user_cap_account_id
+             FROM quota_reservations WHERE request_id = ?1",
+            [&request_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert!(user_cap_account_id.is_none(), "the original hold must be Key-only");
+
+    store
+        .quota_pool_grant_as_admin(
+            &admin,
+            aiwork_core::QuotaGrant {
+                user_id: "budget-user".into(),
+                resource_kind: "credits".into(),
+                amount: 100_000_000,
+                actor_user_id: "budget-admin".into(),
+                reason: "created after the Key-only hold".into(),
+            },
+        )
+        .unwrap();
+    let later_user_cap_id: String = connection
+        .query_row(
+            "SELECT id FROM quota_budget_accounts
+             WHERE scope = 'user_cap' AND user_id = 'budget-user' AND resource_kind = 'credits'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE quota_reservations
+                 SET key_budget_account_id = NULL, user_cap_account_id = ?2
+                 WHERE id = ?1",
+                params![&reservation_id, &later_user_cap_id],
+            )
+            .unwrap(),
+        1,
+    );
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE quota_ledger SET budget_account_id = NULL
+                 WHERE event_group_id = ?1 AND event_kind = 'reserve'",
+                [&event_group_id],
+            )
+            .unwrap(),
+        1,
+    );
+
+    let reservation_before = v2_reservation_snapshot(&connection, &request_id);
+    let key_before = v2_budget_account_snapshot(&connection, &key_account_id);
+    let user_cap_before = v2_budget_account_snapshot(&connection, &later_user_cap_id);
+    let ledger_before = {
+        let mut statement = connection
+            .prepare(
+                "SELECT entry_id, event_kind, budget_account_id, amount, delta
+                 FROM quota_ledger WHERE event_group_id = ?1 ORDER BY entry_id",
+            )
+            .unwrap();
+        statement
+            .query_map([&event_group_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(key_before.1, "ready");
+    assert_eq!(user_cap_before.1, "ready");
+
+    assert_eq!(store.reconcile_quota_event_groups(1_900_000_000_000).unwrap(), 1);
+
+    let key_after = v2_budget_account_snapshot(&connection, &key_account_id);
+    assert_eq!(key_after, (key_before.0, "reconcile_required".into()));
+    assert_eq!(v2_budget_account_snapshot(&connection, &later_user_cap_id), user_cap_before);
+    assert_eq!(v2_reservation_snapshot(&connection, &request_id), reservation_before);
+    let ledger_after = {
+        let mut statement = connection
+            .prepare(
+                "SELECT entry_id, event_kind, budget_account_id, amount, delta
+                 FROM quota_ledger WHERE event_group_id = ?1 ORDER BY entry_id",
+            )
+            .unwrap();
+        statement
+            .query_map([&event_group_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(ledger_after, ledger_before, "reconciliation must preserve ledger facts");
+
+    assert_reconcile_required_key_rejects_budget_admission(
+        &store,
+        &connection,
+        &key_id,
+        &key_account_id,
+        "v2-double-null-key-next-admission",
+        "v2-double-null-key-next-budget",
+    );
+
+    drop(store);
+    let reopened = CoreStore::open(&directory.0).unwrap();
+    reopened.migrate().unwrap();
+    assert_eq!(
+        v2_budget_account_snapshot(&connection, &key_account_id),
+        (key_before.0, "reconcile_required".into()),
+    );
+    assert_eq!(reopened.reconcile_quota_event_groups(1_900_000_000_000).unwrap(), 1);
+    let audit_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM audit_events
+             WHERE action = 'quota.reconcile_required'
+               AND target_type = 'quota_reservation' AND target_id = ?1",
+            [&reservation_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(audit_count, 1, "repeated scans after reopening are audit-idempotent");
+
+    assert_reconcile_required_key_rejects_budget_admission(
+        &reopened,
+        &connection,
+        &key_id,
+        &key_account_id,
+        "v2-double-null-key-reopened-admission",
+        "v2-double-null-key-reopened-budget",
+    );
+}
+
+#[test]
+fn v27_reconcile_indexes_migrate_and_cover_event_group_and_cursor_plans() {
+    let (directory, store, key_id, _admin) = budget_fixture("v27-reconcile-indexes", 5, 100_000_000);
+    let request_id = begin_video_parent(&store, &key_id, "v27-reconcile-indexes");
+    store
+        .begin_budget_operation(
+            &request_id,
+            video_budget_step(&store, &key_id, &request_id, "v27-reconcile-indexes-budget"),
+        )
+        .unwrap();
+
+    let database = directory.0.join("data").join(CORE_DB_FILE);
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "DROP INDEX IF EXISTS quota_ledger_by_event_group_entry;
+             DROP INDEX IF EXISTS quota_reservations_by_created_id;
+             UPDATE schema_meta SET value = '26' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    let ledger_before: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(amount), 0), COALESCE(SUM(delta), 0)
+             FROM quota_ledger",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let reservations_before: (i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM quota_reservations",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+
+    store.migrate().unwrap();
+
+    let schema_version: String = connection
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(schema_version, "27", "V26 databases must receive V27 explicitly");
+    let index_names = {
+        let mut statement = connection.prepare("SELECT name FROM sqlite_master WHERE type='index'").unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()
+            .unwrap()
+    };
+    assert!(index_names.contains("quota_ledger_by_event_group_entry"));
+    assert!(index_names.contains("quota_reservations_by_created_id"));
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(amount), 0), COALESCE(SUM(delta), 0)
+                 FROM quota_ledger",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+            )
+            .unwrap(),
+        ledger_before,
+        "V27 must not rewrite historical ledger facts",
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM quota_reservations",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+        reservations_before,
+        "V27 must not rewrite historical holds",
+    );
+
+    let event_group_plan = {
+        let mut statement = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT entry_id, event_kind FROM quota_ledger
+                 WHERE event_group_id = ?1 ORDER BY entry_id",
+            )
+            .unwrap();
+        statement
+            .query_map(["v27-plan-probe"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert!(
+        event_group_plan
+            .iter()
+            .any(|detail| detail.contains("quota_ledger_by_event_group_entry")),
+        "event-group plan did not use the general index: {event_group_plan:?}",
+    );
+    let cursor_plan = {
+        let mut statement = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT reservation.id FROM quota_reservations AS reservation
+                 INDEXED BY quota_reservations_by_created_id
+                 WHERE (reservation.created_at_ms, reservation.id) > (?1, ?2)
+                   AND (reservation.created_at_ms, reservation.id) <= (?3, ?4)
+                 ORDER BY reservation.created_at_ms, reservation.id LIMIT ?5",
+            )
+            .unwrap();
+        statement
+            .query_map(params![0_i64, "", i64::MAX, "\u{10ffff}", 100_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert!(
+        cursor_plan
+            .iter()
+            .any(|detail| {
+                detail.contains("SEARCH reservation USING")
+                    && detail.contains("quota_reservations_by_created_id")
+            }),
+        "stable raw cursor page must seek through its index: {cursor_plan:?}",
+    );
+    assert!(
+        cursor_plan
+            .iter()
+            .all(|detail| !detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+        "stable cursor page must not sort the scanned history: {cursor_plan:?}",
+    );
+    eprintln!("V27 event-group plan: {event_group_plan:?}");
+    eprintln!("V27 raw cursor plan: {cursor_plan:?}");
+
+    let v2_context_plan = {
+        let mut statement = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT EXISTS(
+                    SELECT 1 FROM budget_steps
+                    WHERE reservation_id = ?1 AND request_id = ?2
+                 ) OR EXISTS(
+                    SELECT 1 FROM budget_operations
+                    WHERE parent_request_id = ?2
+                 ) OR EXISTS(
+                    SELECT 1 FROM request_relations relation
+                    JOIN budget_operations operation
+                      ON operation.parent_request_id = relation.parent_request_id
+                    WHERE relation.child_request_id = ?2
+                      AND relation.relationship_kind = 'seedance_assist'
+                 )",
+            )
+            .unwrap();
+        statement
+            .query_map(params!["reservation-plan-probe", "request-plan-probe"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert!(
+        v2_context_plan.iter().any(|detail| detail.contains("SEARCH budget_steps")),
+        "reservation v2-context probe must seek by reservation_id: {v2_context_plan:?}",
+    );
+    assert!(
+        v2_context_plan.iter().any(|detail| detail.contains("SEARCH budget_operations")),
+        "operation v2-context probe must seek by parent_request_id: {v2_context_plan:?}",
+    );
+    assert!(
+        v2_context_plan.iter().any(|detail| detail.contains("SEARCH relation")),
+        "child-relation v2-context probe must seek by child_request_id: {v2_context_plan:?}",
+    );
+    assert!(
+        v2_context_plan.iter().all(|detail| {
+            !["SCAN budget_steps", "SCAN budget_operations", "SCAN relation", "SCAN operation"]
+                .iter()
+                .any(|table_scan| detail.starts_with(table_scan))
+        }),
+        "v2-context probes must not scan their history tables: {v2_context_plan:?}",
+    );
+    eprintln!("V2 context-probe plan: {v2_context_plan:?}");
+
+    drop(store);
+    let reopened = CoreStore::open(&directory.0).unwrap();
+    reopened.migrate().unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "27",
+        "reopening must keep the migrated schema version",
+    );
+}
+
+#[test]
+fn reconcile_event_group_batches_are_bounded_replay_safe_and_wrapper_compatible() {
+    let (directory, store, key_id, _admin) = budget_fixture("reconcile-batch-cursor", 5, 100_000_000);
+    let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+    let (user_id, key_account_id, key_version): (String, String, i64) = connection
+        .query_row(
+            "SELECT user_id, id, version FROM quota_budget_accounts
+             WHERE scope = 'key' AND api_key_id = ?1 AND resource_kind = 'credits'",
+            [&key_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    for index in 0..5_i64 {
+        let reservation_id = format!("batch-reservation-{index:02}");
+        let request_id = format!("batch-request-{index:02}");
+        let event_group_id = format!("batch-group-{index:02}");
+        let created_at_ms = 1_800_000_000_000 + index;
+        connection
+            .execute(
+                "INSERT INTO quota_reservations
+                 (id, user_id, request_id, resource_kind, amount, state, expires_at_ms,
+                  created_at_ms, api_key_id, key_budget_account_id, user_cap_account_id, event_group_id)
+                 VALUES (?1, ?2, ?3, 'credits', 100, 'held', ?4, ?5, ?6, ?7, NULL, ?8)",
+                params![
+                    reservation_id,
+                    &user_id,
+                    request_id,
+                    created_at_ms + 60_000,
+                    created_at_ms,
+                    &key_id,
+                    &key_account_id,
+                    event_group_id,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO quota_ledger
+                 (entry_id, user_id, resource_kind, event_kind, amount, delta, request_id,
+                  created_at_ms, budget_account_id, event_group_id, api_key_id, budget_version)
+                 VALUES (?1, ?2, 'credits', 'reserve', 99, -99, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    format!("batch-entry-{index:02}"),
+                    &user_id,
+                    request_id,
+                    created_at_ms,
+                    &key_account_id,
+                    event_group_id,
+                    &key_id,
+                    key_version,
+                ],
+            )
+            .unwrap();
+    }
+
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_first_reconcile_audit
+             BEFORE INSERT ON audit_events
+             WHEN NEW.action = 'quota.reconcile_required'
+               AND NEW.target_id = 'batch-reservation-00'
+             BEGIN
+               SELECT RAISE(ABORT, 'injected reconciliation batch failure');
+             END;",
+        )
+        .unwrap();
+    assert!(store
+        .reconcile_quota_event_groups_batch(1_900_000_000_000, None, 2)
+        .is_err());
+    let failed_page_state: String = connection
+        .query_row(
+            "SELECT migration_state FROM quota_budget_accounts WHERE id = ?1",
+            [&key_account_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(failed_page_state, "ready", "a failed batch must roll back quarantine changes");
+    let failed_page_audits: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'quota.reconcile_required'
+             AND target_type = 'quota_reservation'
+             AND target_id IN ('batch-reservation-00','batch-reservation-01')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(failed_page_audits, 0, "a failed page must not commit partial audit evidence");
+    connection
+        .execute_batch("DROP TRIGGER fail_first_reconcile_audit;")
+        .unwrap();
+
+    let first = store
+        .reconcile_quota_event_groups_batch(1_900_000_000_000, None, 2)
+        .unwrap();
+    assert_eq!(first.processed, 2);
+    assert_eq!(first.scanned, 2);
+    assert_eq!(first.raw_rows_read, 3, "one raw look-ahead row establishes continuation");
+    assert_eq!(first.invalid_groups, 2);
+    assert!(!first.complete);
+    let cursor = first.next_cursor.clone().expect("more rows must leave a cursor");
+
+    let replay = store
+        .reconcile_quota_event_groups_batch(1_900_000_000_000, None, 2)
+        .unwrap();
+    assert_eq!(replay.processed, first.processed);
+    assert_eq!(replay.scanned, first.scanned);
+    assert_eq!(replay.next_cursor, first.next_cursor, "replaying the same cursor is deterministic");
+    let first_page_audits: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'quota.reconcile_required'
+             AND target_type = 'quota_reservation'
+             AND target_id IN ('batch-reservation-00','batch-reservation-01')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(first_page_audits, 2, "cursor replay must not duplicate audit events");
+
+    // This row is newer than the cursor's already-fixed high-water mark. The
+    // current sweep must finish the original range; a later full sweep picks
+    // this candidate up instead of silently extending its cursor.
+    let extra_created_at_ms = 1_800_000_000_010_i64;
+    connection
+        .execute(
+            "INSERT INTO quota_reservations
+             (id, user_id, request_id, resource_kind, amount, state, expires_at_ms,
+              created_at_ms, api_key_id, key_budget_account_id, event_group_id)
+             VALUES ('wrapper-reservation', ?1, 'wrapper-request', 'credits', 100, 'held',
+                     ?2, ?3, ?4, ?5, 'wrapper-group')",
+            params![&user_id, extra_created_at_ms + 60_000, extra_created_at_ms, &key_id, &key_account_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO quota_ledger
+             (entry_id, user_id, resource_kind, event_kind, amount, delta, request_id,
+              created_at_ms, budget_account_id, event_group_id, api_key_id, budget_version)
+             VALUES ('wrapper-entry', ?1, 'credits', 'reserve', 99, -99, 'wrapper-request',
+                     ?2, ?3, 'wrapper-group', ?4, ?5)",
+            params![&user_id, extra_created_at_ms, &key_account_id, &key_id, key_version],
+        )
+        .unwrap();
+
+    let second = store
+        .reconcile_quota_event_groups_batch(1_900_000_000_000, Some(&cursor), 2)
+        .unwrap();
+    assert_eq!(second.processed, 2);
+    assert_eq!(second.scanned, 2);
+    assert_eq!(second.invalid_groups, 2);
+    assert!(!second.complete);
+    let final_cursor = second.next_cursor.as_ref().expect("one remaining row must continue");
+    let final_batch = store
+        .reconcile_quota_event_groups_batch(1_900_000_000_000, Some(final_cursor), 2)
+        .unwrap();
+    assert_eq!(final_batch.processed, 1);
+    assert_eq!(final_batch.scanned, 1);
+    assert_eq!(final_batch.invalid_groups, 1);
+    assert!(final_batch.complete);
+    assert!(final_batch.next_cursor.is_none());
+
+    let total_audits: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'quota.reconcile_required'
+             AND target_type = 'quota_reservation'
+             AND target_id LIKE 'batch-reservation-%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(total_audits, 5, "all rows within the fixed cursor boundary must be visited");
+
+    assert_eq!(store.reconcile_quota_event_groups(1_900_000_000_000).unwrap(), 6);
+    assert_eq!(store.reconcile_quota_event_groups(1_900_000_000_000).unwrap(), 6);
+    let wrapper_audits: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'quota.reconcile_required'
+             AND target_type = 'quota_reservation' AND target_id = 'wrapper-reservation'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(wrapper_audits, 1, "the one-shot wrapper must stay audit-idempotent");
+}
+
+#[test]
+fn reconcile_batches_bound_raw_work_when_candidates_are_sparse() {
+    const NON_CANDIDATE_ROWS: i64 = 20_000;
+    const LIMIT: usize = 64;
+    let (directory, store, key_id, _admin) = budget_fixture("reconcile-sparse-raw", 5, 100_000_000);
+    let database = directory.0.join("data").join(CORE_DB_FILE);
+    let mut connection = Connection::open(&database).unwrap();
+    let (user_id, key_account_id): (String, String) = connection
+        .query_row(
+            "SELECT user_id, id FROM quota_budget_accounts
+             WHERE scope = 'key' AND api_key_id = ?1 AND resource_kind = 'credits'",
+            [&key_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let transaction = connection.transaction().unwrap();
+    {
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO quota_reservations
+                 (id, user_id, request_id, resource_kind, amount, state, expires_at_ms,
+                  created_at_ms, api_key_id, key_budget_account_id, user_cap_account_id, event_group_id)
+                 VALUES (?1, ?2, ?3, 'credits', 1, 'held', ?4, ?5, NULL, NULL, NULL, NULL)",
+            )
+            .unwrap();
+        for index in 0..NON_CANDIDATE_ROWS {
+            let created_at_ms = 1_800_000_000_000 + index;
+            insert
+                .execute(params![
+                    format!("ordinary-reservation-{index:05}"),
+                    &user_id,
+                    format!("ordinary-request-{index:05}"),
+                    created_at_ms + 60_000,
+                    created_at_ms,
+                ])
+                .unwrap();
+        }
+    }
+    transaction
+        .execute(
+            "INSERT INTO quota_reservations
+             (id, user_id, request_id, resource_kind, amount, state, expires_at_ms,
+              created_at_ms, api_key_id, key_budget_account_id, user_cap_account_id, event_group_id)
+             VALUES ('sparse-candidate', ?1, 'sparse-candidate-request', 'credits', 100,
+                     'held', ?2, ?3, ?4, ?5, NULL, 'sparse-candidate-group')",
+            params![
+                &user_id,
+                1_800_000_000_000 + NON_CANDIDATE_ROWS + 60_000,
+                1_800_000_000_000 + NON_CANDIDATE_ROWS,
+                &key_id,
+                &key_account_id,
+            ],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+
+    let sweep_started = Instant::now();
+    let first = store
+        .reconcile_quota_event_groups_batch(1_900_000_000_000, None, LIMIT)
+        .unwrap();
+    assert_eq!(first.scanned, LIMIT, "the cursor must advance over raw non-candidates");
+    assert_eq!(first.raw_rows_read, LIMIT + 1, "the look-ahead is bounded to one raw row");
+    assert_eq!(first.processed, 0, "the first raw page contains no candidates");
+    assert!(!first.complete, "a sparse candidate later in the raw range must not be skipped");
+    let mut cursor = first.next_cursor.clone().expect("raw rows remain after page one");
+    let (last_created_at_ms, last_reservation_id) = cursor.last_scanned();
+    let expected_last_id: String = connection
+        .query_row(
+            "SELECT id FROM quota_reservations
+             ORDER BY created_at_ms, id LIMIT 1 OFFSET ?1",
+            [LIMIT as i64 - 1],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(last_reservation_id, expected_last_id);
+    assert_eq!(last_created_at_ms, 1_800_000_000_000 + LIMIT as i64 - 1);
+
+    connection
+        .execute_batch("CREATE TABLE between_batch_write_probe (value INTEGER NOT NULL);")
+        .unwrap();
+    connection
+        .execute("INSERT INTO between_batch_write_probe (value) VALUES (1)", [])
+        .unwrap();
+
+    let mut batch_count = 1_u64;
+    let mut total_scanned = first.scanned as u64;
+    let mut total_raw_rows_read = first.raw_rows_read as u64;
+    let mut total_processed = first.processed as u64;
+    let mut total_invalid = first.invalid_groups;
+    let mut max_write_transaction_micros = first.write_transaction_elapsed_micros;
+    while !first.complete && total_scanned < (NON_CANDIDATE_ROWS + 1) as u64 {
+        let batch = store
+            .reconcile_quota_event_groups_batch(
+                1_900_000_000_000,
+                Some(&cursor),
+                LIMIT,
+            )
+            .unwrap();
+        assert!(batch.scanned <= LIMIT);
+        assert!(batch.raw_rows_read <= LIMIT + 1);
+        assert!(batch.processed <= batch.scanned);
+        total_scanned += batch.scanned as u64;
+        total_raw_rows_read += batch.raw_rows_read as u64;
+        total_processed += batch.processed as u64;
+        total_invalid += batch.invalid_groups;
+        max_write_transaction_micros =
+            max_write_transaction_micros.max(batch.write_transaction_elapsed_micros);
+        batch_count += 1;
+        if batch.complete {
+            assert!(batch.next_cursor.is_none());
+            break;
+        }
+        cursor = batch.next_cursor.expect("incomplete raw page must advance cursor");
+    }
+    let sweep_elapsed_micros = sweep_started.elapsed().as_micros();
+    assert_eq!(total_scanned, (NON_CANDIDATE_ROWS + 1) as u64);
+    assert_eq!(total_processed, 1);
+    assert_eq!(total_invalid, 1);
+    assert_eq!(
+        total_raw_rows_read,
+        total_scanned + batch_count - 1,
+        "each non-final page reads only one additional look-ahead row",
+    );
+    let audit_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'quota.reconcile_required'
+             AND target_type = 'quota_reservation' AND target_id = 'sparse-candidate'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(audit_count, 1, "the sparse final candidate must eventually be visited");
+    eprintln!(
+        "sparse RAW sweep measured: rows={}, batches={}, max_single_IMMEDIATE_transaction_us={}, complete_sweep_wall_us={sweep_elapsed_micros}",
+        total_scanned, batch_count, max_write_transaction_micros
     );
 }
 
@@ -1682,7 +2467,27 @@ fn reconcile_v2_unresolved_owner_is_audited_once_and_dispatch_fails_closed() {
             &admin,
         )
         .unwrap();
+    store
+        .key_quota_grant_as_admin(
+            &admin,
+            KeyQuotaGrant {
+                api_key_id: foreign_key.id.clone(),
+                resource_kind: "credits".into(),
+                amount: 25_000_000,
+                actor_user_id: "budget-admin".into(),
+                reason: "foreign operation pointer isolation test".into(),
+            },
+        )
+        .unwrap();
     let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+    let foreign_key_account_id: String = connection
+        .query_row(
+            "SELECT id FROM quota_budget_accounts
+             WHERE scope = 'key' AND api_key_id = ?1 AND resource_kind = 'credits'",
+            [&foreign_key.id],
+            |row| row.get(0),
+        )
+        .unwrap();
     let reservation_id: String = connection
         .query_row(
             "SELECT id FROM quota_reservations WHERE request_id = ?1",
@@ -1713,8 +2518,10 @@ fn reconcile_v2_unresolved_owner_is_audited_once_and_dispatch_fails_closed() {
     let before = v2_reservation_snapshot(&connection, &request_id);
     let key_before = v2_budget_account_snapshot(&connection, &key_account_id);
     let user_cap_before = v2_budget_account_snapshot(&connection, &user_cap_account_id);
+    let foreign_key_before = v2_budget_account_snapshot(&connection, &foreign_key_account_id);
     assert_eq!(key_before.1, "ready");
     assert_eq!(user_cap_before.1, "ready");
+    assert_eq!(foreign_key_before.1, "ready");
 
     assert_eq!(store.reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis()).unwrap(), 1);
     let audit_count_and_metadata: (i64, Option<String>) = connection
@@ -1732,8 +2539,36 @@ fn reconcile_v2_unresolved_owner_is_audited_once_and_dispatch_fails_closed() {
     assert_eq!(metadata["hold_preserved"], true);
     assert!(metadata["reason"].as_str().is_some_and(|reason| !reason.is_empty()));
     assert_eq!(v2_reservation_snapshot(&connection, &request_id), before);
-    assert_eq!(v2_budget_account_snapshot(&connection, &key_account_id), key_before);
-    assert_eq!(v2_budget_account_snapshot(&connection, &user_cap_account_id), user_cap_before);
+    assert_eq!(
+        v2_budget_account_snapshot(&connection, &key_account_id),
+        (key_before.0, "reconcile_required".into()),
+        "the Key proven by the request record must be durably blocked despite a foreign operation pointer",
+    );
+    assert_eq!(
+        v2_budget_account_snapshot(&connection, &user_cap_account_id),
+        (user_cap_before.0, "reconcile_required".into()),
+        "only the original hold-time user-cap account may be quarantined",
+    );
+    assert_eq!(
+        v2_budget_account_snapshot(&connection, &foreign_key_account_id),
+        foreign_key_before,
+        "the foreign operation pointer must not quarantine its Key account",
+    );
+    let original_key_id: String = connection
+        .query_row(
+            "SELECT api_key_id FROM requests WHERE id = ?1",
+            [&request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_reconcile_required_key_rejects_budget_admission(
+        &store,
+        &connection,
+        &original_key_id,
+        &key_account_id,
+        "v2-unresolved-owner-audit-new-admission",
+        "v2-unresolved-owner-audit-new-budget",
+    );
     assert!(store.mark_budget_step_dispatched(&request_id, &budget_id).is_err());
 
     assert_eq!(store.reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis()).unwrap(), 1);
@@ -2335,13 +3170,13 @@ fn reconcile_v1_commit_and_release_event_groups_without_quarantining_key() {
 }
 
 #[test]
-fn fresh_database_migrates_to_v26_budget_schema() {
+fn fresh_database_migrates_to_v27_budget_schema() {
     let directory = TestDirectory::new("fresh-schema");
     let store = CoreStore::open(&directory.0).unwrap();
 
     store.migrate().unwrap();
 
-    assert_eq!(store.schema_version().unwrap(), 26);
+    assert_eq!(store.schema_version().unwrap(), 27);
     assert_eq!(store.table_count("budget_operations").unwrap(), 1);
     assert_eq!(store.table_count("budget_steps").unwrap(), 1);
     assert!(store.foreign_keys_enabled().unwrap());
@@ -2506,7 +3341,7 @@ fn add_budget_step_records_revision_one_for_reserve_and_authorization_history() 
 }
 
 #[test]
-fn v24_upgrade_preserves_legacy_held_unknown_and_settled_billing() {
+fn v24_to_v27_upgrade_preserves_legacy_held_unknown_and_settled_billing() {
     let directory = TestDirectory::new("v24-preservation");
     let store = CoreStore::open(&directory.0).unwrap();
     store.migrate().unwrap();
@@ -2599,7 +3434,7 @@ fn v24_upgrade_preserves_legacy_held_unknown_and_settled_billing() {
 
     store.migrate().unwrap();
 
-    assert_eq!(store.schema_version().unwrap(), 26);
+    assert_eq!(store.schema_version().unwrap(), 27);
     assert_eq!(legacy_billing_snapshot(&database, request_ids), before);
     assert_eq!(store.table_count("budget_operations").unwrap(), 1);
     drop(store);
@@ -4145,8 +4980,8 @@ fn v2_final_receipt_can_exceed_hold_and_observed_time_retry_is_duplicate() {
 }
 
 #[test]
-fn v25_upgrade_backfills_revision_one_without_changing_financial_facts_or_inventing_finish_time() {
-    let (directory, store, key_id, _) = budget_fixture("v25-to-v26", 2, 20_000_000);
+fn v25_to_v27_upgrade_backfills_revision_one_without_changing_financial_facts_or_inventing_finish_time() {
+    let (directory, store, key_id, _) = budget_fixture("v25-to-v27", 2, 20_000_000);
     let database = directory.0.join("data").join(CORE_DB_FILE);
     let connection = Connection::open(&database).unwrap();
     connection
@@ -4267,7 +5102,7 @@ fn v25_upgrade_backfills_revision_one_without_changing_financial_facts_or_invent
 
     let upgraded = CoreStore::open(&directory.0).unwrap();
     upgraded.migrate().unwrap();
-    assert_eq!(upgraded.schema_version().unwrap(), 26);
+    assert_eq!(upgraded.schema_version().unwrap(), 27);
     let connection = Connection::open(&database).unwrap();
     let step_count: i64 = connection
         .query_row("SELECT COUNT(*) FROM budget_steps", [], |row| row.get(0))

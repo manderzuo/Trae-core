@@ -28,6 +28,10 @@ pub use credits::CreditAmount;
 pub use controlled_billing::{ControlledOperation, ControlledRecoverableStep, ControlledSettlement, ControlledStepKind, ControlledStepResult};
 pub use error::CoreError;
 pub use identity::{require_scope, AuthError, Principal};
+pub use quota::{
+    QuotaReconcileBatch, QuotaReconcileCursor, DEFAULT_QUOTA_RECONCILE_BATCH_SIZE,
+    MAX_QUOTA_RECONCILE_BATCH_SIZE,
+};
 pub use models::{
     AssetState, BeginRequest, BeginRequestInput, BillingQuote, BillingReceipt, BillingReceiptResult,
     BillingReceiptStatus, BillingReservationResult, CoreAsset, CreateAssetInput, CreateVideoJobInput, CoreJob,

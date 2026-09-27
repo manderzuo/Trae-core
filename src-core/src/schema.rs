@@ -850,3 +850,10 @@ CREATE TRIGGER IF NOT EXISTS legacy_execution_evidence_no_delete
   BEFORE DELETE ON legacy_execution_evidence
   BEGIN SELECT RAISE(ABORT, 'legacy execution evidence is append-only'); END;
 "#;
+
+pub(crate) const SCHEMA_V27: &str = r#"
+CREATE INDEX IF NOT EXISTS quota_ledger_by_event_group_entry
+  ON quota_ledger(event_group_id, entry_id);
+CREATE INDEX IF NOT EXISTS quota_reservations_by_created_id
+  ON quota_reservations(created_at_ms, id);
+"#;
