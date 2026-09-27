@@ -1118,6 +1118,7 @@ impl CoreStore {
                     || row.6.as_deref() != Some(previous.budget_id.as_str())
                     || row.7.as_deref() != Some(reservation.request_id.as_str())
                     || row.8.as_deref() != Some(previous.bridge_instance_id.as_str())
+                    || authorization.bridge_instance_id != previous.bridge_instance_id
                     || cancel_ref.is_empty()
                     || bridge_revision <= 0
                     || canceled_at <= 0

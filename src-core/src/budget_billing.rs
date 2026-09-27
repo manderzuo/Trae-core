@@ -423,24 +423,50 @@ impl CoreStore {
         Ok(recovered)
     }
 
-    pub fn mark_budget_step_dispatched(&self, request_id: &str) -> Result<BudgetMutation, CoreError> {
+    pub fn mark_budget_step_dispatched(
+        &self,
+        request_id: &str,
+        expected_budget_id: &str,
+    ) -> Result<BudgetMutation, CoreError> {
         let now = Utc::now().timestamp_millis();
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let step: Option<(String, String, i64, String, i64, String)> = transaction
+        let step: Option<(String, String, String, i64, String, i64, String)> = transaction
             .query_row(
-                "SELECT step.operation_id, step.core_key_id, step.expires_at_ms,
+                "SELECT step.budget_id, step.operation_id, step.core_key_id, step.expires_at_ms,
                         step.execution_state, step.dispatch_attempted, step.financial_state
                  FROM budget_steps step WHERE step.request_id = ?1",
                 [request_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((operation_id, api_key_id, expires_at_ms, execution_state, attempted, financial_state)) = step else {
+        let Some((
+            budget_id,
+            operation_id,
+            api_key_id,
+            expires_at_ms,
+            execution_state,
+            attempted,
+            financial_state,
+        )) = step
+        else {
             return Err(CoreError::RequestNotFound {
                 request_id: request_id.into(),
             });
         };
+        if budget_id != expected_budget_id {
+            return Err(CoreError::IdempotencyConflict);
+        }
         if attempted != 0 {
             if matches!(execution_state.as_str(), "running" | "unknown") {
                 return Ok(BudgetMutation::Duplicate);
@@ -523,9 +549,9 @@ impl CoreStore {
         Self::advance_request_to_dispatched(&transaction, request_id, now)?;
         let changed = transaction.execute(
             "UPDATE budget_steps SET dispatch_attempted = 1, execution_state = 'running', updated_at_ms = ?1
-             WHERE request_id = ?2 AND dispatch_attempted = 0 AND execution_state = 'ready'
+             WHERE request_id = ?2 AND budget_id = ?3 AND dispatch_attempted = 0 AND execution_state = 'ready'
                AND financial_state = 'held' AND expires_at_ms > ?1",
-            params![now, request_id],
+            params![now, request_id, expected_budget_id],
         )?;
         if changed != 1 {
             return Err(CoreError::IdempotencyConflict);
@@ -2867,6 +2893,17 @@ mod tests {
         }
     }
 
+    type RefreshRaceSnapshot = (
+        Option<(String, String, i64, i64)>,
+        Option<(String, i64, String, String)>,
+        String,
+        String,
+        Vec<(i64, String, Vec<u8>)>,
+        Vec<(String, i64, i64, i64, i64)>,
+        (i64, i64, i64),
+        (i64, i64, i64),
+    );
+
     fn fixture() -> (Fixture, CoreStore, String, crate::Principal) {
         fixture_with_quotas(20_000_000, 20_000_000)
     }
@@ -2921,6 +2958,151 @@ mod tests {
             BeginRequest::Created(request) => request.id,
             other => panic!("expected created parent, got {other:?}"),
         }
+    }
+
+    fn refresh_race_snapshot(
+        fixture: &Fixture,
+        store: &CoreStore,
+        parent: &str,
+        key_id: &str,
+        admin: &crate::Principal,
+    ) -> RefreshRaceSnapshot {
+        let connection = Connection::open(fixture.0.join("data").join(crate::CORE_DB_FILE)).unwrap();
+        let reservation = connection
+            .query_row(
+                "SELECT id,state,amount,expires_at_ms FROM quota_reservations WHERE request_id=?1",
+                [parent],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .unwrap();
+        let step = connection
+            .query_row(
+                "SELECT budget_id,dispatch_attempted,execution_state,financial_state FROM budget_steps WHERE request_id=?1",
+                [parent],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .unwrap();
+        let request_state = connection.query_row(
+            "SELECT state FROM requests WHERE id=?1",
+            [parent],
+            |row| row.get(0),
+        ).unwrap();
+        let operation_state = connection.query_row(
+            "SELECT execution_state FROM budget_operations WHERE parent_request_id=?1",
+            [parent],
+            |row| row.get(0),
+        ).unwrap();
+        let revisions = {
+            let mut statement = connection.prepare(
+                "SELECT local_revision,budget_id,authorization_hash FROM budget_authorization_revisions WHERE request_id=?1 ORDER BY local_revision",
+            ).unwrap();
+            statement
+                .query_map([parent], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let ledger = {
+            let mut statement = connection.prepare(
+                "SELECT event_kind,amount,delta,authorization_revision,budget_version FROM quota_ledger WHERE request_id=?1 ORDER BY entry_id",
+            ).unwrap();
+            statement
+                .query_map([parent], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        drop(connection);
+        let key = store.key_quota_balance_as_admin(admin, key_id, "credits").unwrap();
+        let pool = store.quota_pool_balance_as_admin(admin, "user", "credits").unwrap();
+        (
+            reservation,
+            step,
+            request_state,
+            operation_state,
+            revisions,
+            ledger,
+            (key.available, key.held, key.version),
+            (pool.available, pool.held, pool.version),
+        )
+    }
+
+    #[test]
+    fn refresh_first_rejects_stale_budget_dispatch_without_mutating_state_or_ledger() {
+        let (fixture, store, key_id, admin) = fixture();
+        let parent = begin_video_parent(&store, &key_id, "refresh-race-refresh-first");
+        let original = new_authorization(&store, &key_id, &parent, "refresh-race-old", "2");
+        store.begin_budget_operation(&parent, BudgetStepInput {
+            kind: BudgetStepKind::Video,
+            authorization: original.clone(),
+        }).unwrap();
+        let stale_dispatcher = CoreStore::open(&fixture.0).unwrap();
+        stale_dispatcher.migrate().unwrap();
+
+        let replacement = new_authorization(&store, &key_id, &parent, "refresh-race-new", "3");
+        assert_eq!(
+            store
+                .refresh_budget_authorization(
+                    &parent,
+                    &original.budget_id,
+                    replacement.clone(),
+                    proof(&original.budget_id, &parent, 1),
+                )
+                .unwrap(),
+            BudgetMutation::Applied
+        );
+        let after_refresh = refresh_race_snapshot(&fixture, &store, &parent, &key_id, &admin);
+
+        // This second connection still holds the original authorization identity.
+        assert!(stale_dispatcher.mark_budget_step_dispatched(&parent, &original.budget_id).is_err());
+        assert_eq!(refresh_race_snapshot(&fixture, &store, &parent, &key_id, &admin), after_refresh);
+        assert_eq!(
+            after_refresh.1.as_ref().map(|step| step.0.as_str()),
+            Some(replacement.budget_id.as_str())
+        );
+        assert_eq!(after_refresh.1.as_ref().map(|step| step.1), Some(0));
+        assert_eq!(
+            stale_dispatcher
+                .mark_budget_step_dispatched(&parent, &replacement.budget_id)
+                .unwrap(),
+            BudgetMutation::Applied
+        );
+        let after_current_dispatch = refresh_race_snapshot(&fixture, &store, &parent, &key_id, &admin);
+        assert!(stale_dispatcher.mark_budget_step_dispatched(&parent, &original.budget_id).is_err());
+        assert_eq!(refresh_race_snapshot(&fixture, &store, &parent, &key_id, &admin), after_current_dispatch);
+    }
+
+    #[test]
+    fn dispatch_first_wins_over_refresh_across_two_connections() {
+        let (fixture, store, key_id, admin) = fixture();
+        let parent = begin_video_parent(&store, &key_id, "refresh-race-dispatch-first");
+        let original = new_authorization(&store, &key_id, &parent, "dispatch-race-old", "2");
+        store.begin_budget_operation(&parent, BudgetStepInput {
+            kind: BudgetStepKind::Video,
+            authorization: original.clone(),
+        }).unwrap();
+        let refresher = CoreStore::open(&fixture.0).unwrap();
+        refresher.migrate().unwrap();
+
+        store.mark_budget_step_dispatched(&parent, &original.budget_id).unwrap();
+        let after_dispatch = refresh_race_snapshot(&fixture, &store, &parent, &key_id, &admin);
+        let replacement = new_authorization(&store, &key_id, &parent, "dispatch-race-new", "3");
+        assert!(refresher.refresh_budget_authorization(
+            &parent,
+            &original.budget_id,
+            replacement,
+            proof(&original.budget_id, &parent, 1),
+        ).is_err());
+        assert_eq!(refresh_race_snapshot(&fixture, &store, &parent, &key_id, &admin), after_dispatch);
+        assert_eq!(
+            after_dispatch.1.as_ref().map(|step| step.0.as_str()),
+            Some(original.budget_id.as_str())
+        );
+        assert_eq!(after_dispatch.1.as_ref().map(|step| step.1), Some(1));
     }
 
     #[test]
@@ -2992,7 +3174,7 @@ mod tests {
         let attempted_parent = begin_video_parent(&store, &key_id, "refresh-attempted-parent");
         let attempted_old = new_authorization(&store, &key_id, &attempted_parent, "attempted-budget-old", "2");
         store.begin_budget_operation(&attempted_parent, BudgetStepInput { kind: BudgetStepKind::Video, authorization: attempted_old.clone() }).unwrap();
-        store.mark_budget_step_dispatched(&attempted_parent).unwrap();
+        store.mark_budget_step_dispatched(&attempted_parent, &attempted_old.budget_id).unwrap();
         let attempted_replacement = new_authorization(&store, &key_id, &attempted_parent, "attempted-budget-new", "3");
         let attempted_reservation_before = store.reservation_for_request(&attempted_parent).unwrap().unwrap();
         let attempted_balance_before = store.key_quota_balance_as_admin(&admin, &key_id, "credits").unwrap();
@@ -3135,6 +3317,53 @@ mod tests {
         ).unwrap();
         drop(connection);
         assert_eq!(store.reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis()).unwrap(), 1);
+    }
+
+    #[test]
+    fn authorization_bridge_instance_change_between_revisions_is_quarantined() {
+        let (fixture, store, key_id, _) = fixture();
+        let parent = begin_video_parent(&store, &key_id, "refresh-bridge-instance-parent");
+        let initial = new_authorization(&store, &key_id, &parent, "refresh-bridge-instance-old", "2");
+        store.begin_budget_operation(&parent, BudgetStepInput {
+            kind: BudgetStepKind::Video,
+            authorization: initial.clone(),
+        }).unwrap();
+        let replacement = new_authorization(&store, &key_id, &parent, "refresh-bridge-instance-new", "3");
+        store.refresh_budget_authorization(
+            &parent,
+            &initial.budget_id,
+            replacement.clone(),
+            proof(&initial.budget_id, &parent, 1),
+        ).unwrap();
+
+        // Keep the latest row, its canonical hash, and the current step mutually consistent;
+        // the corruption is solely that the instance changed across adjacent local revisions.
+        let mut changed_instance = replacement;
+        changed_instance.bridge_instance_id = "replacement-bridge-instance".into();
+        let authorization_json = serde_json::to_string(&changed_instance).unwrap();
+        let authorization_hash = crate::canonical_json_hash(&serde_json::to_value(&changed_instance).unwrap());
+        let connection = Connection::open(fixture.0.join("data").join(crate::CORE_DB_FILE)).unwrap();
+        connection.execute("DROP TRIGGER budget_authorization_revisions_no_update", []).unwrap();
+        connection.execute(
+            "UPDATE budget_authorization_revisions
+             SET authorization_json=?1,authorization_hash=?2
+             WHERE request_id=?3 AND local_revision=2",
+            params![authorization_json, authorization_hash.as_slice(), &parent],
+        ).unwrap();
+        connection.execute(
+            "UPDATE budget_steps SET bridge_instance_id=?1,authorization_hash=?2 WHERE request_id=?3",
+            params![changed_instance.bridge_instance_id, authorization_hash.as_slice(), &parent],
+        ).unwrap();
+        drop(connection);
+
+        assert_eq!(store.reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis()).unwrap(), 1);
+        let connection = Connection::open(fixture.0.join("data").join(crate::CORE_DB_FILE)).unwrap();
+        let quarantined: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM quota_budget_accounts WHERE api_key_id=?1 AND migration_state='reconcile_required'",
+            [&key_id],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(quarantined, 1);
     }
 
     #[test]

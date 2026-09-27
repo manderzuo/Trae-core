@@ -37,6 +37,21 @@ impl Drop for TestDirectory {
     }
 }
 
+fn dispatch_current_budget_step(
+    store: &CoreStore,
+    request_id: &str,
+) -> Result<aiwork_core::BudgetMutation, aiwork_core::CoreError> {
+    let budget_id = store
+        .pending_budget_steps(100)?
+        .into_iter()
+        .find(|view| view.step.request_id == request_id)
+        .map(|view| view.step.budget_id)
+        .ok_or_else(|| aiwork_core::CoreError::RequestNotFound {
+            request_id: request_id.into(),
+        })?;
+    store.mark_budget_step_dispatched(request_id, &budget_id)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct LegacyBillingSnapshot {
     reservations: Vec<(String, String, i64)>,
@@ -381,7 +396,7 @@ fn partial_assist_and_video_settlements_conserve_exact_credit_balances() {
     assert_eq!((assist_held.available, assist_held.held, assist_held.settled),
         (998_000_000, 2_000_000, 0));
 
-    store.mark_budget_step_dispatched(&helper.id).unwrap();
+    dispatch_current_budget_step(&store, &helper.id).unwrap();
     store
         .mark_budget_step_execution(&helper.id, aiwork_core::BudgetExecutionState::Succeeded)
         .unwrap();
@@ -403,7 +418,7 @@ fn partial_assist_and_video_settlements_conserve_exact_credit_balances() {
     assert_eq!((after_assist.available, after_assist.held, after_assist.settled),
         (724_922_400, 275_000_000, 77_600));
 
-    store.mark_budget_step_dispatched(&parent_request_id).unwrap();
+    dispatch_current_budget_step(&store, &parent_request_id).unwrap();
     store.bind_budget_video_task(&parent_request_id, "partial-video-task").unwrap();
     store
         .mark_budget_step_execution(&parent_request_id, aiwork_core::BudgetExecutionState::Succeeded)
@@ -464,7 +479,7 @@ fn unknown_finance_does_not_keep_a_finished_budget_operation_concurrency_slot() 
     );
     assist.authorization.hold_credits = CreditAmount::parse("2", "credits").unwrap();
     store.begin_budget_operation(&parent_request_id, assist).unwrap();
-    store.mark_budget_step_dispatched(&helper.id).unwrap();
+    dispatch_current_budget_step(&store, &helper.id).unwrap();
     store
         .mark_budget_step_execution(&helper.id, aiwork_core::BudgetExecutionState::Succeeded)
         .unwrap();
@@ -478,7 +493,7 @@ fn unknown_finance_does_not_keep_a_finished_budget_operation_concurrency_slot() 
     let mut video = video_budget_step(&store, &key_id, &parent_request_id, "unknown-finance-video-budget");
     video.authorization.hold_credits = CreditAmount::parse("275", "credits").unwrap();
     store.add_budget_step(&parent_request_id, video).unwrap();
-    store.mark_budget_step_dispatched(&parent_request_id).unwrap();
+    dispatch_current_budget_step(&store, &parent_request_id).unwrap();
     store.bind_budget_video_task(&parent_request_id, "unknown-finance-video-task").unwrap();
     store
         .mark_budget_step_execution(&parent_request_id, aiwork_core::BudgetExecutionState::Succeeded)
@@ -529,7 +544,7 @@ fn legacy_quote_counts_running_v2_parent_after_request_cancel_requested() {
     let mut step = video_budget_step(&store, &key_id, &v2_parent, "quoted-v2-cancel-requested-budget");
     step.authorization.hold_credits = CreditAmount::parse("2", "credits").unwrap();
     store.begin_budget_operation(&v2_parent, step).unwrap();
-    store.mark_budget_step_dispatched(&v2_parent).unwrap();
+    dispatch_current_budget_step(&store, &v2_parent).unwrap();
     assert_eq!(store.request_state(&v2_parent).unwrap(), aiwork_core::RequestState::Dispatched);
     store
         .transition_request(
@@ -648,7 +663,7 @@ fn same_key_concurrent_admissions_respect_max_two_and_unknown_finance_frees_slot
     // A terminal execution with unresolved finances retains its reservation,
     // but finishing its parent frees the execution slot for the rejected next request.
     let (finished_parent, finished_step) = admitted.remove(0);
-    store.mark_budget_step_dispatched(&finished_parent).unwrap();
+    dispatch_current_budget_step(&store, &finished_parent).unwrap();
     store.bind_budget_video_task(&finished_parent, "same-key-max-two-finished-task").unwrap();
     store
         .mark_budget_step_execution(&finished_parent, aiwork_core::BudgetExecutionState::Succeeded)
@@ -838,7 +853,7 @@ fn ten_keys_each_settle_three_out_of_order_steps_without_cross_key_leaks() {
 
     let mut receipts = Vec::with_capacity(cases.len());
     for (key_index, step_index, parent_request_id, input) in &cases {
-        store.mark_budget_step_dispatched(parent_request_id).unwrap();
+        dispatch_current_budget_step(&store, parent_request_id).unwrap();
         let task_ref = format!("ten-key-task-{key_index}-{step_index}");
         store.bind_budget_video_task(parent_request_id, &task_ref).unwrap();
         store
@@ -995,7 +1010,7 @@ fn negative_key_and_user_cap_balances_block_until_admin_top_up() {
             video_budget_step(&store, &first_key, &debt_parent, "negative-budget-debt-step"),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&debt_parent).unwrap();
+    dispatch_current_budget_step(&store, &debt_parent).unwrap();
     store.bind_budget_video_task(&debt_parent, "negative-budget-debt-task").unwrap();
     store
         .mark_budget_step_execution(&debt_parent, aiwork_core::BudgetExecutionState::Succeeded)
@@ -1123,7 +1138,7 @@ fn reconcile_v2_valid_states_overrun_and_later_account_versions_without_quaranti
     let mut unknown_step = video_budget_step(&store, &key_id, &unknown_parent, "v2-event-group-unknown-budget");
     unknown_step.authorization.hold_credits = CreditAmount::parse("2", "credits").unwrap();
     store.begin_budget_operation(&unknown_parent, unknown_step).unwrap();
-    store.mark_budget_step_dispatched(&unknown_parent).unwrap();
+    dispatch_current_budget_step(&store, &unknown_parent).unwrap();
     store.bind_budget_video_task(&unknown_parent, "v2-event-group-unknown-task").unwrap();
     store
         .mark_budget_step_execution(&unknown_parent, aiwork_core::BudgetExecutionState::Unknown)
@@ -1148,7 +1163,7 @@ fn reconcile_v2_valid_states_overrun_and_later_account_versions_without_quaranti
     let mut overrun_step = video_budget_step(&store, &key_id, &overrun_parent, "v2-event-group-overrun-budget");
     overrun_step.authorization.hold_credits = CreditAmount::parse("2", "credits").unwrap();
     store.begin_budget_operation(&overrun_parent, overrun_step).unwrap();
-    store.mark_budget_step_dispatched(&overrun_parent).unwrap();
+    dispatch_current_budget_step(&store, &overrun_parent).unwrap();
     store.bind_budget_video_task(&overrun_parent, "v2-event-group-overrun-task").unwrap();
     store
         .mark_budget_step_execution(&overrun_parent, aiwork_core::BudgetExecutionState::Succeeded)
@@ -1191,7 +1206,7 @@ fn reconcile_v2_valid_states_overrun_and_later_account_versions_without_quaranti
             },
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&versioned_parent).unwrap();
+    dispatch_current_budget_step(&store, &versioned_parent).unwrap();
     store.bind_budget_video_task(&versioned_parent, "v2-event-group-versioned-task").unwrap();
     store
         .mark_budget_step_execution(&versioned_parent, aiwork_core::BudgetExecutionState::Succeeded)
@@ -1221,7 +1236,7 @@ fn reconcile_v2_valid_states_overrun_and_later_account_versions_without_quaranti
         .finish_budget_execution(&unknown_parent, aiwork_core::BudgetExecutionState::Succeeded)
         .unwrap();
 
-    store.mark_budget_step_dispatched(&held_parent).unwrap();
+    dispatch_current_budget_step(&store, &held_parent).unwrap();
     store.bind_budget_video_task(&held_parent, "v2-event-group-held-task").unwrap();
     store
         .mark_budget_step_execution(&held_parent, aiwork_core::BudgetExecutionState::Succeeded)
@@ -1329,7 +1344,7 @@ fn reconcile_v2_corrupt_receipt_hash_quarantines_accounts_and_blocks_admission()
     let mut step = video_budget_step(&store, &key_id, &parent, "v2-event-group-receipt-hash-budget");
     step.authorization.hold_credits = CreditAmount::parse("2", "credits").unwrap();
     store.begin_budget_operation(&parent, step).unwrap();
-    store.mark_budget_step_dispatched(&parent).unwrap();
+    dispatch_current_budget_step(&store, &parent).unwrap();
     store.bind_budget_video_task(&parent, "v2-event-group-receipt-hash-task").unwrap();
     store
         .mark_budget_step_execution(&parent, aiwork_core::BudgetExecutionState::Succeeded)
@@ -1456,7 +1471,7 @@ fn explicit_conflict_evidence_does_not_quarantine_shared_user_cap_but_bad_shape_
     let mut first_step = video_budget_step(&store, &key_id, &first_parent, "v2-explicit-conflict-first-budget");
     first_step.authorization.hold_credits = CreditAmount::parse("2", "credits").unwrap();
     store.begin_budget_operation(&first_parent, first_step).unwrap();
-    store.mark_budget_step_dispatched(&first_parent).unwrap();
+    dispatch_current_budget_step(&store, &first_parent).unwrap();
     store
         .mark_budget_receipt_conflict(aiwork_core::BudgetReceiptConflict {
             request_id: first_parent.clone(),
@@ -1557,7 +1572,7 @@ fn reconcile_v2_explicit_conflict_wrong_owner_quarantines_accounts() {
             video_budget_step(&store, &key_id, &parent, "v2-explicit-conflict-owner-budget"),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&parent).unwrap();
+    dispatch_current_budget_step(&store, &parent).unwrap();
     store
         .mark_budget_receipt_conflict(aiwork_core::BudgetReceiptConflict {
             request_id: parent.clone(),
@@ -1616,7 +1631,7 @@ fn reconcile_v2_explicit_conflict_tampered_hash_quarantines_accounts() {
             video_budget_step(&store, &key_id, &parent, "v2-explicit-conflict-hash-budget"),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&parent).unwrap();
+    dispatch_current_budget_step(&store, &parent).unwrap();
     store
         .mark_budget_receipt_conflict(aiwork_core::BudgetReceiptConflict {
             request_id: parent.clone(),
@@ -2229,7 +2244,7 @@ fn concurrent_marking_budget_step_dispatched_has_one_persisted_attempt() {
             thread::spawn(move || {
                 let worker_store = CoreStore::open(worker_db.as_path()).unwrap();
                 worker_barrier.wait();
-                worker_store.mark_budget_step_dispatched(&request_id)
+                dispatch_current_budget_step(&worker_store, &request_id)
             })
         })
         .collect::<Vec<_>>();
@@ -2245,7 +2260,7 @@ fn concurrent_marking_budget_step_dispatched_has_one_persisted_attempt() {
     }
     assert_eq!((applied, duplicate), (1, 1));
     assert_eq!(
-        store.mark_budget_step_dispatched(&parent_request_id).unwrap(),
+        dispatch_current_budget_step(&store, &parent_request_id).unwrap(),
         aiwork_core::BudgetMutation::Duplicate
     );
     let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
@@ -2277,7 +2292,7 @@ fn video_task_binding_and_execution_do_not_settle_financial_state_or_parent() {
             video_budget_step(&store, &key_id, &parent_request_id, "video-execution-budget"),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&parent_request_id).unwrap();
+    dispatch_current_budget_step(&store, &parent_request_id).unwrap();
 
     assert!(store
         .mark_budget_step_execution(&parent_request_id, aiwork_core::BudgetExecutionState::Succeeded)
@@ -2333,7 +2348,7 @@ fn video_step_can_be_added_after_assist_execution_without_waiting_for_assist_rec
             assist_budget_step(&store, &key_id, &parent_request_id, &child.id, "assist-then-video-budget-assist"),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&child.id).unwrap();
+    dispatch_current_budget_step(&store, &child.id).unwrap();
     store
         .mark_budget_step_execution(&child.id, aiwork_core::BudgetExecutionState::Succeeded)
         .unwrap();
@@ -2377,7 +2392,7 @@ fn assist_only_execution_can_finish_parent_without_a_video_charge_step() {
             assist_budget_step(&store, &key_id, &parent_request_id, &child.id, "assist-only-finish-budget"),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&child.id).unwrap();
+    dispatch_current_budget_step(&store, &child.id).unwrap();
     store
         .mark_budget_step_execution(&child.id, aiwork_core::BudgetExecutionState::Succeeded)
         .unwrap();
@@ -2438,7 +2453,7 @@ fn expired_budget_authorization_only_allows_exact_existing_operation_replay() {
         .unwrap();
     assert_eq!(replay, expected);
     assert_eq!(replay.operation_id, initial.operation_id);
-    assert!(store.mark_budget_step_dispatched(&parent_request_id).is_err());
+    assert!(dispatch_current_budget_step(&store, &parent_request_id).is_err());
 
     let new_parent = begin_video_parent(&store, &key_id, "expired-auth-new-parent");
     let mut expired_new = video_budget_step(&store, &key_id, &new_parent, "expired-auth-new-budget");
@@ -2466,7 +2481,7 @@ fn attempted_assist_can_resume_running_from_unknown_without_dispatching_again() 
             assist_budget_step(&store, &key_id, &parent_request_id, &child.id, "assist-unknown-running-budget"),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&child.id).unwrap();
+    dispatch_current_budget_step(&store, &child.id).unwrap();
     assert_eq!(
         store.mark_budget_step_execution(&child.id, aiwork_core::BudgetExecutionState::Unknown).unwrap(),
         aiwork_core::BudgetMutation::Applied
@@ -2476,7 +2491,7 @@ fn attempted_assist_can_resume_running_from_unknown_without_dispatching_again() 
         aiwork_core::BudgetMutation::Applied
     );
     assert_eq!(
-        store.mark_budget_step_dispatched(&child.id).unwrap(),
+        dispatch_current_budget_step(&store, &child.id).unwrap(),
         aiwork_core::BudgetMutation::Duplicate
     );
     let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
@@ -2511,7 +2526,7 @@ fn video_failed_no_charge_without_task_ref_releases_only_its_hold() {
             assist_budget_step(&store, &key_id, &parent_request_id, &child.id, "video-no-charge-assist-budget"),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&child.id).unwrap();
+    dispatch_current_budget_step(&store, &child.id).unwrap();
     store
         .mark_budget_step_execution(&child.id, aiwork_core::BudgetExecutionState::Succeeded)
         .unwrap();
@@ -2521,7 +2536,7 @@ fn video_failed_no_charge_without_task_ref_releases_only_its_hold() {
             video_budget_step(&store, &key_id, &parent_request_id, "video-no-charge-video-budget"),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&parent_request_id).unwrap();
+    dispatch_current_budget_step(&store, &parent_request_id).unwrap();
 
     let mut receipt = final_budget_receipt(&parent_request_id, "video-no-charge-video-budget", "0");
     receipt.receipt.status = BillingReceiptStatus::FailedNoCharge;
@@ -2572,7 +2587,7 @@ fn zero_final_and_failed_no_charge_with_same_source_are_not_duplicate_statuses()
             video_budget_step(&store, &key_id, &parent_request_id, budget_id),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&parent_request_id).unwrap();
+    dispatch_current_budget_step(&store, &parent_request_id).unwrap();
     store.bind_budget_video_task(&parent_request_id, "task-receipt-video-1").unwrap();
     let mut final_receipt = final_budget_receipt(&parent_request_id, budget_id, "0");
     assert_eq!(
@@ -2626,7 +2641,7 @@ fn video_final_before_local_task_binding_is_retriable_without_side_effects() {
             video_budget_step(&store, &key_id, &parent_request_id, budget_id),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&parent_request_id).unwrap();
+    dispatch_current_budget_step(&store, &parent_request_id).unwrap();
     let receipt = final_budget_receipt(&parent_request_id, budget_id, "1");
     assert!(store.apply_budget_receipt(receipt.clone()).is_err());
 
@@ -2673,7 +2688,7 @@ fn video_final_wrong_task_after_binding_is_conflict_with_evidence() {
             video_budget_step(&store, &key_id, &parent_request_id, budget_id),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&parent_request_id).unwrap();
+    dispatch_current_budget_step(&store, &parent_request_id).unwrap();
     store.bind_budget_video_task(&parent_request_id, "stored-video-task").unwrap();
     let mut wrong_task = final_budget_receipt(&parent_request_id, budget_id, "1");
     wrong_task.receipt.task_ref = Some("unrelated-video-task".into());
@@ -2722,7 +2737,7 @@ fn opaque_conflict_hash_collision_is_not_a_receipt_duplicate() {
             video_budget_step(&store, &key_id, &parent, budget_id),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&parent).unwrap();
+    dispatch_current_budget_step(&store, &parent).unwrap();
     store.bind_budget_video_task(&parent, "opaque-conflict-collision-task").unwrap();
 
     let mut receipt = final_budget_receipt(&parent, budget_id, "1");
@@ -2809,7 +2824,7 @@ fn v2_settlements_remain_in_admin_views_after_later_receipt_conflict() {
     let mut step = video_budget_step(&store, &key_id, &parent, "v2-summary-budget");
     step.authorization.hold_credits = CreditAmount::parse("2", "credits").unwrap();
     store.begin_budget_operation(&parent, step).unwrap();
-    store.mark_budget_step_dispatched(&parent).unwrap();
+    dispatch_current_budget_step(&store, &parent).unwrap();
     store.bind_budget_video_task(&parent, "v2-summary-task").unwrap();
     store
         .mark_budget_step_execution(&parent, aiwork_core::BudgetExecutionState::Succeeded)
@@ -2882,7 +2897,7 @@ fn explicit_receipt_conflict_is_owned_idempotent_and_preserves_settlement() {
             video_budget_step(&store, &key_id, &parent_request_id, "explicit-receipt-conflict-budget"),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&parent_request_id).unwrap();
+    dispatch_current_budget_step(&store, &parent_request_id).unwrap();
     store.bind_budget_video_task(&parent_request_id, "explicit-conflict-task").unwrap();
     store
         .mark_budget_step_execution(&parent_request_id, aiwork_core::BudgetExecutionState::Succeeded)
@@ -2962,7 +2977,7 @@ fn legacy_settle_request_rejects_v2_holds_before_state_or_replay_changes() {
                 video_budget_step(&store, &key_id, parent_request_id, budget_id),
             )
             .unwrap();
-        store.mark_budget_step_dispatched(parent_request_id).unwrap();
+        dispatch_current_budget_step(&store, parent_request_id).unwrap();
     }
     let principal = aiwork_core::Principal {
         user_id: "budget-user".into(),
@@ -3030,7 +3045,7 @@ fn legacy_lease_recovery_excludes_an_accidental_v2_lease_binding() {
             video_budget_step(&store, &key_id, &parent_request_id, "legacy-lease-v2-budget"),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&parent_request_id).unwrap();
+    dispatch_current_budget_step(&store, &parent_request_id).unwrap();
     let now = chrono::Utc::now().timestamp_millis() + 60_000;
     let database = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
     database.execute(
@@ -3100,17 +3115,17 @@ fn dispatch_requires_ready_key_and_user_cap_but_inflight_can_settle() {
     let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
 
     connection.execute("UPDATE quota_budget_accounts SET enabled = 0 WHERE id = ?1", [key_account_id]).unwrap();
-    assert!(store.mark_budget_step_dispatched(&parent_request_id).is_err());
+    assert!(dispatch_current_budget_step(&store, &parent_request_id).is_err());
     connection.execute("UPDATE quota_budget_accounts SET enabled = 1 WHERE id = ?1", [key_account_id]).unwrap();
     connection.execute("UPDATE quota_budget_accounts SET migration_state = 'reconcile_required' WHERE id = ?1", [key_account_id]).unwrap();
-    assert!(store.mark_budget_step_dispatched(&parent_request_id).is_err());
+    assert!(dispatch_current_budget_step(&store, &parent_request_id).is_err());
     connection.execute("UPDATE quota_budget_accounts SET migration_state = 'ready' WHERE id = ?1", [key_account_id]).unwrap();
 
     connection.execute("UPDATE quota_budget_accounts SET enabled = 0 WHERE id = ?1", [user_cap_account_id]).unwrap();
-    assert!(store.mark_budget_step_dispatched(&parent_request_id).is_err());
+    assert!(dispatch_current_budget_step(&store, &parent_request_id).is_err());
     connection.execute("UPDATE quota_budget_accounts SET enabled = 1 WHERE id = ?1", [user_cap_account_id]).unwrap();
     connection.execute("UPDATE quota_budget_accounts SET migration_state = 'reconcile_required' WHERE id = ?1", [user_cap_account_id]).unwrap();
-    assert!(store.mark_budget_step_dispatched(&parent_request_id).is_err());
+    assert!(dispatch_current_budget_step(&store, &parent_request_id).is_err());
     connection.execute("UPDATE quota_budget_accounts SET migration_state = 'ready' WHERE id = ?1", [user_cap_account_id]).unwrap();
 
     let (attempted, execution_state, request_state): (i64, String, String) = connection
@@ -3124,7 +3139,7 @@ fn dispatch_requires_ready_key_and_user_cap_but_inflight_can_settle() {
         .unwrap();
     assert_eq!((attempted, execution_state.as_str(), request_state.as_str()), (0, "ready", "reserved"));
 
-    store.mark_budget_step_dispatched(&parent_request_id).unwrap();
+    dispatch_current_budget_step(&store, &parent_request_id).unwrap();
     store.bind_budget_video_task(&parent_request_id, "dispatch-readiness-task").unwrap();
     connection.execute("UPDATE quota_budget_accounts SET enabled = 0 WHERE id = ?1", [key_account_id]).unwrap();
     connection.execute("UPDATE quota_budget_accounts SET migration_state = 'reconcile_required' WHERE id = ?1", [user_cap_account_id]).unwrap();
@@ -3212,7 +3227,7 @@ fn attempted_budget_step_cannot_be_released() {
             video_budget_step(&store, &key_id, &parent_request_id, "attempted-release-rejected-budget"),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&parent_request_id).unwrap();
+    dispatch_current_budget_step(&store, &parent_request_id).unwrap();
     store
         .mark_budget_step_execution(&parent_request_id, aiwork_core::BudgetExecutionState::Failed)
         .unwrap();
@@ -3351,7 +3366,7 @@ fn pending_budget_steps_are_stable_read_only_and_include_revoked_keys() {
             video_budget_step(&store, &key_id, &ready_parent, "pending-budget-ready"),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&running_parent).unwrap();
+    dispatch_current_budget_step(&store, &running_parent).unwrap();
     store
         .mark_budget_step_execution(&running_parent, aiwork_core::BudgetExecutionState::Unknown)
         .unwrap();
@@ -3417,7 +3432,7 @@ fn v2_final_receipt_can_exceed_hold_and_observed_time_retry_is_duplicate() {
             video_budget_step(&store, &key_id, &parent_request_id, budget_id),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&parent_request_id).unwrap();
+    dispatch_current_budget_step(&store, &parent_request_id).unwrap();
     store.bind_budget_video_task(&parent_request_id, "task-receipt-video-1").unwrap();
     let input = final_budget_receipt(&parent_request_id, budget_id, "3");
 
@@ -3491,7 +3506,7 @@ fn v25_upgrade_backfills_revision_one_without_changing_financial_facts_or_invent
             video_budget_step(&store, &key_id, &settled_parent, "v25-settled-budget"),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&settled_parent).unwrap();
+    dispatch_current_budget_step(&store, &settled_parent).unwrap();
     store.bind_budget_video_task(&settled_parent, "v25-settled-task").unwrap();
     store
         .mark_budget_step_execution(&settled_parent, aiwork_core::BudgetExecutionState::Succeeded)
@@ -3676,7 +3691,7 @@ fn v2_terminal_time_is_written_once_and_not_moved_by_replay_or_late_receipt() {
             video_budget_step(&store, &key_id, &parent_request_id, "execution-finished-at-budget"),
         )
         .unwrap();
-    store.mark_budget_step_dispatched(&parent_request_id).unwrap();
+    dispatch_current_budget_step(&store, &parent_request_id).unwrap();
     store.bind_budget_video_task(&parent_request_id, "execution-finished-at-task").unwrap();
     store
         .mark_budget_step_execution(&parent_request_id, aiwork_core::BudgetExecutionState::Succeeded)
