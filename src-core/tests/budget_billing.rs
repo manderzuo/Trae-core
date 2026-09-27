@@ -1260,6 +1260,586 @@ fn reconcile_v2_valid_states_overrun_and_later_account_versions_without_quaranti
     assert!(directory.0.join("data").join(CORE_DB_FILE).exists());
 }
 
+#[derive(Clone, Copy, Debug)]
+enum MissingV2ReservationAccountPointer {
+    Key,
+    UserCap,
+    Both,
+}
+
+fn held_v2_reservation_with_missing_pointer(
+    label: &str,
+    missing: MissingV2ReservationAccountPointer,
+) -> (TestDirectory, CoreStore, String, String, String, String, aiwork_core::Principal) {
+    let (directory, store, key_id, admin) = budget_fixture(label, 5, 100_000_000);
+    store
+        .quota_pool_grant_as_admin(
+            &admin,
+            aiwork_core::QuotaGrant {
+                user_id: "budget-user".into(),
+                resource_kind: "credits".into(),
+                amount: 100_000_000,
+                actor_user_id: "budget-admin".into(),
+                reason: "missing V2 reservation account pointer fixture".into(),
+            },
+        )
+        .unwrap();
+    let request_id = begin_video_parent(&store, &key_id, label);
+    let budget_id = format!("{label}-budget");
+    store
+        .begin_budget_operation(
+            &request_id,
+            video_budget_step(&store, &key_id, &request_id, &budget_id),
+        )
+        .unwrap();
+
+    let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+    let (key_account_id, user_cap_account_id): (String, String) = connection
+        .query_row(
+            "SELECT key_budget_account_id, user_cap_account_id
+             FROM quota_reservations WHERE request_id = ?1",
+            [&request_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let sql = match missing {
+        MissingV2ReservationAccountPointer::Key => {
+            "UPDATE quota_reservations SET key_budget_account_id = NULL WHERE request_id = ?1"
+        }
+        MissingV2ReservationAccountPointer::UserCap => {
+            "UPDATE quota_reservations SET user_cap_account_id = NULL WHERE request_id = ?1"
+        }
+        MissingV2ReservationAccountPointer::Both => {
+            "UPDATE quota_reservations
+             SET key_budget_account_id = NULL, user_cap_account_id = NULL WHERE request_id = ?1"
+        }
+    };
+    assert_eq!(connection.execute(sql, [&request_id]).unwrap(), 1);
+
+    (
+        directory,
+        store,
+        request_id,
+        budget_id,
+        key_account_id,
+        user_cap_account_id,
+        admin,
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct V2ReservationSnapshot {
+    request_state: String,
+    operation_state: String,
+    budget_id: String,
+    execution_state: String,
+    dispatch_attempted: i64,
+    financial_state: String,
+    reservation_state: String,
+    reservation_amount: i64,
+    key_account_id: Option<String>,
+    user_cap_account_id: Option<String>,
+    event_group_id: Option<String>,
+    ledger_events: Vec<(Option<String>, String, i64, i64, Option<i64>)>,
+}
+
+fn v2_reservation_snapshot(connection: &Connection, request_id: &str) -> V2ReservationSnapshot {
+    let mut snapshot = connection
+        .query_row(
+            "SELECT request.state, operation.execution_state, step.budget_id,
+                    step.execution_state, step.dispatch_attempted, step.financial_state,
+                    reservation.state, reservation.amount, reservation.key_budget_account_id,
+                    reservation.user_cap_account_id, reservation.event_group_id
+             FROM quota_reservations reservation
+             JOIN budget_steps step ON step.reservation_id = reservation.id
+                                  AND step.request_id = reservation.request_id
+             JOIN budget_operations operation ON operation.operation_id = step.operation_id
+             JOIN requests request ON request.id = step.request_id
+             WHERE reservation.request_id = ?1",
+            [request_id],
+            |row| {
+                Ok(V2ReservationSnapshot {
+                    request_state: row.get(0)?,
+                    operation_state: row.get(1)?,
+                    budget_id: row.get(2)?,
+                    execution_state: row.get(3)?,
+                    dispatch_attempted: row.get(4)?,
+                    financial_state: row.get(5)?,
+                    reservation_state: row.get(6)?,
+                    reservation_amount: row.get(7)?,
+                    key_account_id: row.get(8)?,
+                    user_cap_account_id: row.get(9)?,
+                    event_group_id: row.get(10)?,
+                    ledger_events: Vec::new(),
+                })
+            },
+        )
+        .unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT event_group_id, event_kind, amount, delta, authorization_revision
+             FROM quota_ledger WHERE request_id = ?1 ORDER BY entry_id",
+        )
+        .unwrap();
+    snapshot.ledger_events = statement
+        .query_map([request_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    snapshot
+}
+
+fn v2_budget_account_snapshot(connection: &Connection, account_id: &str) -> (i64, String) {
+    connection
+        .query_row(
+            "SELECT version, migration_state FROM quota_budget_accounts WHERE id = ?1",
+            [account_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn v2_key_only_hold_remains_valid_after_user_cap_account_is_created() {
+    let (directory, store, key_id, admin) = budget_fixture("v2-key-only-then-cap", 5, 100_000_000);
+    let request_id = begin_video_parent(&store, &key_id, "v2-key-only-then-cap");
+    let budget_id = "v2-key-only-then-cap-budget";
+    let mut step = video_budget_step(&store, &key_id, &request_id, budget_id);
+    step.authorization.hold_credits = CreditAmount::parse("2", "credits").unwrap();
+    store.begin_budget_operation(&request_id, step).unwrap();
+
+    let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+    let (key_account_id, user_cap_account_id, event_group_id): (String, Option<String>, String) = connection
+        .query_row(
+            "SELECT key_budget_account_id, user_cap_account_id, event_group_id
+             FROM quota_reservations WHERE request_id = ?1",
+            [&request_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(user_cap_account_id.is_none(), "the hold was created without a user-cap account");
+    let reserve_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM quota_ledger
+             WHERE event_group_id = ?1 AND event_kind = 'reserve'",
+            [&event_group_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reserve_count, 1, "the immutable hold evidence is Key-only");
+    let key_before = v2_budget_account_snapshot(&connection, &key_account_id);
+
+    store
+        .quota_pool_grant_as_admin(
+            &admin,
+            aiwork_core::QuotaGrant {
+                user_id: "budget-user".into(),
+                resource_kind: "credits".into(),
+                amount: 100_000_000,
+                actor_user_id: "budget-admin".into(),
+                reason: "user-cap created after a Key-only V2 hold".into(),
+            },
+        )
+        .unwrap();
+    let later_user_cap_id: String = connection
+        .query_row(
+            "SELECT id FROM quota_budget_accounts
+             WHERE scope = 'user_cap' AND user_id = 'budget-user' AND resource_kind = 'credits'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_ne!(later_user_cap_id, key_account_id);
+
+    assert_eq!(
+        store.reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis()).unwrap(),
+        0,
+        "a later account must not retroactively change the original hold's account set",
+    );
+    assert_eq!(v2_budget_account_snapshot(&connection, &key_account_id), key_before);
+    let user_cap_state: String = connection
+        .query_row(
+            "SELECT migration_state FROM quota_budget_accounts WHERE id = ?1",
+            [&later_user_cap_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(user_cap_state, "ready", "the later account is not part of this hold");
+
+    assert_eq!(
+        store.mark_budget_step_dispatched(&request_id, budget_id).unwrap(),
+        aiwork_core::BudgetMutation::Applied,
+    );
+}
+
+#[derive(Clone, Copy)]
+enum ForeignV2ReservationAccountPointer {
+    Key,
+    UserCap,
+}
+
+fn held_v2_reservation_with_foreign_account_pointer(
+    label: &str,
+    wrong_pointer: ForeignV2ReservationAccountPointer,
+) -> (TestDirectory, CoreStore, String, String, String, String, String) {
+    let (directory, store, request_id, budget_id, key_account_id, user_cap_account_id, admin) =
+        held_v2_reservation_with_missing_pointer(label, MissingV2ReservationAccountPointer::Both);
+    let foreign_account_id = match wrong_pointer {
+        ForeignV2ReservationAccountPointer::Key => {
+            let foreign_key = store
+                .issue_api_key_as_admin_with_max_concurrency(
+                    "budget-user",
+                    &format!("{label}-foreign-key"),
+                    BTreeSet::from(["video:submit".into()]),
+                    5,
+                    &admin,
+                )
+                .unwrap();
+            store
+                .key_quota_grant_as_admin(
+                    &admin,
+                    KeyQuotaGrant {
+                        api_key_id: foreign_key.id.clone(),
+                        resource_kind: "credits".into(),
+                        amount: 100_000_000,
+                        actor_user_id: "budget-admin".into(),
+                        reason: "foreign V2 Key account pointer fixture".into(),
+                    },
+                )
+                .unwrap();
+            let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+            connection
+                .query_row(
+                    "SELECT id FROM quota_budget_accounts
+                     WHERE scope = 'key' AND user_id = 'budget-user' AND api_key_id = ?1
+                       AND resource_kind = 'credits'",
+                    [&foreign_key.id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        }
+        ForeignV2ReservationAccountPointer::UserCap => {
+            let foreign_user_id = format!("foreign-{label}");
+            store
+                .create_user(
+                    NewUser {
+                        id: foreign_user_id.clone(),
+                        name: "Foreign User".into(),
+                        role: UserRole::User,
+                    },
+                    "budget-admin",
+                )
+                .unwrap();
+            store
+                .quota_pool_grant_as_admin(
+                    &admin,
+                    aiwork_core::QuotaGrant {
+                        user_id: foreign_user_id.clone(),
+                        resource_kind: "credits".into(),
+                        amount: 100_000_000,
+                        actor_user_id: "budget-admin".into(),
+                        reason: "foreign V2 user-cap account pointer fixture".into(),
+                    },
+                )
+                .unwrap();
+            let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+            connection
+                .query_row(
+                    "SELECT id FROM quota_budget_accounts
+                     WHERE scope = 'user_cap' AND user_id = ?1 AND api_key_id IS NULL
+                       AND resource_kind = 'credits'",
+                    [&foreign_user_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        }
+    };
+    let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+    let (key_pointer, user_cap_pointer) = match wrong_pointer {
+        ForeignV2ReservationAccountPointer::Key => (&foreign_account_id, &user_cap_account_id),
+        ForeignV2ReservationAccountPointer::UserCap => (&key_account_id, &foreign_account_id),
+    };
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE quota_reservations
+                 SET key_budget_account_id = ?2, user_cap_account_id = ?3
+                 WHERE request_id = ?1",
+                params![&request_id, key_pointer, user_cap_pointer],
+            )
+            .unwrap(),
+        1
+    );
+    (
+        directory,
+        store,
+        request_id,
+        budget_id,
+        key_account_id,
+        user_cap_account_id,
+        foreign_account_id,
+    )
+}
+
+#[test]
+fn dispatch_v2_rejects_ready_key_account_owned_by_another_key() {
+    let (directory, store, request_id, budget_id, key_account_id, user_cap_account_id, foreign_account_id) =
+        held_v2_reservation_with_foreign_account_pointer(
+            "v2-dispatch-foreign-key-account",
+            ForeignV2ReservationAccountPointer::Key,
+        );
+    let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+    let before = v2_reservation_snapshot(&connection, &request_id);
+    let key_before = v2_budget_account_snapshot(&connection, &key_account_id);
+    let user_cap_before = v2_budget_account_snapshot(&connection, &user_cap_account_id);
+    let foreign_before = v2_budget_account_snapshot(&connection, &foreign_account_id);
+
+    let result = store.mark_budget_step_dispatched(&request_id, &budget_id);
+
+    assert!(result.is_err(), "ready account owned by another Key was accepted: {result:?}");
+    assert_eq!(v2_reservation_snapshot(&connection, &request_id), before);
+    assert_eq!(v2_budget_account_snapshot(&connection, &key_account_id), key_before);
+    assert_eq!(v2_budget_account_snapshot(&connection, &user_cap_account_id), user_cap_before);
+    assert_eq!(v2_budget_account_snapshot(&connection, &foreign_account_id), foreign_before);
+}
+
+#[test]
+fn dispatch_v2_rejects_ready_user_cap_account_owned_by_another_user() {
+    let (directory, store, request_id, budget_id, key_account_id, user_cap_account_id, foreign_account_id) =
+        held_v2_reservation_with_foreign_account_pointer(
+            "v2-dispatch-foreign-user-cap-account",
+            ForeignV2ReservationAccountPointer::UserCap,
+        );
+    let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+    let before = v2_reservation_snapshot(&connection, &request_id);
+    let key_before = v2_budget_account_snapshot(&connection, &key_account_id);
+    let user_cap_before = v2_budget_account_snapshot(&connection, &user_cap_account_id);
+    let foreign_before = v2_budget_account_snapshot(&connection, &foreign_account_id);
+
+    let result = store.mark_budget_step_dispatched(&request_id, &budget_id);
+
+    assert!(result.is_err(), "ready user-cap account owned by another user was accepted: {result:?}");
+    assert_eq!(v2_reservation_snapshot(&connection, &request_id), before);
+    assert_eq!(v2_budget_account_snapshot(&connection, &key_account_id), key_before);
+    assert_eq!(v2_budget_account_snapshot(&connection, &user_cap_account_id), user_cap_before);
+    assert_eq!(v2_budget_account_snapshot(&connection, &foreign_account_id), foreign_before);
+}
+
+#[test]
+fn reconcile_v2_foreign_account_pointers_quarantines_only_accounts_from_hold_ledger() {
+    let cases = [
+        (ForeignV2ReservationAccountPointer::Key, "foreign-key"),
+        (ForeignV2ReservationAccountPointer::UserCap, "foreign-user-cap"),
+    ];
+    let mut failures = Vec::new();
+
+    for (wrong_pointer, label) in cases {
+        let (directory, store, request_id, _budget_id, key_account_id, user_cap_account_id, foreign_account_id) =
+            held_v2_reservation_with_foreign_account_pointer(label, wrong_pointer);
+        let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+        let before = v2_reservation_snapshot(&connection, &request_id);
+        let key_before = v2_budget_account_snapshot(&connection, &key_account_id);
+        let user_cap_before = v2_budget_account_snapshot(&connection, &user_cap_account_id);
+        let foreign_before = v2_budget_account_snapshot(&connection, &foreign_account_id);
+
+        let invalid_groups = store
+            .reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis())
+            .unwrap();
+        if invalid_groups != 1 {
+            failures.push(format!("{label}: expected one invalid reservation, got {invalid_groups}"));
+        }
+        if v2_reservation_snapshot(&connection, &request_id) != before {
+            failures.push(format!("{label}: reconciliation changed reservation or ledger facts"));
+        }
+        for (account_id, before) in [(&key_account_id, key_before), (&user_cap_account_id, user_cap_before)] {
+            let after = v2_budget_account_snapshot(&connection, account_id);
+            if after.0 != before.0 || after.1 != "reconcile_required" {
+                failures.push(format!("{label}: original hold account was not quarantined safely: {after:?}"));
+            }
+        }
+        let foreign_after = v2_budget_account_snapshot(&connection, &foreign_account_id);
+        if foreign_after != foreign_before || foreign_after.1 != "ready" {
+            failures.push(format!("{label}: foreign pointer target was modified: {foreign_after:?}"));
+        }
+    }
+
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn reconcile_v2_unresolved_owner_is_audited_once_and_dispatch_fails_closed() {
+    let label = "v2-unresolved-owner-audit";
+    let (directory, store, request_id, budget_id, key_account_id, user_cap_account_id, admin) =
+        held_v2_reservation_with_missing_pointer(label, MissingV2ReservationAccountPointer::Both);
+    let foreign_key = store
+        .issue_api_key_as_admin_with_max_concurrency(
+            "budget-user",
+            "v2-unresolved-owner-audit-foreign-key",
+            BTreeSet::from(["video:submit".into()]),
+            5,
+            &admin,
+        )
+        .unwrap();
+    let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+    let reservation_id: String = connection
+        .query_row(
+            "SELECT id FROM quota_reservations WHERE request_id = ?1",
+            [&request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE quota_reservations
+                 SET key_budget_account_id = ?2, user_cap_account_id = ?3
+                 WHERE request_id = ?1",
+                params![&request_id, &key_account_id, &user_cap_account_id],
+            )
+            .unwrap(),
+        1,
+    );
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE budget_operations SET api_key_id = ?2 WHERE parent_request_id = ?1",
+                params![&request_id, &foreign_key.id],
+            )
+            .unwrap(),
+        1,
+    );
+    let before = v2_reservation_snapshot(&connection, &request_id);
+    let key_before = v2_budget_account_snapshot(&connection, &key_account_id);
+    let user_cap_before = v2_budget_account_snapshot(&connection, &user_cap_account_id);
+    assert_eq!(key_before.1, "ready");
+    assert_eq!(user_cap_before.1, "ready");
+
+    assert_eq!(store.reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis()).unwrap(), 1);
+    let audit_count_and_metadata: (i64, Option<String>) = connection
+        .query_row(
+            "SELECT COUNT(*), MAX(metadata_json) FROM audit_events
+             WHERE action = 'quota.reconcile_required'
+               AND target_type = 'quota_reservation' AND target_id = ?1",
+            [&reservation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(audit_count_and_metadata.0, 1);
+    let metadata: serde_json::Value =
+        serde_json::from_str(audit_count_and_metadata.1.as_deref().unwrap()).unwrap();
+    assert_eq!(metadata["hold_preserved"], true);
+    assert!(metadata["reason"].as_str().is_some_and(|reason| !reason.is_empty()));
+    assert_eq!(v2_reservation_snapshot(&connection, &request_id), before);
+    assert_eq!(v2_budget_account_snapshot(&connection, &key_account_id), key_before);
+    assert_eq!(v2_budget_account_snapshot(&connection, &user_cap_account_id), user_cap_before);
+    assert!(store.mark_budget_step_dispatched(&request_id, &budget_id).is_err());
+
+    assert_eq!(store.reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis()).unwrap(), 1);
+    let audit_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM audit_events
+             WHERE action = 'quota.reconcile_required'
+               AND target_type = 'quota_reservation' AND target_id = ?1",
+            [&reservation_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(audit_count, 1, "repeated scans keep the observability event idempotent");
+    assert_eq!(v2_reservation_snapshot(&connection, &request_id), before);
+}
+
+#[test]
+fn reconcile_v2_missing_reservation_account_pointers_quarantines_both_owner_accounts() {
+    let cases = [
+        (MissingV2ReservationAccountPointer::Key, "key-pointer"),
+        (MissingV2ReservationAccountPointer::UserCap, "user-cap-pointer"),
+        (MissingV2ReservationAccountPointer::Both, "both-pointers"),
+    ];
+    let mut failures = Vec::new();
+
+    for (missing, label) in cases {
+        let (directory, store, request_id, _budget_id, key_account_id, user_cap_account_id, _admin) =
+            held_v2_reservation_with_missing_pointer(label, missing);
+        let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+        let before = v2_reservation_snapshot(&connection, &request_id);
+        let key_before = v2_budget_account_snapshot(&connection, &key_account_id);
+        let user_cap_before = v2_budget_account_snapshot(&connection, &user_cap_account_id);
+        assert_eq!(key_before.1, "ready");
+        assert_eq!(user_cap_before.1, "ready");
+
+        let invalid_groups = store
+            .reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis())
+            .unwrap();
+        if invalid_groups != 1 {
+            failures.push(format!("{label}: expected one invalid V2 group, got {invalid_groups}"));
+        }
+        if v2_reservation_snapshot(&connection, &request_id) != before {
+            failures.push(format!("{label}: reconciliation changed reservation, execution, or ledger facts"));
+        }
+        let key_after = v2_budget_account_snapshot(&connection, &key_account_id);
+        let user_cap_after = v2_budget_account_snapshot(&connection, &user_cap_account_id);
+        if key_after.0 != key_before.0 || key_after.1 != "reconcile_required" {
+            failures.push(format!("{label}: Key account was not quarantined without changing its version: {key_after:?}"));
+        }
+        if user_cap_after.0 != user_cap_before.0 || user_cap_after.1 != "reconcile_required" {
+            failures.push(format!("{label}: user-cap account was not quarantined without changing its version: {user_cap_after:?}"));
+        }
+    }
+
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn dispatch_v2_with_missing_reservation_account_pointers_fails_closed_without_mutation_after_reopen() {
+    let cases = [
+        (MissingV2ReservationAccountPointer::Key, "key-pointer"),
+        (MissingV2ReservationAccountPointer::UserCap, "user-cap-pointer"),
+        (MissingV2ReservationAccountPointer::Both, "both-pointers"),
+    ];
+    let mut failures = Vec::new();
+
+    for (missing, label) in cases {
+        let (directory, store, request_id, budget_id, key_account_id, user_cap_account_id, _admin) =
+            held_v2_reservation_with_missing_pointer(label, missing);
+        let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+        let before = v2_reservation_snapshot(&connection, &request_id);
+        let key_before = v2_budget_account_snapshot(&connection, &key_account_id);
+        let user_cap_before = v2_budget_account_snapshot(&connection, &user_cap_account_id);
+
+        let first_dispatch = store.mark_budget_step_dispatched(&request_id, &budget_id);
+        if first_dispatch.is_ok() {
+            failures.push(format!("{label}: dispatch was accepted before reconciliation: {first_dispatch:?}"));
+        }
+        if v2_reservation_snapshot(&connection, &request_id) != before {
+            failures.push(format!("{label}: rejected dispatch changed request, step, reservation, or ledger facts"));
+        }
+        if v2_budget_account_snapshot(&connection, &key_account_id) != key_before
+            || v2_budget_account_snapshot(&connection, &user_cap_account_id) != user_cap_before
+        {
+            failures.push(format!("{label}: rejected dispatch changed a budget account"));
+        }
+
+        drop(store);
+        let reopened = CoreStore::open(&directory.0).unwrap();
+        let replay_dispatch = reopened.mark_budget_step_dispatched(&request_id, &budget_id);
+        if replay_dispatch.is_ok() {
+            failures.push(format!("{label}: dispatch after reopening was accepted: {replay_dispatch:?}"));
+        }
+        if v2_reservation_snapshot(&connection, &request_id) != before {
+            failures.push(format!("{label}: reopened dispatch changed request, step, reservation, or ledger facts"));
+        }
+        if v2_budget_account_snapshot(&connection, &key_account_id) != key_before
+            || v2_budget_account_snapshot(&connection, &user_cap_account_id) != user_cap_before
+        {
+            failures.push(format!("{label}: reopened dispatch changed a budget account"));
+        }
+    }
+
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 #[test]
 fn reconcile_v2_wrong_user_cap_ledger_owner_quarantines_accounts_and_blocks_admission() {
     let (directory, store, key_id, admin) = budget_fixture("v2-event-group-owner-mismatch", 5, 100_000_000);
@@ -1824,6 +2404,105 @@ fn newly_created_v2_reserve_is_tagged_with_local_authorization_revision_one() {
         .unwrap();
     assert!(!rows.is_empty());
     assert!(rows.iter().all(|(revision, account_version)| *revision == Some(1) && account_version.is_some()));
+}
+
+#[test]
+fn add_budget_step_records_revision_one_for_reserve_and_authorization_history() {
+    let (directory, store, key_id, admin) = budget_fixture("add-step-revision-one", 2, 100_000_000);
+    store
+        .quota_pool_grant_as_admin(
+            &admin,
+            aiwork_core::QuotaGrant {
+                user_id: "budget-user".into(),
+                resource_kind: "credits".into(),
+                amount: 100_000_000,
+                actor_user_id: "budget-admin".into(),
+                reason: "add-budget-step revision-one fixture".into(),
+            },
+        )
+        .unwrap();
+    let parent_request_id = begin_video_parent(&store, &key_id, "add-step-revision-one-parent");
+    let helper = match store
+        .begin_budget_assist_request(
+            &parent_request_id,
+            budget_assist_input(&key_id, "add-step-revision-one-helper"),
+        )
+        .unwrap()
+    {
+        BeginRequest::Created(request) => request,
+        other => panic!("expected a new helper request, got {other:?}"),
+    };
+    store
+        .begin_budget_operation(
+            &parent_request_id,
+            assist_budget_step(
+                &store,
+                &key_id,
+                &parent_request_id,
+                &helper.id,
+                "add-step-revision-one-assist",
+            ),
+        )
+        .unwrap();
+    dispatch_current_budget_step(&store, &helper.id).unwrap();
+    store
+        .mark_budget_step_execution(&helper.id, aiwork_core::BudgetExecutionState::Succeeded)
+        .unwrap();
+
+    let video = video_budget_step(
+        &store,
+        &key_id,
+        &parent_request_id,
+        "add-step-revision-one-video",
+    );
+    let expected_authorization = video.authorization.clone();
+    store.add_budget_step(&parent_request_id, video).unwrap();
+
+    let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+    let event_group_id: String = connection
+        .query_row(
+            "SELECT event_group_id FROM quota_reservations WHERE request_id = ?1",
+            [&parent_request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let reserve_rows: Vec<(String, Option<i64>, Option<i64>)> = connection
+        .prepare(
+            "SELECT budget_account_id, authorization_revision, budget_version
+             FROM quota_ledger WHERE event_group_id = ?1 AND event_kind = 'reserve'
+             ORDER BY budget_account_id",
+        )
+        .unwrap()
+        .query_map([&event_group_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(reserve_rows.len(), 2, "Key and configured user-cap each have a reserve row");
+    assert!(reserve_rows
+        .iter()
+        .all(|(_, revision, version)| *revision == Some(1) && version.is_some()));
+
+    let history: (i64, String, Vec<u8>, i64) = connection
+        .query_row(
+            "SELECT local_revision, authorization_json, authorization_hash, hold_microcredits
+             FROM budget_authorization_revisions WHERE request_id = ?1",
+            [&parent_request_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(history.0, 1);
+    assert_eq!(history.2, connection
+        .query_row(
+            "SELECT authorization_hash FROM budget_steps WHERE request_id = ?1",
+            [&parent_request_id],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .unwrap());
+    assert_eq!(history.3, expected_authorization.hold_credits.as_microcredits());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&history.1).unwrap(),
+        serde_json::to_value(&expected_authorization).unwrap(),
+    );
 }
 
 #[test]

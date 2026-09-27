@@ -754,8 +754,24 @@ impl CoreStore {
         let mut statement = transaction.prepare(
             "SELECT id, user_id, request_id, resource_kind, amount, state, expires_at_ms,
                     api_key_id, key_budget_account_id, user_cap_account_id, event_group_id
-             FROM quota_reservations
+             FROM quota_reservations reservation
              WHERE key_budget_account_id IS NOT NULL
+                OR EXISTS (
+                    SELECT 1 FROM budget_steps step
+                    WHERE step.reservation_id = reservation.id
+                      AND step.request_id = reservation.request_id
+                )
+                OR EXISTS (
+                    SELECT 1 FROM budget_operations operation
+                    WHERE operation.parent_request_id = reservation.request_id
+                )
+                OR EXISTS (
+                    SELECT 1 FROM request_relations relation
+                    JOIN budget_operations operation
+                      ON operation.parent_request_id = relation.parent_request_id
+                    WHERE relation.child_request_id = reservation.request_id
+                      AND relation.relationship_kind = 'seedance_assist'
+                )
              ORDER BY created_at_ms, id",
         )?;
         let reservations = statement
@@ -765,21 +781,28 @@ impl CoreStore {
 
         let mut invalid_groups = 0_u64;
         for reservation in reservations {
+            let is_v2 = Self::reservation_has_v2_context(&transaction, &reservation)?;
             let (consistent, reason) = Self::validate_quota_event_group(&transaction, &reservation)?;
             if consistent {
                 continue;
             }
 
             invalid_groups += 1;
-            let mut account_ids = Vec::new();
-            if let Some(account_id) = reservation.key_budget_account_id.as_deref() {
-                account_ids.push(account_id.to_owned());
-            }
-            if let Some(account_id) = reservation.user_cap_account_id.as_deref() {
-                if !account_ids.iter().any(|existing| existing == account_id) {
+            let account_ids = if is_v2 {
+                Self::v2_owner_account_ids_in_transaction(&transaction, &reservation)?
+                    .unwrap_or_default()
+            } else {
+                let mut account_ids = Vec::new();
+                if let Some(account_id) = reservation.key_budget_account_id.as_deref() {
                     account_ids.push(account_id.to_owned());
                 }
-            }
+                if let Some(account_id) = reservation.user_cap_account_id.as_deref() {
+                    if !account_ids.iter().any(|existing| existing == account_id) {
+                        account_ids.push(account_id.to_owned());
+                    }
+                }
+                account_ids
+            };
             let mut transitioned = false;
             for account_id in &account_ids {
                 transitioned |= transaction.execute(
@@ -789,7 +812,16 @@ impl CoreStore {
                     params![now_ms, account_id],
                 )? > 0;
             }
-            if transitioned {
+            let audit_exists: bool = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM audit_events
+                    WHERE action = 'quota.reconcile_required'
+                      AND target_type = 'quota_reservation' AND target_id = ?1
+                 )",
+                [&reservation.id],
+                |row| row.get(0),
+            )?;
+            if transitioned || !audit_exists {
                 Self::insert_audit_event(
                     &transaction,
                     "system",
@@ -811,6 +843,210 @@ impl CoreStore {
         Ok(invalid_groups)
     }
 
+    pub(crate) fn reservation_has_v2_context(
+        transaction: &Transaction<'_>,
+        reservation: &Reservation,
+    ) -> Result<bool, CoreError> {
+        transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM budget_steps
+                    WHERE reservation_id = ?1 AND request_id = ?2
+                 ) OR EXISTS(
+                    SELECT 1 FROM budget_operations
+                    WHERE parent_request_id = ?2
+                 ) OR EXISTS(
+                    SELECT 1 FROM request_relations relation
+                    JOIN budget_operations operation
+                      ON operation.parent_request_id = relation.parent_request_id
+                    WHERE relation.child_request_id = ?2
+                      AND relation.relationship_kind = 'seedance_assist'
+                 )",
+                params![&reservation.id, &reservation.request_id],
+                |row| row.get(0),
+            )
+            .map_err(CoreError::from)
+    }
+
+    fn v2_hold_accounts_from_ledger_in_transaction(
+        transaction: &Transaction<'_>,
+        event_group_id: &str,
+        expected_user_id: &str,
+        expected_key_id: &str,
+    ) -> Result<Option<Vec<(String, String, i64)>>, CoreError> {
+        let reserve_events = {
+            let mut statement = transaction.prepare(
+                "SELECT budget_account_id
+                 FROM quota_ledger
+                 WHERE event_group_id = ?1 AND event_kind = 'reserve'
+                 ORDER BY entry_id",
+            )?;
+            let rows = statement.query_map([event_group_id], |row| row.get::<_, Option<String>>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if reserve_events.is_empty() {
+            return Ok(None);
+        }
+
+        let mut key_account = None;
+        let mut user_cap_account = None;
+        let mut seen_account_ids = Vec::new();
+        for event_account_id in reserve_events {
+            let Some(account_id) = event_account_id.as_deref() else {
+                continue;
+            };
+            if seen_account_ids.iter().any(|seen| seen == account_id) {
+                continue;
+            }
+
+            let account = transaction
+                .query_row(
+                    "SELECT scope, user_id, api_key_id, resource_kind, version
+                     FROM quota_budget_accounts WHERE id = ?1",
+                    [account_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((scope, user_id, api_key_id, resource_kind, current_version)) = account else {
+                continue;
+            };
+            if user_id != expected_user_id
+                || resource_kind != "credits"
+                || current_version <= 0
+            {
+                continue;
+            }
+
+            let resolved = (account_id.to_owned(), scope.clone(), current_version);
+            match scope.as_str() {
+                "key" if api_key_id.as_deref() == Some(expected_key_id) && key_account.is_none() => {
+                    key_account = Some(resolved);
+                }
+                "user_cap" if api_key_id.is_none() && user_cap_account.is_none() => {
+                    user_cap_account = Some(resolved);
+                }
+                _ => continue,
+            }
+            seen_account_ids.push(account_id.to_owned());
+        }
+
+        let mut accounts = Vec::new();
+        if let Some(key_account) = key_account {
+            accounts.push(key_account);
+        }
+        if let Some(user_cap_account) = user_cap_account {
+            accounts.push(user_cap_account);
+        }
+        Ok((!accounts.is_empty()).then_some(accounts))
+    }
+
+    fn v2_owner_account_ids_in_transaction(
+        transaction: &Transaction<'_>,
+        reservation: &Reservation,
+    ) -> Result<Option<Vec<String>>, CoreError> {
+        let owner = transaction
+            .query_row(
+                "SELECT request.user_id, request.api_key_id, step.core_key_id,
+                        operation.api_key_id, parent.user_id, parent.api_key_id
+                 FROM budget_steps step
+                 JOIN budget_operations operation ON operation.operation_id = step.operation_id
+                 JOIN requests request ON request.id = step.request_id
+                 JOIN requests parent ON parent.id = operation.parent_request_id
+                 WHERE step.reservation_id = ?1 AND step.request_id = ?2",
+                params![&reservation.id, &reservation.request_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((request_user_id, request_key_id, step_key_id, operation_key_id, parent_user_id, parent_key_id)) = owner
+        else {
+            return Ok(None);
+        };
+        if reservation.resource_kind != "credits"
+            || reservation.user_id != request_user_id
+            || reservation.api_key_id.as_deref() != Some(request_key_id.as_str())
+            || step_key_id != request_key_id
+            || operation_key_id != request_key_id
+            || parent_user_id != request_user_id
+            || parent_key_id != request_key_id
+        {
+            return Ok(None);
+        }
+
+        let Some(event_group_id) = reservation.event_group_id.as_deref() else {
+            return Ok(None);
+        };
+        let ledger_accounts = Self::v2_hold_accounts_from_ledger_in_transaction(
+            transaction,
+            event_group_id,
+            &request_user_id,
+            &request_key_id,
+        )?
+        .unwrap_or_default();
+        let mut accounts = ledger_accounts;
+        for (pointer, expected_scope) in [
+            (reservation.key_budget_account_id.as_deref(), "key"),
+            (reservation.user_cap_account_id.as_deref(), "user_cap"),
+        ] {
+            let Some(account_id) = pointer else {
+                continue;
+            };
+            if accounts.iter().any(|(id, _, _)| id == account_id) {
+                continue;
+            }
+            let account = transaction
+                .query_row(
+                    "SELECT scope, user_id, api_key_id, resource_kind, version
+                     FROM quota_budget_accounts WHERE id = ?1",
+                    [account_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((scope, user_id, api_key_id, resource_kind, version)) = account else {
+                continue;
+            };
+            let expected_account_key = (expected_scope == "key").then_some(request_key_id.as_str());
+            if scope == expected_scope
+                && user_id == request_user_id
+                && api_key_id.as_deref() == expected_account_key
+                && resource_kind == reservation.resource_kind
+                && version > 0
+            {
+                accounts.push((account_id.to_owned(), scope, version));
+            }
+        }
+        accounts.sort_by_key(|(_, scope, _)| if scope == "key" { 0 } else { 1 });
+        if accounts.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(accounts.into_iter().map(|(id, _, _)| id).collect()))
+        }
+    }
+
     fn validate_quota_event_group(
         transaction: &Transaction<'_>,
         reservation: &Reservation,
@@ -821,13 +1057,7 @@ impl CoreStore {
         if event_group_id.is_empty() {
             return Ok((false, "empty_event_group_id".into()));
         }
-        let is_v2: bool = transaction.query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM budget_steps WHERE reservation_id = ?1 AND request_id = ?2
-             )",
-            params![&reservation.id, &reservation.request_id],
-            |row| row.get(0),
-        )?;
+        let is_v2 = Self::reservation_has_v2_context(transaction, reservation)?;
         if is_v2 {
             return Self::validate_v2_quota_event_group(transaction, reservation, event_group_id);
         }
@@ -949,7 +1179,7 @@ impl CoreStore {
         Ok((true, String::new()))
     }
 
-    fn validate_v2_quota_event_group(
+    pub(crate) fn validate_v2_quota_event_group(
         transaction: &Transaction<'_>,
         reservation: &Reservation,
         event_group_id: &str,
@@ -1157,46 +1387,34 @@ impl CoreStore {
             _ => return Ok((false, "v2_step_kind_parent_mismatch".into())),
         }
 
-        let mut account_ids = vec![key_account_id.to_owned()];
-        if let Some(user_account_id) = reservation.user_cap_account_id.as_deref() {
-            if user_account_id == key_account_id {
-                return Ok((false, "duplicate_budget_account_id".into()));
-            }
-            account_ids.push(user_account_id.to_owned());
+        let Some(hold_accounts) = Self::v2_hold_accounts_from_ledger_in_transaction(
+            transaction,
+            event_group_id,
+            &step.request_user_id,
+            &step.core_key_id,
+        )? else {
+            return Ok((false, "v2_initial_reserve_account_set_invalid".into()));
+        };
+        let expected_key_account_id = hold_accounts
+            .first()
+            .map(|(account_id, _, _)| account_id.as_str());
+        if expected_key_account_id != Some(key_account_id) {
+            return Ok((false, "v2_key_account_pointer_mismatch".into()));
         }
-        let mut account_versions = Vec::with_capacity(account_ids.len());
-        for (index, account_id) in account_ids.iter().enumerate() {
-            let account = transaction
-                .query_row(
-                    "SELECT scope, user_id, api_key_id, resource_kind, version
-                     FROM quota_budget_accounts WHERE id = ?1",
-                    [account_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, Option<String>>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, i64>(4)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            let Some((scope, user_id, api_key_id, resource_kind, version)) = account else {
-                return Ok((false, format!("missing_budget_account:{account_id}")));
-            };
-            let expected_scope = if index == 0 { "key" } else { "user_cap" };
-            let expected_key = (index == 0).then_some(step.core_key_id.as_str());
-            if scope != expected_scope
-                || user_id != reservation.user_id
-                || api_key_id.as_deref() != expected_key
-                || resource_kind != "credits"
-                || version <= 0
-            {
-                return Ok((false, format!("v2_budget_account_owner_mismatch:{account_id}")));
-            }
-            account_versions.push(version);
+        let expected_user_cap_account_id = hold_accounts
+            .get(1)
+            .map(|(account_id, _, _)| account_id.as_str());
+        if reservation.user_cap_account_id.as_deref() != expected_user_cap_account_id {
+            return Ok((false, "v2_user_cap_account_pointer_mismatch".into()));
         }
+        let account_ids = hold_accounts
+            .iter()
+            .map(|(account_id, _, _)| account_id.clone())
+            .collect::<Vec<_>>();
+        let account_versions = hold_accounts
+            .iter()
+            .map(|(_, _, version)| *version)
+            .collect::<Vec<_>>();
 
         let final_kind = match (reservation.state, step.financial_state.as_str()) {
             (ReservationState::Held, "held" | "conflict")

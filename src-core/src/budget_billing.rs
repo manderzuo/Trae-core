@@ -467,6 +467,34 @@ impl CoreStore {
         if budget_id != expected_budget_id {
             return Err(CoreError::IdempotencyConflict);
         }
+        let reservation = Self::reservation_by_request(&transaction, request_id)?.ok_or_else(|| {
+            CoreError::ReservationNotFound {
+                reservation_id: request_id.into(),
+            }
+        })?;
+        if Self::reservation_has_v2_context(&transaction, &reservation)? {
+            let validation = if let Some(event_group_id) = reservation.event_group_id.as_deref() {
+                Self::validate_v2_quota_event_group(&transaction, &reservation, event_group_id)?
+            } else {
+                (false, "missing_event_group_id".to_owned())
+            };
+            if !validation.0 {
+                return Err(CoreError::Validation {
+                    field: "quota_reservation.v2_integrity".into(),
+                    reason: format!("V2 reservation is not safe to dispatch: {}", validation.1),
+                });
+            }
+            let key_account_id = reservation.key_budget_account_id.as_deref().ok_or_else(|| {
+                CoreError::Validation {
+                    field: "quota_reservation.key_budget_account_id".into(),
+                    reason: "V2 reservation is missing its required Key account".into(),
+                }
+            })?;
+            Self::ensure_budget_account_ready_in_transaction(&transaction, key_account_id)?;
+            if let Some(user_cap_account_id) = reservation.user_cap_account_id.as_deref() {
+                Self::ensure_budget_account_ready_in_transaction(&transaction, user_cap_account_id)?;
+            }
+        }
         if attempted != 0 {
             if matches!(execution_state.as_str(), "running" | "unknown") {
                 return Ok(BudgetMutation::Duplicate);
@@ -511,11 +539,6 @@ impl CoreStore {
         if blocked {
             return Err(CoreError::ApiKeyBillingBlocked { api_key_id });
         }
-        let reservation = Self::reservation_by_request(&transaction, request_id)?.ok_or_else(|| {
-            CoreError::ReservationNotFound {
-                reservation_id: request_id.into(),
-            }
-        })?;
         if let Some(account_id) = reservation.key_budget_account_id.as_deref() {
             Self::ensure_budget_account_ready_in_transaction(&transaction, account_id)?;
         }
@@ -848,6 +871,16 @@ impl CoreStore {
                 });
             }
         };
+        let expected_reserve_rows = 1 + i64::from(reservation.user_cap_account_id.is_some());
+        let tagged_reserve_rows = transaction.execute(
+            "UPDATE quota_ledger SET authorization_revision = 1
+             WHERE event_group_id = ?1 AND request_id = ?2 AND event_kind = 'reserve'
+               AND authorization_revision IS NULL",
+            params![reservation.event_group_id.as_deref(), &input.authorization.request_id],
+        )?;
+        if tagged_reserve_rows != expected_reserve_rows as usize {
+            return Err(CoreError::IdempotencyConflict);
+        }
         transaction.execute(
             "INSERT INTO budget_steps
              (request_id, operation_id, kind, budget_id, core_key_id, request_fingerprint,
@@ -872,6 +905,20 @@ impl CoreStore {
                 hold_microcredits,
                 input.authorization.expires_at_ms,
                 &reservation.id,
+                now,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO budget_authorization_revisions
+             (request_id, local_revision, budget_id, authorization_json, authorization_hash,
+              hold_microcredits, previous_budget_id, adopted_at_ms)
+             VALUES (?1, 1, ?2, ?3, ?4, ?5, NULL, ?6)",
+            params![
+                &input.authorization.request_id,
+                &input.authorization.budget_id,
+                serde_json::to_string(&input.authorization)?,
+                &authorization_hash,
+                hold_microcredits,
                 now,
             ],
         )?;
