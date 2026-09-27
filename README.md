@@ -103,17 +103,19 @@ Windows 发布脚本默认从 PATH 查找 `cargo`，也支持覆盖输出目录�
 /opt/gemstory/starlink-dimension-router/current/starlink-dimension-router
 ```
 
-腾讯云现有生产服务目前通过 `starlink-dimension-router.service.d/` 下的版本化 drop-in 选择具体 release，而不是 `current` 链接。升级时应保留主 unit 和已有版本/drop-in，新增一个排序更后的版本化 drop-in 指向新 release；不要为套用模板而重写现有服务配置。回滚时先恢复迁移前数据库，再切回旧 release。
+腾讯云现有生产服务目前通过 `starlink-dimension-router.service.d/` 下的版本化 drop-in 选择具体 release，而不是 `current` 链接。升级时应保留主 unit 和已有版本/drop-in，新增一个排序更后的版本化 drop-in 指向新 release；不要为套用模板而重写现有服务配置。
+
+schema 26 与新 v2 账本的恢复规则：一旦新 v2 账本已写入任何新财务事实，先关闭新收费准入；保留并继续运行能够识别 schema 26 的兼容结算进程和生产数据库，让在途任务继续结算，并确保旧任务结果与账单仍可查询。此后不得恢复迁移前数据库，也不得盲目切回不识别 schema 26 的旧 release。迁移前只读备份和回滚准备可以保留，但只有确认尚未产生任何新财务事实时，才允许将数据库、实际使用的 release 选择入口（`current` 链接或版本化 drop-in）及相关服务配置作为一套一致状态整体还原；不得只恢复数据库或只切换程序。本文其他位置的 v20→v21 回滚说明仅适用于对应历史迁移且尚未产生任何新财务事实的场景，不得套用于当前 schema 26 数据库或已产生新财务事实的场景。
 
 推荐每个版本放在独立 `releases/<版本号>/` 目录，再把 `current` 指向已验收版本；数据目录固定在 `/var/lib/starlink-dimension-router`，加密环境文件固定在 `/etc/starlink-dimension-router/key-encryption.env`，二者不可随版本目录轮换。不要把生产密钥、数据库、FRP token 或真实配置提交到 Git。
 
 带数据库 schema 迁移的发布流程：
 
-1. 维护窗口内停止 Core 写入入口并停止服务，确认没有进程打开 SQLite。
-2. 在服务器持久卷的受限备份目录备份整个 Core 数据目录（数据库及存在的 WAL/SHM）、当前 `current` 指向和服务配置；不要下载生产数据库到开发机。
-3. 将新二进制放入版本目录，校验 SHA-256；切换 `current`，启动服务，让 SQLite 事务执行 v21 迁移。
-4. 检查 `systemctl status`、`journalctl`、`curl --fail https://<域名>/healthz` 和 `/admin`，再恢复外部流量。
-5. 如健康检查失败，停止服务，保留故障现场副本，再同时恢复旧版本链接和迁移前数据库备份；只回退二进制不足以回到 v20。确认恢复无误后再开放流量。
+1. 维护窗口内先关闭新收费准入；确认没有未完成写入，且在途任务状态已持久化并可由 schema 26 兼容结算进程恢复后，再停止服务并确认没有进程打开 SQLite。
+2. 在服务器持久卷的受限备份目录建立迁移前只读备份，包含整个 Core 数据目录（数据库及存在的 WAL/SHM）、实际使用的 release 选择入口和服务配置；该备份仅在尚未产生任何新财务事实时可用于整套还原。不要下载生产数据库到开发机。
+3. 将新二进制放入版本目录并校验 SHA-256；腾讯云现有服务应新增排序更后的版本化 drop-in 指向新 release，保留主 unit 与已有 drop-in，不要切换 `current` 或重写现有服务配置。启动能够识别 schema 26 的版本，执行对应迁移并启用新 v2 账本。
+4. 检查 `systemctl status`、`journalctl`、`curl --fail https://<域名>/healthz` 和 `/admin`；确认旧任务结果与账单仍可查询，且在途任务由兼容结算进程继续处理。新收费准入保持关闭，直到发布门槛验收通过。
+5. 如迁移或健康检查失败，关闭新收费准入并保留故障现场副本。若新财务事实已经产生，保留生产数据库并继续运行 schema 26 兼容结算进程，使在途任务继续结算、旧任务结果和账单保持可查；不得恢复迁移前数据库，也不得盲目切回不识别 schema 26 的旧 release。只有确认尚未产生任何新财务事实时，才可将迁移前数据库、release 选择入口和服务配置作为一套整体还原；核对无误后再开放新收费准入。
 
 健康检查只证明 HTTP 服务启动，不会发送真实上游请求或验证真实积分扣费。公网反向代理样例使用 `api.gemstory.cn`，上线前需核验服务器实际域名、FRP/Nginx 路由、TLS 证书、持久卷、数据库路径及管理员登录状态；不能仅凭模板推定生产拓扑。
 
