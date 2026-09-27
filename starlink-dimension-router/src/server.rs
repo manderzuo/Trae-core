@@ -6,6 +6,7 @@ use serde_json::json;
 use crate::{admin_auth, admin_routes, auth, state::StarlinkRouterState, user_routes};
 
 pub fn build_router(state: Arc<StarlinkRouterState>) -> Router {
+    crate::budget_reconciler::spawn(&state);
     crate::video_reconciler::spawn(&state);
     crate::key_registry_sync::spawn(&state);
     crate::assets::spawn_cleanup(&state);

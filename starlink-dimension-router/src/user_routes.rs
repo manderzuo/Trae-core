@@ -68,7 +68,7 @@ fn validate_vision_data_urls(body: &Value) -> Result<(), Response> {
 
 const MAX_SEEDANCE_ASSIST_PROMPT_BYTES: usize = 12 * 1024;
 
-fn extract_seedance_prompt(body: &Value) -> Result<String, Response> {
+pub(crate) fn extract_seedance_prompt(body: &Value) -> Result<String, Response> {
     let user_message = body
         .get("messages")
         .and_then(Value::as_array)
@@ -98,7 +98,7 @@ fn extract_seedance_prompt(body: &Value) -> Result<String, Response> {
     Ok(prompt)
 }
 
-fn infer_video_parameters_from_prompt(body: &mut Value) {
+pub(crate) fn infer_video_parameters_from_prompt(body: &mut Value) {
     let Ok(prompt) = extract_seedance_prompt(body) else { return; };
     let normalized = prompt.to_ascii_lowercase();
     let chars: Vec<char> = normalized.chars().collect();
@@ -254,7 +254,7 @@ fn materialize_text_asset_ids(
 }
 
 #[derive(Default)]
-struct BridgeAssetMap {
+pub(crate) struct BridgeAssetMap {
     image: Vec<String>,
     video: Vec<String>,
 }
@@ -266,7 +266,7 @@ struct PendingAsset {
     bytes: Vec<u8>,
 }
 
-async fn materialize_bridge_assets(
+pub(crate) async fn materialize_bridge_assets(
     state: &StarlinkRouterState,
     principal: &Principal,
     body: &mut Value,
@@ -299,7 +299,7 @@ async fn materialize_bridge_assets(
 
     let mut bridge_ids = HashMap::<String, String>::new();
     for asset in pending {
-        let bridge_id = state.bridge.lock().unwrap().upload_asset(&asset.filename, &asset.mime_type, &asset.bytes, request_id)
+        let bridge_id = state.bridge_client().upload_asset(&asset.filename, &asset.mime_type, &asset.bytes, request_id)
             .map_err(|error| (StatusCode::BAD_GATEWAY, Json(json!({"error": {"type": "bridge_error", "message": error, "request_id": request_id}}))).into_response())?;
         bridge_ids.insert(asset.core_id, bridge_id);
     }
@@ -493,9 +493,7 @@ fn quote_and_reserve_or_controlled(
     model: &str,
 ) -> Result<QuoteAdmission, Response> {
     let upstream_snapshot = state
-        .bridge
-        .lock()
-        .unwrap()
+        .bridge_client()
         .upstream_credit_snapshot()
         .map_err(|_| {
             upstream_credits_unavailable(
@@ -509,9 +507,7 @@ fn quote_and_reserve_or_controlled(
         .request_fingerprint_for_billing(request_id)
         .map_err(|error| request_error(StatusCode::INTERNAL_SERVER_ERROR, "core_error", error.to_string()))?;
     let quote = state
-        .bridge
-        .lock()
-        .unwrap()
+        .bridge_client()
         .quote(request_id, endpoint, model, &fingerprint);
     match quote {
         Ok(BridgeQuoteResult::Quoted(quote)) => {
@@ -762,7 +758,7 @@ fn fail_unreserved_pre_dispatch_request(
         .map_err(|error| error.to_string())
 }
 
-fn finish_failed_quote_request(
+pub(crate) fn finish_failed_quote_request(
     state: &StarlinkRouterState,
     request_id: &str,
     response: Response,
@@ -837,12 +833,12 @@ pub(crate) fn reconcile_billing_request_once(
     state: &StarlinkRouterState,
     request_id: &str,
 ) -> Result<BillingReceiptResult, String> {
-    let result = state.bridge.lock().unwrap().billing(request_id);
+    let result = state.bridge_client().billing(request_id);
     let result = match result {
         Ok(BridgeBillingResult::Unresolved)
             if state.store.is_seedance_assist_child(request_id).map_err(|error| error.to_string())? =>
         {
-            state.bridge.lock().unwrap().finalize_chat_billing(request_id)
+            state.bridge_client().finalize_chat_billing(request_id)
         }
         other => other,
     };
@@ -866,6 +862,11 @@ pub(crate) fn reconcile_billing_request_once(
 /// and asks AI Work for their receipts. Requests with a live video job are
 /// reconciled by the video status worker instead, avoiding duplicate polling.
 pub fn reconcile_pending_billing_requests_once(state: &StarlinkRouterState) -> usize {
+    crate::budget_reconciler::reconcile_once(state);
+    reconcile_legacy_pending_billing_requests_once(state)
+}
+
+pub(crate) fn reconcile_legacy_pending_billing_requests_once(state: &StarlinkRouterState) -> usize {
     let pending = match state.store.recoverable_billing_requests(100) {
         Ok(requests) => requests,
         Err(_) => return 0,
@@ -904,7 +905,7 @@ pub fn reconcile_pending_billing_requests_once(state: &StarlinkRouterState) -> u
             continue;
         }
         if step.kind == ControlledStepKind::Video {
-            let observed_task = state.bridge.lock().unwrap().controlled_video_task(&step.request_id);
+            let observed_task = state.bridge_client().controlled_video_task(&step.request_id);
             let task = match (step.task_ref.as_deref(), observed_task) {
                 (Some(expected), Ok(Some((observed, status)))) if expected == observed => Some((observed, status)),
                 (Some(expected), Ok(None) | Err(_)) => Some((expected.to_string(), "queued".into())),
@@ -930,7 +931,7 @@ pub fn reconcile_pending_billing_requests_once(state: &StarlinkRouterState) -> u
         }
         queried += 1;
         let receipt = {
-            let bridge = state.bridge.lock().unwrap();
+            let bridge = state.bridge_client();
             match step.kind {
                 ControlledStepKind::Assist => match bridge.billing(&step.request_id) {
                     Ok(BridgeBillingResult::Unresolved) => bridge.finalize_chat_billing(&step.request_id),
@@ -1028,7 +1029,7 @@ fn replay_existing_video_request(
     existing_request_error(&state, request_id)
 }
 
-fn require_video_admission(
+pub(crate) fn require_video_admission(
     state: &StarlinkRouterState,
     principal: &Principal,
     model: &str,
@@ -1051,7 +1052,7 @@ fn require_video_admission(
 
 pub async fn models(State(state): State<Arc<StarlinkRouterState>>, headers: HeaderMap, Extension(_principal): Extension<Principal>) -> Response {
     let request_id = request_id();
-    match state.bridge.lock().unwrap().forward("GET", "/v1/models", &[], &header_map(&headers), &request_id) {
+    match state.bridge_client().forward("GET", "/v1/models", &[], &header_map(&headers), &request_id) {
         Ok(response) => proxy(response.status, response.headers, response.body),
         Err(error) => (StatusCode::BAD_GATEWAY, Json(json!({"error": {"type": "bridge_error", "message": error}}))).into_response(),
     }
@@ -1126,7 +1127,7 @@ fn run_controlled_seedance_assist(
         Err(_) => return Err(reconcile_required(parent_request_id)),
     };
     let headers = BTreeMap::from([("content-type".into(), "application/json".into())]);
-    let response = state.bridge.lock().unwrap().forward_controlled_for_key(
+    let response = state.bridge_client().forward_controlled_for_key(
         "POST", "/v1/chat/completions", &body, &headers,
         &child_id, operation_id, &principal.key_id,
     );
@@ -1139,7 +1140,7 @@ fn run_controlled_seedance_assist(
         }
     };
     let receipt = {
-        let bridge = state.bridge.lock().unwrap();
+        let bridge = state.bridge_client();
         match bridge.billing(&child_id) {
             Ok(BridgeBillingResult::Final(receipt)) => Ok(BridgeBillingResult::Final(receipt)),
             Ok(BridgeBillingResult::Unresolved) => bridge.finalize_chat_billing(&child_id),
@@ -1192,7 +1193,7 @@ fn run_controlled_seedance_assist(
 
 fn settle_controlled_chat_request(state: &StarlinkRouterState, request_id: &str) -> bool {
     let receipt = {
-        let bridge = state.bridge.lock().unwrap();
+        let bridge = state.bridge_client();
         match bridge.billing(request_id) {
             Ok(BridgeBillingResult::Unresolved) => bridge.finalize_chat_billing(request_id),
             other => other,
@@ -1288,7 +1289,7 @@ fn run_seedance_assist(
     }
     let body = serde_json::to_vec(&assist_body).unwrap_or_default();
     let headers = BTreeMap::from([("content-type".into(), "application/json".into())]);
-    let upstream = state.bridge.lock().unwrap_or_else(|error| error.into_inner()).forward_billed_for_key(
+    let upstream = state.bridge_client().forward_billed_for_key(
         "POST",
         "/v1/chat/completions",
         &body,
@@ -1330,7 +1331,7 @@ fn run_seedance_assist(
     })
 }
 
-struct BridgeBodyStream(tokio::sync::mpsc::Receiver<Result<Bytes, io::Error>>);
+pub(crate) struct BridgeBodyStream(pub(crate) tokio::sync::mpsc::Receiver<Result<Bytes, io::Error>>);
 
 impl Stream for BridgeBodyStream {
     type Item = Result<Bytes, io::Error>;
@@ -1532,7 +1533,7 @@ fn stream_seedance_video_response(
                     let content_state = stream_state.clone();
                     let request_id = current.request_id.clone();
                     let probe = tokio::task::spawn_blocking(move || {
-                        content_state.bridge.lock().unwrap_or_else(|error| error.into_inner()).forward(
+                        content_state.bridge_client().forward(
                             "HEAD", &content_path, &[], &BTreeMap::new(), &request_id,
                         )
                     }).await;
@@ -1659,7 +1660,7 @@ async fn run_controlled_chat_completion(
     let incoming_headers = video_forward_headers(&headers, &request_id);
     let streaming = forward_value.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if streaming {
-        let bridge = state.bridge.lock().unwrap().clone();
+        let bridge = state.bridge_client().clone();
         let request_id_for_send = request_id.clone();
         let operation_id = operation.operation_id.clone();
         let key_id = principal.key_id.clone();
@@ -1698,7 +1699,7 @@ async fn run_controlled_chat_completion(
         };
     }
 
-    let upstream = state.bridge.lock().unwrap().forward_controlled_for_key(
+    let upstream = state.bridge_client().forward_controlled_for_key(
         "POST", "/v1/chat/completions", &forward_body, &incoming_headers,
         &request_id, &operation.operation_id, &principal.key_id,
     );
@@ -1790,7 +1791,7 @@ async fn run_controlled_seedance_chat(
         mark_request_unknown(&state, &request_id, "controlled_video_dispatch_state_failed");
         return reconcile_required(&request_id);
     }
-    let upstream = state.bridge.lock().unwrap().forward_controlled_for_key(
+    let upstream = state.bridge_client().forward_controlled_for_key(
         "POST", "/v1/chat/completions", &forward_body,
         &video_forward_headers(&headers, &request_id),
         &request_id, &operation.operation_id, &principal.key_id,
@@ -1856,6 +1857,7 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
     let seedance = is_seedance_model(&model);
     let seedance_stream = seedance && value.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if let Err(response) = authorize_scope(&principal, if seedance { "videos:submit" } else { "chat:invoke" }) { return response; }
+    if seedance && state.config.budget_billing_v2 {return crate::budget_flow::seedance_chat(state,principal,headers,value).await;}
     let supplied_idempotency = headers.get("idempotency-key").and_then(|value| value.to_str().ok()).filter(|value| !value.trim().is_empty());
     let headerless_seedance_stream = seedance_stream && supplied_idempotency.is_none();
     if seedance {
@@ -1983,7 +1985,7 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
     }
     let streaming = !seedance && forward_value.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if streaming {
-        let bridge = state.bridge.lock().unwrap().clone();
+        let bridge = state.bridge_client().clone();
         let request_headers = header_map(&headers);
         let request_id_for_send = request_id.clone();
         let quote_id_for_send = quote_id.clone();
@@ -2050,7 +2052,7 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
     } else {
         header_map(&headers)
     };
-    let upstream = state.bridge.lock().unwrap().forward_billed_for_key(
+    let upstream = state.bridge_client().forward_billed_for_key(
         "POST",
         "/v1/chat/completions",
         &forward_body,
@@ -2168,7 +2170,7 @@ async fn run_controlled_native_video(
         mark_request_unknown(&state, &request_id, "controlled_video_dispatch_state_failed");
         return reconcile_required(&request_id);
     }
-    let response = state.bridge.lock().unwrap().forward_controlled_for_key(
+    let response = state.bridge_client().forward_controlled_for_key(
         "POST", "/v1/videos/generations", &forward_body,
         &video_forward_headers(&headers, &request_id),
         &request_id, &operation.operation_id, &principal.key_id,
@@ -2227,6 +2229,9 @@ pub async fn video_generations(State(state): State<Arc<StarlinkRouterState>>, he
         Ok(BeginRequest::Created(request)) => request,
         Ok(BeginRequest::Conflict) => return (StatusCode::CONFLICT, Json(json!({"error": {"type": "idempotency_conflict", "message": "Idempotency-Key 与历史请求内容不一致"}}))).into_response(),
         Ok(BeginRequest::Existing(request)) => {
+            if state.config.budget_billing_v2 && state.store.budget_operation(&request.id).ok().flatten().is_some_and(|o|o.api_key_id==principal.key_id) {
+                return (StatusCode::ACCEPTED,Json(json!({"task":{"id":request.id,"status":"processing"},"core_replay":true}))).into_response();
+            }
             let job = state.jobs.lock().unwrap().values().find(|job| job.request_id == request.id && job.user_id == principal.user_id).cloned();
             if let Some(job) = job.filter(|job| !job.reconcile_required && job.upstream_id.is_some()) {
                 return Json(json!({"task": {"id": job.id, "status": job.status}, "core_replay": true})).into_response();
@@ -2236,6 +2241,11 @@ pub async fn video_generations(State(state): State<Arc<StarlinkRouterState>>, he
         Err(response) => return response,
     };
     let request_id = request.id.clone();
+    if state.config.budget_billing_v2 {
+        let mut forwarded=value;
+        if let Err(response)=materialize_bridge_assets(&state,&principal,&mut forwarded,&request_id).await {return finish_failed_quote_request(&state,&request_id,response);}
+        return crate::budget_flow::submit_video(state,principal,request_id,forwarded).await;
+    }
     let quote_admission = match quote_and_reserve_or_controlled(&state, &request_id, "videos", &model) {
         Ok(admission) => admission,
         Err(response) => return finish_failed_quote_request(&state, &request_id, response),
@@ -2279,7 +2289,7 @@ pub async fn video_generations(State(state): State<Arc<StarlinkRouterState>>, he
         release_before_dispatch(&state, &principal, &reservation_id, 500, "request_state_transition_failed");
         return request_error(StatusCode::INTERNAL_SERVER_ERROR, "core_error", error);
     }
-    let response = match state.bridge.lock().unwrap().forward_billed_for_key("POST", "/v1/videos/generations", &forward_body, &video_forward_headers(&headers, &request_id), &request_id, &quote_id, &principal.key_id) {
+    let response = match state.bridge_client().forward_billed_for_key("POST", "/v1/videos/generations", &forward_body, &video_forward_headers(&headers, &request_id), &request_id, &quote_id, &principal.key_id) {
         Ok(response) => response,
         Err(error) => {
             mark_request_unknown(&state, &request_id, "bridge_result_unknown");
@@ -2321,10 +2331,13 @@ pub async fn video_generations(State(state): State<Arc<StarlinkRouterState>>, he
 }
 
 pub async fn video_task(State(state): State<Arc<StarlinkRouterState>>, Path(task_id): Path<String>, headers: HeaderMap, Extension(principal): Extension<Principal>) -> Response {
+    if state.store.budget_operation(&task_id).ok().flatten().is_some() {
+        return crate::budget_flow::video_status(state,principal,task_id).await;
+    }
     let job = match state.jobs.lock().unwrap().get(&task_id).cloned() { Some(job) if job.user_id == principal.user_id && job.api_key_id == principal.key_id => job, Some(_) => return StatusCode::NOT_FOUND.into_response(), None => return StatusCode::NOT_FOUND.into_response() };
     let upstream_id = job.upstream_id.as_deref().unwrap_or(&task_id);
     let path = format!("/v1/videos/{upstream_id}");
-    let result = state.bridge.lock().unwrap().forward("GET", &path, &[], &header_map(&headers), &job.request_id);
+    let result = state.bridge_client().forward("GET", &path, &[], &header_map(&headers), &job.request_id);
     match result {
         Ok(response) => {
             if (200..300).contains(&response.status) {
@@ -2345,10 +2358,11 @@ pub async fn video_task(State(state): State<Arc<StarlinkRouterState>>, Path(task
 }
 
 pub async fn video_content(State(state): State<Arc<StarlinkRouterState>>, Path(task_id): Path<String>, headers: HeaderMap, Extension(principal): Extension<Principal>) -> Response {
+    if state.store.budget_operation(&task_id).ok().flatten().is_some() {return crate::budget_flow::video_content(state,principal,task_id).await;}
     let job = match state.jobs.lock().unwrap().get(&task_id).cloned() { Some(job) if job.user_id == principal.user_id && job.api_key_id == principal.key_id => job, Some(_) => return StatusCode::NOT_FOUND.into_response(), None => return StatusCode::NOT_FOUND.into_response() };
     let upstream_id = job.upstream_id.as_deref().unwrap_or(&task_id);
     let path = format!("/v1/videos/{upstream_id}/content");
-    match state.bridge.lock().unwrap().forward("GET", &path, &[], &header_map(&headers), &job.request_id) { Ok(response) => proxy(response.status, response.headers, response.body), Err(error) => (StatusCode::BAD_GATEWAY, Json(json!({"error": {"type": "bridge_error", "message": error}}))).into_response() }
+    match state.bridge_client().forward("GET", &path, &[], &header_map(&headers), &job.request_id) { Ok(response) => proxy(response.status, response.headers, response.body), Err(error) => (StatusCode::BAD_GATEWAY, Json(json!({"error": {"type": "bridge_error", "message": error}}))).into_response() }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2452,7 +2466,7 @@ fn settle_confirmed_pre_dispatch_video_rejection(
     state: &StarlinkRouterState,
     request_id: &str,
 ) -> bool {
-    let receipt = state.bridge.lock().unwrap().billing(request_id);
+    let receipt = state.bridge_client().billing(request_id);
     let Ok(BridgeBillingResult::Final(receipt)) = receipt else { return false; };
     if receipt.status != aiwork_core::BillingReceiptStatus::FailedNoCharge || receipt.task_ref.is_some() {
         return false;
@@ -2568,7 +2582,7 @@ pub(crate) fn settle_video_job(
         return Ok(VideoBillingDecision::Held);
     }
     if job.controlled_operation_id.is_some() {
-        let receipt = state.bridge.lock().unwrap().finalize_video_billing(&job.request_id, upstream_id);
+        let receipt = state.bridge_client().finalize_video_billing(&job.request_id, upstream_id);
         let receipt = match receipt {
             Ok(BridgeBillingResult::Final(receipt)) => receipt,
             _ => {
@@ -2612,9 +2626,9 @@ pub(crate) fn settle_video_job(
         return Ok(VideoBillingDecision::ReconcileRequired);
     }
     let receipt_result = if job.one_shot_test {
-        state.bridge.lock().unwrap().finalize_video_billing(&job.request_id, upstream_id)
+        state.bridge_client().finalize_video_billing(&job.request_id, upstream_id)
     } else {
-        state.bridge.lock().unwrap().billing(&job.request_id)
+        state.bridge_client().billing(&job.request_id)
     };
     match receipt_result {
         Ok(BridgeBillingResult::Final(receipt)) => {
@@ -2700,7 +2714,7 @@ pub(crate) fn reconcile_video_job_once(
         };
     };
     let path = format!("/v1/videos/{upstream_id}");
-    let response = match state.bridge.lock().unwrap().forward(
+    let response = match state.bridge_client().forward(
         "GET",
         &path,
         &[],

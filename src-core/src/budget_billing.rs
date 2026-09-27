@@ -2518,6 +2518,10 @@ impl CoreStore {
     }
 
     pub fn pending_budget_steps(&self, limit: usize) -> Result<Vec<BudgetStepRecoveryView>, CoreError> {
+        self.pending_budget_steps_in_page(limit, None)
+    }
+
+    fn pending_budget_steps_in_page(&self, limit: usize, after: Option<&str>) -> Result<Vec<BudgetStepRecoveryView>, CoreError> {
         if !(1..=100).contains(&limit) {
             return Err(CoreError::Validation {
                 field: "pending_budget_steps.limit".into(),
@@ -2530,12 +2534,13 @@ impl CoreStore {
                 "SELECT step.request_id, operation.parent_request_id
                  FROM budget_steps step
                  JOIN budget_operations operation ON operation.operation_id = step.operation_id
-                 WHERE step.financial_state IN ('held','unknown','conflict')
-                    OR step.execution_state IN ('ready','running','unknown')
-                 ORDER BY step.updated_at_ms, step.request_id LIMIT ?1",
+                 WHERE (step.financial_state IN ('held','unknown','conflict')
+                    OR step.execution_state IN ('ready','running','unknown'))
+                   AND (?2 IS NULL OR step.request_id > ?2)
+                 ORDER BY CASE WHEN ?2 IS NULL THEN step.updated_at_ms ELSE 0 END, step.request_id LIMIT ?1",
             )?;
             let rows = statement
-                .query_map([limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .query_map(params![limit as i64, after], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<Result<Vec<_>, _>>()?;
             rows
         };
@@ -2557,6 +2562,53 @@ impl CoreStore {
             recovery.push(BudgetStepRecoveryView { step });
         }
         Ok(recovery)
+    }
+
+    pub fn pending_budget_steps_after(&self, limit: usize, after_request_id: &str) -> Result<Vec<BudgetStepRecoveryView>, CoreError> {
+        self.pending_budget_steps_in_page(limit, Some(after_request_id))
+    }
+
+    pub fn budget_step_for_request(&self, request_id:&str)->Result<Option<BudgetStepView>,CoreError> {
+        let connection=self.connection.lock().expect("core store mutex poisoned");
+        let parent:Option<String>=connection.query_row(
+            "SELECT o.parent_request_id FROM budget_steps s JOIN budget_operations o ON o.operation_id=s.operation_id WHERE s.request_id=?1",
+            [request_id],|r|r.get(0)).optional()?;
+        match parent {
+            Some(parent)=>Ok(Self::budget_operation_in_connection(&connection,&parent)?.and_then(|o|o.steps.into_iter().find(|s|s.request_id==request_id))),
+            None=>Ok(None),
+        }
+    }
+
+    fn budget_cursor_key(instance:&str,generation:&str)->Result<String,CoreError> {
+        if [instance,generation].iter().any(|s|s.is_empty() || s.len()>256 || s.chars().any(char::is_control)) {
+            return Err(CoreError::Validation {field:"receipt_cursor".into(),reason:"invalid bridge identity".into()});
+        }
+        Ok(format!("budget-receipts-v2:{}",URL_SAFE_NO_PAD.encode(crate::canonical_json_hash(&serde_json::json!([instance,generation])))))
+    }
+    /// Each bridge generation has its own durable cursor; an epoch change never
+    /// overwrites the previous generation's recovery position or money facts.
+    pub fn budget_receipt_cursor(&self,instance:&str,generation:&str)->Result<i64,CoreError> {
+        let key=Self::budget_cursor_key(instance,generation)?;
+        let connection=self.connection.lock().expect("core store mutex poisoned");
+        let value:Option<String>=connection.query_row("SELECT value FROM schema_meta WHERE key=?1",[&key],|r|r.get(0)).optional()?;
+        value.map_or(Ok(0),|v|v.parse::<i64>().ok().filter(|n|*n>=0).ok_or(CoreError::InvalidConfiguration {key,value:v}))
+    }
+    /// Call only after the event's idempotent receipt transaction has committed.
+    /// A crash between the two commits replays the receipt, never skips it.
+    pub fn advance_budget_receipt_cursor(&self,instance:&str,generation:&str,expected:i64,next:i64,ignored_request:Option<&str>)->Result<(),CoreError> {
+        let key=Self::budget_cursor_key(instance,generation)?;
+        if expected<0 || next<=expected {return Err(CoreError::IdempotencyConflict);}
+        let mut connection=self.connection.lock().expect("core store mutex poisoned");
+        let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("INSERT OR IGNORE INTO schema_meta(key,value) VALUES (?1,'0')",[&key])?;
+        if tx.execute("UPDATE schema_meta SET value=?1 WHERE key=?2 AND value=?3",params![next.to_string(),key,expected.to_string()])?!=1 {return Err(CoreError::IdempotencyConflict);}
+        if let Some(request)=ignored_request {
+            // AI Work can have canceled preparations rejected by Core before a
+            // budget operation exists. Retain an audit trail, do not invent one.
+            Self::insert_audit_event(&tx,"system","budget.receipt_without_local_step","request",request,
+                serde_json::json!({"instance":instance,"generation":generation,"sequence":next}),Utc::now().timestamp_millis())?;
+        }
+        tx.commit()?;Ok(())
     }
 
     pub fn active_execution_count_for_key(&self, api_key_id: &str) -> Result<i64, CoreError> {

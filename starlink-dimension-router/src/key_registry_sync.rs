@@ -14,7 +14,7 @@ pub fn spawn(state: &Arc<StarlinkRouterState>) {
             let Some(state) = weak_state.upgrade() else { break; };
             let state_for_sync = state.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                if !state_for_sync.bridge.lock().unwrap_or_else(|error| error.into_inner())
+                if !state_for_sync.bridge_client()
                     .background_registry_sync_enabled()
                 {
                     return Ok::<_, String>(());
@@ -22,7 +22,7 @@ pub fn spawn(state: &Arc<StarlinkRouterState>) {
                 let keys = state_for_sync.store.bridge_api_key_metadata()
                     .map_err(|error| error.to_string())?;
                 let version = chrono::Utc::now().timestamp_millis();
-                state_for_sync.bridge.lock().unwrap_or_else(|error| error.into_inner())
+                state_for_sync.bridge_client()
                     .sync_core_key_registry(version, keys)
                     .map(|_| ())
             }).await;

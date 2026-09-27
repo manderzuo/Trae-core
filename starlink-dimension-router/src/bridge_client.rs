@@ -192,6 +192,11 @@ struct CoreKeyRegistrySnapshot {
 }
 
 impl BridgeClient {
+    pub(crate) fn budget_content(&self,step:&aiwork_core::BudgetStepView)->Result<BridgeStreamingResponse,String> {
+        let path=crate::budget_reconciler::request_path(step,"content");
+        let headers=BTreeMap::from([("authorization".into(),format!("Bearer {}",self.bridge_secret)),("accept".into(),"video/mp4".into())]);
+        self.transport.send_stream("GET",&format!("{}{path}",self.base_url),&headers,&[])
+    }
     pub fn new(base_url: impl Into<String>, bridge_secret: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -752,9 +757,10 @@ impl BridgeClient {
             .ok_or_else(|| "AI Work 素材桥接响应缺少素材 ID".into())
     }
 
-    fn json_request(&self, method: &str, path: &str, body: &[u8], request_id: Option<&str>) -> Result<Value, String> {
+    pub(crate) fn json_request(&self, method: &str, path: &str, body: &[u8], request_id: Option<&str>) -> Result<Value, String> {
         let mut incoming = BTreeMap::new();
         incoming.insert("accept".into(), "application/json".into());
+        if !body.is_empty() {incoming.insert("content-type".into(),"application/json".into());}
         let response = self.forward(
             method,
             path,

@@ -230,11 +230,7 @@ fn secure_cookie_from_headers(headers: &HeaderMap) -> bool {
 
 async fn summary(State(state): State<Arc<StarlinkRouterState>>) -> Result<Json<SummaryResponse>, (StatusCode, Json<serde_json::Value>)> {
     let core = state.store.admin_summary(chrono::Utc::now().timestamp_millis()).map_err(internal)?;
-    let upstream_status = state
-        .bridge
-        .lock()
-        .ok()
-        .and_then(|client| client.upstream_credit_status().ok());
+    let upstream_status = state.bridge_client().upstream_credit_status().ok();
     let upstream = match &upstream_status {
         Some(status) => json!({
             "upstream_credits": {
@@ -684,9 +680,7 @@ async fn allocate_key_quota(
     Json(input): Json<KeyQuotaInput>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let snapshot = state
-        .bridge
-        .lock()
-        .map_err(|_| internal("AI Work 桥接锁不可用"))?
+        .bridge_client()
         .upstream_credit_snapshot()
         .map_err(|reason| {
             quota_admin_error(CoreError::UpstreamCreditsUnavailable { reason })

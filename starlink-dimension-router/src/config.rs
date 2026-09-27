@@ -15,6 +15,9 @@ pub struct RouterConfig {
     /// An explicit STARLINK_ROUTER_PUBLIC_BASE_URL environment variable wins.
     #[serde(default)]
     pub public_base_url: String,
+    /// Staged protocol migration. Enable only together with the v2 local bridge.
+    #[serde(default)]
+    pub budget_billing_v2: bool,
     #[serde(default)]
     pub bridge: Option<BridgeConfig>,
 }
@@ -35,6 +38,7 @@ impl RouterConfig {
             display_name: "星链维度分流系统".to_string(),
             default_model: "deepseek-v4-flash".to_string(),
             public_base_url: String::new(),
+            budget_billing_v2: false,
             bridge: None,
         }
     }

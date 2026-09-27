@@ -31,7 +31,7 @@ pub fn spawn(state: &Arc<StarlinkRouterState>) {
             }
             let state = state.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                crate::user_routes::reconcile_pending_billing_requests_once(&state);
+                crate::user_routes::reconcile_legacy_pending_billing_requests_once(&state);
             })
             .await;
         }

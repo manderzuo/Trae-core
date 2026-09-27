@@ -213,6 +213,21 @@ fn budget_fixture(label: &str, concurrency: i64, credits: i64) -> (TestDirectory
     (directory, store, user_key.id, admin)
 }
 
+#[test]
+fn pending_budget_recovery_pages_do_not_starve_later_unresolved_keys() {
+    let (_dir,store,key,_admin)=budget_fixture("recovery-page",3,100_000_000);
+    for index in 0..3 {
+        let request=begin_video_parent(&store,&key,&format!("page-{index}"));
+        store.begin_budget_operation(&request,video_budget_step(&store,&key,&request,&format!("budget-{index}"))).unwrap();
+    }
+    let first=store.pending_budget_steps_after(1,"").unwrap().remove(0).step.request_id;
+    let second=store.pending_budget_steps_after(1,&first).unwrap().remove(0).step.request_id;
+    assert!(second>first,"an unresolved first page must not starve later requests");
+    let third=store.pending_budget_steps_after(1,&second).unwrap().remove(0).step.request_id;
+    assert!(third>second);
+    assert!(store.pending_budget_steps_after(1,&third).unwrap().is_empty());
+}
+
 fn begin_video_parent(store: &CoreStore, key_id: &str, idempotency_key: &str) -> String {
     match store
         .begin_billed_request(BeginRequestInput {
