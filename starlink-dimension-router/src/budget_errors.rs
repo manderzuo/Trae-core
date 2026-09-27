@@ -14,6 +14,8 @@ pub(crate) fn public_code(code:&str)->Option<&'static str> {
         "bridge_workers_busy"=>"bridge_workers_busy",
         "budget_identity_conflict"=>"budget_identity_conflict",
         "invalid_budget_business_request"=>"invalid_budget_business_request",
+        "invalid_chat_image"=>"invalid_chat_image",
+        "budget_chat_input_too_large"=>"budget_chat_input_too_large",
         "budget_preparation_failed"=>"budget_preparation_failed",
         "budget_dispatch_not_accepted"=>"budget_dispatch_not_accepted",
         "bridge_state_unavailable"=>"bridge_state_unavailable",

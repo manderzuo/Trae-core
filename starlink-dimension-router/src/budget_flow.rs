@@ -10,12 +10,13 @@ use crate::{state::StarlinkRouterState,bridge_client::BridgeClient};
 struct Prepared {
     wire_version:u8,authorization:BudgetAuthorization,dispatch_token:String,evidence_level:String,prepared_at_ms:i64,revision:i64,
 }
-fn fail(code:&str)->Response {
+pub(crate) fn fail(code:&str)->Response {
     let status=match code {
         "key_concurrency_exceeded"|"video_download_busy"|"budget_preparation_busy"|"bridge_workers_busy"|"reference_upload_limited"=>StatusCode::TOO_MANY_REQUESTS,
         "quota_insufficient"=>StatusCode::PAYMENT_REQUIRED,
         "video_not_ready"|"budget_identity_conflict"=>StatusCode::CONFLICT,
-        "invalid_budget_business_request"=>StatusCode::BAD_REQUEST,
+        "invalid_budget_business_request"|"invalid_chat_image"=>StatusCode::BAD_REQUEST,
+        "budget_chat_input_too_large"=>StatusCode::PAYLOAD_TOO_LARGE,
         _=>StatusCode::SERVICE_UNAVAILABLE,
     };
     let mut response=(status,Json(json!({"error":{"type":"billing_error","code":code,"message":code}}))).into_response();
@@ -31,6 +32,8 @@ mod error_tests {
         assert_eq!(fail("invalid_budget_business_request").status(),StatusCode::BAD_REQUEST);
         assert_eq!(fail("budget_identity_conflict").status(),StatusCode::CONFLICT);
         assert_eq!(fail("budget_policy_unconfigured").status(),StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(fail("invalid_chat_image").status(),StatusCode::BAD_REQUEST);
+        assert_eq!(fail("budget_chat_input_too_large").status(),StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
 fn post(client:&BridgeClient,path:&str,body:&Value,request:&str)->Result<Value,String> {
@@ -122,7 +125,7 @@ pub(crate) async fn video_status(state:Arc<StarlinkRouterState>,principal:Princi
     match result {Ok(Ok(Some(value)))=>Json(value).into_response(),Ok(Ok(None))=>StatusCode::NOT_FOUND.into_response(),_=>fail("budget_result_unavailable")}
 }
 
-async fn wait_result(state:Arc<StarlinkRouterState>,step:BudgetStepView)->Result<Value,String> {
+pub(crate) async fn wait_result(state:Arc<StarlinkRouterState>,step:BudgetStepView)->Result<Value,String> {
     let started=std::time::Instant::now();
     loop {
         let s=state.clone();let b=step.clone();

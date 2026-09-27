@@ -21,3 +21,4 @@ pub(crate) mod budget_flow;
 pub(crate) mod budget_errors;
 pub(crate) mod budget_continuation;
 pub(crate) mod budget_observer;
+pub(crate) mod budget_chat;

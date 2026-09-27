@@ -48,7 +48,7 @@ fn request_error(status: StatusCode, error_type: &str, message: impl Into<String
     (status, Json(json!({"error": {"type": error_type, "message": message.into()}}))).into_response()
 }
 
-fn validate_vision_data_urls(body: &Value) -> Result<(), Response> {
+pub(crate) fn validate_vision_data_urls(body: &Value) -> Result<(), Response> {
     let mut total = 0_usize;
     let Some(messages) = body.get("messages").and_then(Value::as_array) else { return Ok(()); };
     for message in messages {
@@ -199,7 +199,7 @@ fn apply_assisted_prompt(body: &mut Value, prompt: &str) -> Result<(), &'static 
     Ok(())
 }
 
-fn materialize_text_asset_ids(
+pub(crate) fn materialize_text_asset_ids(
     state: &StarlinkRouterState,
     principal: &Principal,
     body: &mut Value,
@@ -1858,6 +1858,7 @@ pub async fn chat_completions(State(state): State<Arc<StarlinkRouterState>>, hea
     let seedance_stream = seedance && value.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if let Err(response) = authorize_scope(&principal, if seedance { "videos:submit" } else { "chat:invoke" }) { return response; }
     if seedance && state.config.budget_billing_v2 {return crate::budget_flow::seedance_chat(state,principal,headers,value).await;}
+    if state.config.budget_billing_v2 {return crate::budget_chat::chat(state,principal,headers,value,model).await;}
     let supplied_idempotency = headers.get("idempotency-key").and_then(|value| value.to_str().ok()).filter(|value| !value.trim().is_empty());
     let headerless_seedance_stream = seedance_stream && supplied_idempotency.is_none();
     if seedance {

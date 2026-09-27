@@ -4,7 +4,7 @@
 
 ## 请求路径
 
-`seedance` Chat请求经默认文字助手判断意图；连接测试/问候只执行助手，不误生成视频。视频意图沿用原请求时长、清晰度与参考图，准备独立视频预算后派发。普通文字模型仍沿用旧路由，不宣称已经迁移v2早SSE。
+`seedance` Chat请求经默认文字助手判断意图；连接测试/问候只执行助手，不误生成视频。视频意图沿用原请求时长、清晰度与参考图，准备独立视频预算后派发。v2开启时普通文字模型也使用独立Chat步骤预算，不再进入旧quote链路；关闭v2仍保持原路由。
 
 Core的`router.json`新增`budget_billing_v2`，默认false。必须在两端相容、审计/真实验收通过后才启用。不能仅改此开关解决旧公网503。
 
@@ -18,6 +18,7 @@ Key 镜像版本与元数据摘要在同一数据库事务内持久化：内容�
 | POST `/internal/bridge/v2/budgets/dispatch` | 全授权与加密原件核验后，consume/send CAS唯一派发 |
 | POST `/internal/bridge/v2/budgets/cancel` | 只取消尚未消费的原预算，返回持久no-send证据 |
 | GET `/internal/bridge/v2/requests/{request_id}/{execution,result,billing,content}?budget_id=...` | 按完整预算归属恢复状态、结果、账单与视频 |
+| GET `/internal/bridge/v2/requests/{request_id}/chunks?budget_id=...&after=...` | 按相同完整归属读取普通Chat增量页；不是财务或唯一结果存储 |
 | POST `/internal/bridge/v2/requests/{request_id}/refresh?budget_id=...` | 请求级幂等刷新提示，不新发付费任务 |
 | GET `/internal/bridge/v2/receipt-events?generation=...&after=...&limit=100` | 有界回执事件与历史重放 |
 | GET/POST `/internal/bridge/v2/recovery` | 桥接管理员读取恢复状态，并显式确认同机异常停止后的新世代激活；不释放未知占用 |
@@ -28,7 +29,11 @@ Key 镜像版本与元数据摘要在同一数据库事务内持久化：内容�
 
 执行终态释放并发，财务待结仍保留本笔H。结果、下载不等待账单。并发满返回429，不包装成quote_unavailable/503。Core未派发且有桥接持久no-send证据时释放预约，不编造上游账单；已派发的NoSend按0回执处理。未知派发不自动重试、退款或释放执行槽。
 
-Chat流式请求无需客户端另配Idempotency-Key；Core内部用Key+请求指纹复用在途请求。后台worker不依赖HTTP观察连接存活。结果用OpenAI SSE帧及DONE结束。文件下载沿用普通Key鉴权，不能承诺任意客户端都自动执行本地下载。
+Seedance Chat流式请求无需客户端另配Idempotency-Key；Core内部用Key+请求指纹复用在途请求。普通Chat接受显式幂等Key用于恢复，未提供时每次调用是新请求，不推断两次相同文字一定是同一任务。后台worker不依赖HTTP观察连接存活。结果用OpenAI SSE帧及DONE结束。文件下载沿用普通Key鉴权，不能承诺任意客户端都自动执行本地下载。
+
+普通Chat转发真实文本、思考与工具参数delta，桥接仅在持久结果成功后结束缓存writer，Core取得持久结果后才发成功终态。慢客户端最多等待发送5秒，断开只停止观察，不退款、不重发收费；结果完成即释放执行并发，不等账单。缓存每流1MiB/4096项、64流、每页32项；完成120秒后可在新准入时淘汰，满额先淘汰已完成条目。缺页明确报错；只有尚未发送任何业务delta时才可回退完整持久结果，不能把缺失的半截工具参数接成成功。已结束但没有可信结果的worker及时返回execution_unknown，保留财务及未知执行占用。
+
+普通视觉Chat允许已有Core素材ID或合法image_url，仍检查素材所有权和真实图片格式；已持久预算的同请求重放不再依赖输入素材是否过期，新任务仍拒绝过期素材。Base64不计入64KiB文字/工具预算，图片URL合计6MiB、最多10张；其风险政策使用独立`chat:<model>:images<N>`档案，不能套纯文字政策。是否原生支持视觉仍由所选模型能力决定。
 
 ## 回执恢复
 
@@ -62,7 +67,7 @@ AI Work原生档案当前限无参考图/视频720p16:9的10/15秒。其他规�
 
 - 按账号的静止重基线已有AI Work schema6原语，但仍缺生产受信余额覆盖来源；不能任意清除D。异常lease的显式同机恢复接口已通过隔离验证，旧未知占用的处置仍需真实证据。
 - 事件/账单大历史有界处理与错误诊断复核；Key 镜像并发版本修复已通过本地回归。
-- 参考规格政策、真实参考图采样、普通Chat新账本早SSE。
+- 参考规格政策、真实参考图采样；普通Chat新账本增量SSE已接线，仍需双进程与公网真实验收。
 - 后台续接的损坏记录隔离、权限撤销、HTTP竞争和终态临时正文保留已通过隔离用例；这不替代生产重启、迁移及负载验收。
 - 本机新运行器与公网Core的受控付费联调，记录产物、唯一会话、实际扣费与Key前后余额；实测回执确认到Core入账P95。
 - 正式部署的备份/迁移与回滚演练，之后分别推送AI Work和Core仓库，MCP仓库不混入。

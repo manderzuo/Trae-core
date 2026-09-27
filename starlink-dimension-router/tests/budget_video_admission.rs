@@ -47,10 +47,97 @@ impl BridgeTransport for Bridge {
             if url.contains("/execution?") {v["status"]=json!("succeeded");v["execution"]=json!({"budget_id":format!("budget-{id}"),"request_id":c["request_id"],"core_key_id":c["core_key_id"],"account_ref":"account","bridge_instance_id":"instance","step_kind":c["step_kind"],"state":"succeeded","task_ref":if c["step_kind"]=="assist" {Value::Null} else {json!("native-video")},"finished_at_ms":chrono::Utc::now().timestamp_millis(),"result_available":true});}
             else if url.contains("/result?") {v["status"]=json!("ready");v["result"]=if c["step_kind"]=="assist" {json!({"choices":[{"message":{"content":if self.video_intent {"{\"intent\":\"video\",\"prompt\":\"cat playing\"}"} else {"{\"intent\":\"text\",\"text\":\"你好，连接正常。\"}"}}}]})} else {json!({"id":"native-video","status":"completed","content_url":"/v1/videos/native-video/content"})};}
             else if url.contains("/billing?") {v["status"]=json!("pending");v["event"]=Value::Null;v["receipt"]=Value::Null;}
-            else {return Err("unexpected legacy or paid-retry route".into());} v
+            else if url.contains("/chunks?") {v["status"]=json!("available");v["finished"]=json!(true);v["next"]=json!(2);v["chunks"]=if url.ends_with("&after=0") {json!([{"content":"hello "},{"content":"world"}])} else {json!([])};}
+            else {return Err("unexpected legacy or paid-retry route".into());}
+            if c["step_kind"]=="chat" {
+                if url.contains("/execution?") {v["execution"]["task_ref"]=Value::Null;}
+                if url.contains("/result?") {v["result"]=json!({"id":format!("chatcmpl-{id}"),"object":"chat.completion","model":"text-model","created":1,"choices":[{"index":0,"message":{"role":"assistant","content":"hello world"},"finish_reason":"stop"}]});}
+                if c["body"]["messages"][0]["content"]=="force unknown" {
+                    if url.contains("/execution?") {v["status"]=json!("unknown");v["execution"]["state"]=json!("unknown");v["execution"]["finished_at_ms"]=Value::Null;v["execution"]["result_available"]=json!(false);}
+                    if url.contains("/result?") {v["status"]=json!("not_ready");v["result"]=Value::Null;}
+                }
+            }
+            v
         };
         Ok(BridgeResponse {status:200,headers:BTreeMap::new(),body:serde_json::to_vec(&value).unwrap()})
     }
+}
+#[tokio::test]
+async fn ordinary_chat_v2_streams_real_deltas_and_pending_bill_does_not_block_next_request() {
+    let dir=Directory(std::env::temp_dir().join(format!("core-chat-budget-{:032x}",rand::random::<u128>())));
+    let store=Arc::new(CoreStore::open(dir.path()).unwrap());store.migrate().unwrap();
+    store.create_user(NewUser {id:"admin".into(),name:"Admin".into(),role:UserRole::Admin},"bootstrap").unwrap();
+    store.create_user(NewUser {id:"user".into(),name:"User".into(),role:UserRole::User},"admin").unwrap();
+    let a=store.issue_api_key("admin","admin",BTreeSet::from(["admin:*".into()]),"bootstrap").unwrap();let admin=store.authenticate_api_key(&a.plaintext).unwrap();
+    let k=store.issue_api_key_as_admin_with_max_concurrency("user","Key",BTreeSet::from(["chat:invoke".into()]),1,&admin).unwrap();
+    store.key_quota_grant_as_admin(&admin,KeyQuotaGrant {api_key_id:k.id.clone(),resource_kind:"credits".into(),amount:200_000_000,actor_user_id:"admin".into(),reason:"isolated".into()}).unwrap();
+    let bridge=Arc::new(Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent:false,large_downloads:std::sync::atomic::AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0)),download_status:AtomicUsize::new(200)});
+    let mut cfg=RouterConfig::defaults(dir.path().into());cfg.budget_billing_v2=true;
+    let state=StarlinkRouterState::for_test(store.clone(),BridgeClient::from_transport("http://bridge","bridge-only",bridge.clone()),cfg);
+    let principal=store.authenticate_api_key(&k.plaintext).unwrap();
+    for (id,stream) in [("first",true),("first",true),("second",false)] {
+        let mut headers=HeaderMap::new();headers.insert("idempotency-key",id.parse().unwrap());
+        let r=user_routes::chat_completions(State(state.clone()),headers,Extension(principal.clone()),Bytes::from(json!({"model":"text-model","messages":[{"role":"user","content":"hello"}],"stream":stream}).to_string())).await;
+        assert_eq!(r.status(),StatusCode::OK,"ordinary Chat must not enter the legacy quote/whole-Key reservation path");
+        let bytes=axum::body::to_bytes(r.into_body(),65536).await.unwrap();
+        let request=if stream {
+            let wire=std::str::from_utf8(&bytes).unwrap();assert!(wire.contains("data: [DONE]"));
+            let frames:Vec<Value>=wire.lines().filter_map(|s|s.strip_prefix("data: ")).filter_map(|s|serde_json::from_str(s).ok()).collect();
+            assert_eq!(frames[1]["choices"][0]["delta"]["content"],"hello ");assert_eq!(frames[2]["choices"][0]["delta"]["content"],"world");
+            assert_eq!(frames.last().unwrap()["choices"][0]["finish_reason"],"stop");frames[0]["request_id"].as_str().unwrap().to_owned()
+        } else {let result:Value=serde_json::from_slice(&bytes).unwrap();assert_eq!(result["choices"][0]["message"]["content"],"hello world");result["request_id"].as_str().unwrap().into()};
+        let op=store.budget_operation(&request).unwrap().unwrap();assert_eq!(op.steps[0].financial_state,aiwork_core::BudgetFinancialState::Held);
+        assert_eq!(store.active_execution_count_for_key(&k.id).unwrap(),0);
+    }
+    assert_eq!(bridge.sends.load(Ordering::SeqCst),2,"same idempotency key never pays twice");
+    let r=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(principal.clone()),Bytes::from(json!({"model":"text-model","messages":[{"role":"user","content":"force unknown"}],"stream":true}).to_string())).await;
+    let bytes=tokio::time::timeout(std::time::Duration::from_secs(2),axum::body::to_bytes(r.into_body(),65536)).await.expect("finished failed worker must not leave client waiting fourteen minutes").unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("chat_execution_unknown"));
+    assert_eq!(store.active_execution_count_for_key(&k.id).unwrap(),1,"unknown execution is not proof to release its paid slot");
+    assert_eq!(bridge.sends.load(Ordering::SeqCst),3);
+}
+
+#[tokio::test]
+async fn completed_chat_replay_does_not_require_expired_input_asset() {
+    let dir=Directory(std::env::temp_dir().join(format!("core-chat-expired-{:032x}",rand::random::<u128>())));
+    let store=Arc::new(CoreStore::open(dir.path()).unwrap());store.migrate().unwrap();
+    store.create_user(NewUser {id:"admin".into(),name:"Admin".into(),role:UserRole::Admin},"bootstrap").unwrap();
+    store.create_user(NewUser {id:"user".into(),name:"User".into(),role:UserRole::User},"admin").unwrap();
+    let a=store.issue_api_key("admin","admin",BTreeSet::from(["admin:*".into()]),"bootstrap").unwrap();let admin=store.authenticate_api_key(&a.plaintext).unwrap();
+    let k=store.issue_api_key_as_admin_with_max_concurrency("user","Key",BTreeSet::from(["chat:invoke".into(),"assets:write".into()]),1,&admin).unwrap();
+    store.key_quota_grant_as_admin(&admin,KeyQuotaGrant {api_key_id:k.id.clone(),resource_kind:"credits".into(),amount:80_000_000,actor_user_id:"admin".into(),reason:"isolated".into()}).unwrap();
+    let bridge=Arc::new(Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent:false,large_downloads:std::sync::atomic::AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0)),download_status:AtomicUsize::new(200)});
+    let mut cfg=RouterConfig::defaults(dir.path().into());cfg.budget_billing_v2=true;
+    let state=StarlinkRouterState::for_test(store.clone(),BridgeClient::from_transport("http://bridge","bridge-only",bridge.clone()),cfg);
+    let principal=store.authenticate_api_key(&k.plaintext).unwrap();
+    let uploaded=user_routes::assets_upload(State(state.clone()),Extension(principal.clone()),Bytes::from(json!({"filename":"tiny.png","data_base64":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jN1sAAAAASUVORK5CYII="}).to_string())).await;
+    assert_eq!(uploaded.status(),StatusCode::OK);
+    let asset:Value=serde_json::from_slice(&axum::body::to_bytes(uploaded.into_body(),65536).await.unwrap()).unwrap();
+    let body=Bytes::from(json!({"model":"text-model","messages":[{"role":"user","content":"describe"}],"image_asset_ids":[asset["id"]]}).to_string());
+    let mut header=HeaderMap::new();header.insert("idempotency-key","same-image".parse().unwrap());
+    let first=user_routes::chat_completions(State(state.clone()),header.clone(),Extension(principal.clone()),body.clone()).await;
+    assert_eq!(first.status(),StatusCode::OK);
+    let result=axum::body::to_bytes(first.into_body(),65536).await.unwrap();
+    assert_eq!(starlink_dimension_router::assets::cleanup_expired_assets_once(&store,dir.path(),asset["expires_at"].as_i64().unwrap()*1000+1000).unwrap(),1);
+    let replay=user_routes::chat_completions(State(state.clone()),header,Extension(principal.clone()),body.clone()).await;
+    assert_eq!(replay.status(),StatusCode::OK,"persisted result must survive input expiry");
+    assert_eq!(axum::body::to_bytes(replay.into_body(),65536).await.unwrap(),result);
+    let fresh=user_routes::chat_completions(State(state),HeaderMap::new(),Extension(principal),body).await;
+    assert!(fresh.status().is_client_error(),"expired input cannot authorize a new paid task");
+    assert_eq!(bridge.sends.load(Ordering::SeqCst),1);
+    assert_eq!(bridge.claims.lock().unwrap().len(),1);
+}
+#[tokio::test]
+async fn ordinary_chat_rejects_foreign_assets_before_budget_or_paid_send() {
+    let dir=Directory(std::env::temp_dir().join(format!("core-chat-assets-{:032x}",rand::random::<u128>())));
+    let store=Arc::new(CoreStore::open(dir.path()).unwrap());store.migrate().unwrap();
+    store.create_user(NewUser {id:"admin".into(),name:"Admin".into(),role:UserRole::Admin},"bootstrap").unwrap();
+    let k=store.issue_api_key("admin","limited",BTreeSet::from(["chat:invoke".into()]),"bootstrap").unwrap();let principal=store.authenticate_api_key(&k.plaintext).unwrap();
+    let bridge=Arc::new(Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent:false,large_downloads:std::sync::atomic::AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0)),download_status:AtomicUsize::new(200)});
+    let mut cfg=RouterConfig::defaults(dir.path().into());cfg.budget_billing_v2=true;
+    let state=StarlinkRouterState::for_test(store.clone(),BridgeClient::from_transport("http://bridge","bridge-only",bridge.clone()),cfg);
+    let r=user_routes::chat_completions(State(state),HeaderMap::new(),Extension(principal),Bytes::from(json!({"model":"text-model","messages":[{"role":"user","content":"look"}],"image_asset_ids":["asset-other"]}).to_string())).await;
+    assert!(r.status().is_client_error());assert!(bridge.claims.lock().unwrap().is_empty());assert_eq!(bridge.sends.load(Ordering::SeqCst),0);
 }
 #[tokio::test(flavor="multi_thread",worker_threads=4)]
 async fn ten_keys_each_admit_two_reject_third_and_reuse_terminal_slot_before_receipt() {

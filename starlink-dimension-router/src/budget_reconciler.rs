@@ -4,7 +4,7 @@ use aiwork_core::{BudgetStepView, BudgetStepKind, BudgetExecutionState as Execut
 use serde_json::Value;
 use crate::{bridge_client::BridgeClient, state::StarlinkRouterState};
 
-fn identity(value: &Value, step: &BudgetStepView) -> Result<(), String> {
+pub(crate) fn identity(value: &Value, step: &BudgetStepView) -> Result<(), String> {
     for (name, expected) in [("request_id", &step.request_id), ("core_key_id", &step.core_key_id),
         ("budget_id", &step.budget_id), ("account_ref", &step.account_ref), ("bridge_instance_id", &step.bridge_instance_id)] {
         if value[name].as_str() != Some(expected.as_str()) { return Err(format!("v2 {name} binding mismatch")); }
