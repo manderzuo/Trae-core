@@ -1303,6 +1303,9 @@ impl CoreStore {
     /// prefix, user identity, scope and quota field.
     pub fn bridge_api_key_metadata(&self) -> Result<Vec<(String, String, bool)>, CoreError> {
         let connection = self.connection.lock().expect("core store mutex poisoned");
+        Self::bridge_api_key_metadata_in_connection(&connection)
+    }
+    fn bridge_api_key_metadata_in_connection(connection:&Connection)->Result<Vec<(String,String,bool)>,CoreError> {
         let mut statement = connection.prepare(
             "SELECT api_keys.id, api_keys.name,
                     CASE WHEN api_keys.status = 'active'
@@ -1317,6 +1320,24 @@ impl CoreStore {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(CoreError::from)
+    }
+    pub fn bridge_api_key_snapshot(&self,now_ms:i64)->Result<(i64,Vec<(String,String,bool)>),CoreError> {
+        if now_ms<=0 {return Err(CoreError::Validation {field:"registry_timestamp".into(),reason:"must be positive".into()});}
+        let mut connection=self.connection.lock().expect("core store mutex poisoned");
+        let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let keys=Self::bridge_api_key_metadata_in_connection(&tx)?;
+        let hash=URL_SAFE_NO_PAD.encode(crate::canonical_json_hash(&serde_json::json!(keys)));
+        let saved:Option<String>=tx.query_row("SELECT value FROM schema_meta WHERE key='bridge-key-snapshot-v2'",[],|r|r.get(0)).optional()?;
+        let mut previous=0;
+        if let Some(saved)=saved {
+            let value:Value=serde_json::from_str(&saved)?;
+            previous=value["version"].as_i64().filter(|v|*v>0).ok_or_else(||CoreError::InvalidConfiguration {key:"bridge-key-snapshot-v2".into(),value:"invalid durable version".into()})?;
+            if value["hash"]==hash {tx.commit()?;return Ok((previous,keys));}
+        }
+        let version=now_ms.max(previous.checked_add(1).ok_or(CoreError::IdempotencyConflict)?);
+        tx.execute("INSERT INTO schema_meta(key,value) VALUES ('bridge-key-snapshot-v2',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [serde_json::json!({"version":version,"hash":hash}).to_string()])?;
+        tx.commit()?;Ok((version,keys))
     }
 
     pub fn list_api_keys_as_admin(

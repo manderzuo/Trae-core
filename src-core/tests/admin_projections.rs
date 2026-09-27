@@ -160,6 +160,18 @@ fn bridge_key_projection_contains_only_opaque_id_name_and_enabled_state() {
     store.set_user_status_as_admin(&admin, &inactive_user.id, false).unwrap();
 
     let projection = store.bridge_api_key_metadata().unwrap();
+    let (version,stable)=store.bridge_api_key_snapshot(100).unwrap();
+    assert_eq!(stable,projection);
+    let (same,later)=store.bridge_api_key_snapshot(200).unwrap();
+    assert_eq!(same,version,"unchanged snapshots must share a stable version even when concurrent network delivery reverses");
+    assert_eq!(later,stable);
+    store.update_api_key_as_admin(&admin,&active.id,false,3).unwrap();
+    let (changed,disabled)=store.bridge_api_key_snapshot(99).unwrap();
+    assert!(changed>version,"a changed snapshot must advance even if the wall clock goes backwards");
+    assert!(!disabled.iter().find(|k|k.0==active.id).unwrap().2);
+    let reopened=CoreStore::open(&dir).unwrap();reopened.migrate().unwrap();
+    assert_eq!(reopened.bridge_api_key_snapshot(500).unwrap(),(changed,disabled),"registry revision must survive restart");
+    drop(reopened);
     let active_view = projection.iter().find(|item| item.0 == active.id).unwrap();
     let revoked_view = projection.iter().find(|item| item.0 == revoked.id).unwrap();
     let inactive_view = projection.iter().find(|item| item.0 == inactive_user_key.id).unwrap();

@@ -23,7 +23,7 @@ pub(crate) fn prepare_step(state:&StarlinkRouterState,principal:&Principal,paren
     let endpoint=if kind==BudgetStepKind::Video {"videos"} else {"chat"};
     let fingerprint=state.store.request_fingerprint_for_billing(request).map_err(|e|e.to_string())?;
     let client=state.bridge_client();
-    client.sync_core_key_registry(chrono::Utc::now().timestamp_millis(),state.store.bridge_api_key_metadata().map_err(|e|e.to_string())?)?;
+    crate::key_registry_sync::sync_now(state)?;
     let value=post(&client,"/internal/bridge/v2/budgets/prepare",&json!({"wire_version":2,"parent_request_id":parent,"request_id":request,
         "core_key_id":principal.key_id,"request_fingerprint":fingerprint,"endpoint":endpoint,"model":model,"step_kind":kind,"body":body}),request)?;
     let prepared:Prepared=serde_json::from_value(value).map_err(|_|"invalid prepared budget")?;
