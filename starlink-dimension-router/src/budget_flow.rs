@@ -11,10 +11,27 @@ struct Prepared {
     wire_version:u8,authorization:BudgetAuthorization,dispatch_token:String,evidence_level:String,prepared_at_ms:i64,revision:i64,
 }
 fn fail(code:&str)->Response {
-    let status=match code {"key_concurrency_exceeded"=>StatusCode::TOO_MANY_REQUESTS,"quota_insufficient"=>StatusCode::PAYMENT_REQUIRED,_=>StatusCode::SERVICE_UNAVAILABLE};
+    let status=match code {
+        "key_concurrency_exceeded"|"video_download_busy"|"budget_preparation_busy"|"bridge_workers_busy"|"reference_upload_limited"=>StatusCode::TOO_MANY_REQUESTS,
+        "quota_insufficient"=>StatusCode::PAYMENT_REQUIRED,
+        "video_not_ready"|"budget_identity_conflict"=>StatusCode::CONFLICT,
+        "invalid_budget_business_request"=>StatusCode::BAD_REQUEST,
+        _=>StatusCode::SERVICE_UNAVAILABLE,
+    };
     let mut response=(status,Json(json!({"error":{"type":"billing_error","code":code,"message":code}}))).into_response();
     if status==StatusCode::TOO_MANY_REQUESTS {response.headers_mut().insert("retry-after","1".parse().unwrap());}
     response
+}
+#[cfg(test)]
+mod error_tests {
+    #[test]
+    fn busy_invalid_and_missing_policy_are_not_the_same_503() {
+        use super::*;
+        assert_eq!(fail("budget_preparation_busy").status(),StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(fail("invalid_budget_business_request").status(),StatusCode::BAD_REQUEST);
+        assert_eq!(fail("budget_identity_conflict").status(),StatusCode::CONFLICT);
+        assert_eq!(fail("budget_policy_unconfigured").status(),StatusCode::SERVICE_UNAVAILABLE);
+    }
 }
 fn post(client:&BridgeClient,path:&str,body:&Value,request:&str)->Result<Value,String> {
     client.json_request("POST",path,&serde_json::to_vec(body).map_err(|_|"budget encoding failed")?,Some(request))
@@ -62,7 +79,7 @@ pub(crate) async fn submit_video(state:Arc<StarlinkRouterState>,principal:Princi
     match result {
         Ok(Ok(_))=>(StatusCode::ACCEPTED,Json(json!({"task":{"id":request,"status":"queued"},"request_id":request}))).into_response(),
         other=>{
-            let code=match &other {Ok(Err(code)) if matches!(code.as_str(),"key_concurrency_exceeded"|"quota_insufficient")=>code.as_str(),_=>"budget_admission_failed"};
+            let code=match &other {Ok(Err(code))=>crate::budget_errors::public_code(code).unwrap_or("budget_admission_failed"),_=>"budget_admission_failed"};
             let response=fail(code);
             if matches!(state.store.budget_operation(&request),Ok(None)) {crate::user_routes::finish_failed_quote_request(&state,&request,response)} else {response}
         }
@@ -216,16 +233,24 @@ fn completed_video(state:&StarlinkRouterState,request:&str,result:&Value)->Resul
 }
 
 pub(crate) async fn video_content(state:Arc<StarlinkRouterState>,principal:Principal,request:String)->Response {
+    match owned_video_step(&state,&principal,&request) {
+        Ok(Some(_))=>{},Ok(None)=>return StatusCode::NOT_FOUND.into_response(),Err(_)=>return fail("video_content_unavailable"),
+    }
+    let permit=match state.budget_download_slots.clone().try_acquire_owned() {
+        Ok(permit)=>permit,Err(_)=>return fail("video_download_busy"),
+    };
     let s=state.clone();
     let result=tokio::task::spawn_blocking(move ||->Result<Option<_>,String> {
         let Some(step)=owned_video_step(&s,&principal,&request)? else {return Ok(None)};
         let value=read_result(&s,&step)?;
         if value["status"]!="ready" || value["result"]["status"]!="completed" {return Err("video_not_ready".into());}
-        s.bridge_client().budget_content(&step).map(Some)
+        s.bridge_client().budget_content(&step).map(|upstream|Some((upstream,permit)))
     }).await;
-    let upstream=match result {Ok(Ok(Some(value))) if value.status==200=>value,Ok(Ok(None))=>return StatusCode::NOT_FOUND.into_response(),_=>return fail("video_content_unavailable")};
+    let (upstream,permit)=match result {Ok(Ok(Some((value,permit)))) if value.status==200=>(value,permit),Ok(Ok(None))=>return StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(code)) if code=="video_not_ready"=>return fail(&code),_=>return fail("video_content_unavailable")};
     let (send,receive)=tokio::sync::mpsc::channel(2);
     tokio::task::spawn_blocking(move || {
+        let _permit=permit; // Held until EOF/error/disconnect, not just headers.
         use std::io::Read;let mut reader=upstream.body;let mut buffer=[0u8;64*1024];let mut total=0u64;
         loop {match reader.read(&mut buffer) {
             Ok(0)=>break,
@@ -269,12 +294,16 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
     if !stream {
         return match receive.await {
             Ok(Ok(value))=>Json(value).into_response(),
-            Ok(Err(code)) if matches!(code.as_str(),"key_concurrency_exceeded"|"quota_insufficient")=>fail(&code),
+            Ok(Err(code))=>fail(crate::budget_errors::public_code(&code).unwrap_or("seedance_budget_execution_failed")),
             _=>fail("seedance_budget_execution_failed"),
         };
     }
     let (send,recv)=tokio::sync::mpsc::channel(8);
     tokio::spawn(async move {
+        let initial=json!({"id":format!("chatcmpl-{request}"),"object":"chat.completion.chunk","model":"seedance",
+            "created":chrono::Utc::now().timestamp(),"request_id":request,
+            "choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]});
+        if send.send(Ok(axum::body::Bytes::from(format!("data: {initial}\n\n")))).await.is_err() {return;}
         // Heartbeats keep provider validation and long video generation alive;
         // this is Seedance orchestration, not a replacement for normal chat SSE.
         let mut receive=receive;
@@ -289,7 +318,10 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
                         if !value["video_task"].is_null() {chunk["video_task"]=value["video_task"].clone();}
                         format!("data: {chunk}\n\ndata: [DONE]\n\n").into_bytes()
                     },
-                    _=>crate::seedance_sse::encode_event(&request,crate::seedance_sse::VideoStreamEvent::Failed {code:"seedance_budget_execution_failed".into(),request_id:request.clone()}),
+                    failure=>{
+                        let code=match &failure {Ok(Err(code))=>crate::budget_errors::public_code(code).unwrap_or("seedance_budget_execution_failed"),_=>"seedance_budget_execution_failed"};
+                        crate::seedance_sse::encode_event(&request,crate::seedance_sse::VideoStreamEvent::Failed {code:code.into(),request_id:request.clone()})
+                    },
                 };
                 let _=send.send(Ok(axum::body::Bytes::from(bytes))).await;break;
             }

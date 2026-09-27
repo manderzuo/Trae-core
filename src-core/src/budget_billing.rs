@@ -2535,7 +2535,8 @@ impl CoreStore {
                  FROM budget_steps step
                  JOIN budget_operations operation ON operation.operation_id = step.operation_id
                  WHERE (step.financial_state IN ('held','unknown','conflict')
-                    OR step.execution_state IN ('ready','running','unknown'))
+                    OR step.execution_state IN ('ready','running','unknown')
+                    OR operation.execution_state IN ('ready','running','unknown'))
                    AND (?2 IS NULL OR step.request_id > ?2)
                  ORDER BY CASE WHEN ?2 IS NULL THEN step.updated_at_ms ELSE 0 END, step.request_id LIMIT ?1",
             )?;

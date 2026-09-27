@@ -55,6 +55,27 @@ pub(crate) fn sync_execution(state: &StarlinkRouterState, client: &BridgeClient,
     if terminal && step.kind!=BudgetStepKind::Assist && step.request_id==step.parent_request_id {
         state.store.finish_budget_execution(&step.parent_request_id,next).map_err(|e|e.to_string())?;
     }
+    if terminal && step.kind==BudgetStepKind::Assist {
+        let operation=state.store.budget_operation(&step.parent_request_id).map_err(|e|e.to_string())?.ok_or("helper parent missing")?;
+        if !matches!(operation.execution_state,Execution::Succeeded|Execution::Failed|Execution::Canceled)
+            && !operation.steps.iter().any(|s|s.kind==BudgetStepKind::Video) {
+            let finish=if next==Execution::Failed {Some(Execution::Failed)} else {
+                // A durable helper result can finish a text-only probe even if
+                // its original HTTP observer/process is gone. Video intent is
+                // not terminal: it still needs the separate continuation path.
+                let reply=read(client,step,"result")?;
+                if reply["status"]!="ready" {return Err("terminal helper result unavailable".into());}
+                let decision=reply.pointer("/result/choices/0/message/content").and_then(Value::as_str)
+                    .and_then(|text|serde_json::from_str::<Value>(text.trim()).ok());
+                match decision {
+                    Some(value) if value["intent"]=="text" && value["text"].as_str().is_some_and(|s|!s.trim().is_empty() && s.len()<=16*1024)=>Some(Execution::Succeeded),
+                    Some(value) if value["intent"]=="video" && value["prompt"].as_str().is_some_and(|s|!s.trim().is_empty() && s.len()<=12*1024)=>None,
+                    _=>Some(Execution::Failed),
+                }
+            };
+            if let Some(finish)=finish {state.store.finish_budget_execution(&step.parent_request_id,finish).map_err(|e|e.to_string())?;}
+        }
+    }
     Ok(())
 }
 
@@ -109,8 +130,10 @@ fn apply_receipt_envelope(state:&StarlinkRouterState,step:&BudgetStepView,value:
 }
 
 pub(crate) fn reconcile_once(state: &StarlinkRouterState) {
-    if let Err(error)=sync_event_page(state) {eprintln!("v2 receipt events: {error}");}
-    if let Err(error)=reconcile_page(state, "") {eprintln!("v2 recovery index: {error}");}
+    std::thread::scope(|scope| {
+        scope.spawn(|| {if let Err(error)=sync_event_page(state) {eprintln!("v2 receipt events: {error}");}});
+        if let Err(error)=reconcile_page(state, "") {eprintln!("v2 recovery index: {error}");}
+    });
 }
 
 fn sync_event_page(state:&StarlinkRouterState)->Result<(),String> {
@@ -167,6 +190,10 @@ fn reconcile_page(state: &StarlinkRouterState, after: &str) -> Result<String,Str
 pub(crate) fn spawn(state: &std::sync::Arc<StarlinkRouterState>) {
     use std::{sync::{Arc,atomic::Ordering},time::Duration};
     if state.budget_reconciler_started.swap(true,Ordering::AcqRel) {return;}
+    // Independent, bounded lanes: a slow event feed cannot delay execution slot
+    // release, and slow request reads cannot postpone newly published receipts.
+    // Each lane awaits its own worker before the next tick (no overlap/backlog).
+    for event_lane in [true,false] {
     let weak=Arc::downgrade(state);
     tokio::spawn(async move {
         let mut after=String::new();
@@ -177,14 +204,15 @@ pub(crate) fn spawn(state: &std::sync::Arc<StarlinkRouterState>) {
             let Some(state)=weak.upgrade() else {break};
             let previous=after.clone();
             match tokio::task::spawn_blocking(move || {
-                if let Err(error)=sync_event_page(&state) {eprintln!("v2 receipt events: {error}");}
-                reconcile_page(&state,&previous)
+                if event_lane {sync_event_page(&state).map(|_|String::new())}
+                else {reconcile_page(&state,&previous)}
             }).await {
                 Ok(Ok(next))=>after=next,
-                _=>eprintln!("v2 background reconciliation failed; next tick will retry"),
+                _=>eprintln!("v2 background reconciliation lane failed; next tick will retry"),
             }
         }
     });
+    }
 }
 
 fn for_each_bounded<T: Sync>(items: &[T], action: impl Fn(&T) + Sync) {

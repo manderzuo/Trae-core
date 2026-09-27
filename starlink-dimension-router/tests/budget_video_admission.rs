@@ -4,11 +4,24 @@ use axum::{extract::{State,Path},Extension,http::{HeaderMap,StatusCode},body::By
 use serde_json::{json,Value};
 use starlink_dimension_router::{bridge_client::{BridgeClient,BridgeTransport,BridgeResponse},config::RouterConfig,state::StarlinkRouterState,user_routes};
 
-struct Bridge {claims:Mutex<BTreeMap<String,Value>>,sends:AtomicUsize,video_intent:bool}
+struct Bridge {claims:Mutex<BTreeMap<String,Value>>,sends:AtomicUsize,video_intent:bool,
+    large_downloads:std::sync::atomic::AtomicBool,active_downloads:Arc<AtomicUsize>}
+struct DownloadReader {active:Arc<AtomicUsize>}
+impl std::io::Read for DownloadReader {
+    fn read(&mut self,buffer:&mut [u8])->std::io::Result<usize> {buffer.fill(0);Ok(buffer.len())}
+}
+impl Drop for DownloadReader {fn drop(&mut self) {self.active.fetch_sub(1,Ordering::SeqCst);}}
 struct Directory(std::path::PathBuf);
 impl Directory {fn path(&self)->&std::path::Path {&self.0}}
 impl Drop for Directory {fn drop(&mut self) {let _=std::fs::remove_dir_all(&self.0);}}
 impl BridgeTransport for Bridge {
+    fn send_stream(&self,method:&str,url:&str,headers:&BTreeMap<String,String>,body:&[u8])->Result<starlink_dimension_router::bridge_client::BridgeStreamingResponse,String> {
+        let response=self.send(method,url,headers,body)?;
+        let reader:Box<dyn std::io::Read+Send>=if url.contains("/content?") && self.large_downloads.load(Ordering::SeqCst) {
+            self.active_downloads.fetch_add(1,Ordering::SeqCst);Box::new(DownloadReader {active:self.active_downloads.clone()})
+        } else {Box::new(std::io::Cursor::new(response.body))};
+        Ok(starlink_dimension_router::bridge_client::BridgeStreamingResponse {status:response.status,headers:response.headers,body:reader})
+    }
     fn send(&self,_method:&str,url:&str,headers:&BTreeMap<String,String>,body:&[u8])->Result<BridgeResponse,String> {
         assert_eq!(headers.get("authorization").map(String::as_str),Some("Bearer bridge-only"));
         if url.contains("/content?") {return Ok(BridgeResponse {status:200,headers:BTreeMap::from([("content-type".into(),"video/mp4".into())]),body:b"fixture-mp4".to_vec()});}
@@ -54,7 +67,7 @@ async fn ten_keys_each_admit_two_reject_third_and_reuse_terminal_slot_before_rec
         principals.push(store.authenticate_api_key(&issued.plaintext).unwrap());
     }
     store.set_video_billing_control(aiwork_core::VideoBillingControlInput {mode:aiwork_core::VideoBillingMode::Active,reason:"fixture".into(),diagnostic_key_id:None,diagnostic_request_hash:None}).unwrap();
-    let bridge=Arc::new(Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent:true});
+    let bridge=Arc::new(Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent:true,large_downloads:std::sync::atomic::AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0))});
     let mut cfg=RouterConfig::defaults(dir.path().into());cfg.budget_billing_v2=true;
     let state=StarlinkRouterState::for_test(store.clone(),BridgeClient::from_transport("http://bridge","bridge-only",bridge.clone()),cfg);
     let body=Bytes::from(json!({"model":"seedance","prompt":"fixture cat","duration":5,"resolution":"480p"}).to_string());
@@ -104,7 +117,11 @@ async fn seedance_stream_probe_has_valid_sse_and_needs_no_client_idempotency_hea
 async fn seedance_helper_to_video_continues_while_both_receipts_are_pending() {run_case(true,false,true).await;}
 #[tokio::test]
 async fn retry_after_core_restart_recovers_saved_helper_without_paying_for_it_again() {
-    run_case_options(true,false,true,false,true).await;
+    run_case_options(true,false,true,false,true,false).await;
+}
+#[tokio::test]
+async fn orphaned_helper_text_completion_releases_parent_without_client_retry() {
+    run_case_options(true,false,false,false,true,true).await;
 }
 #[tokio::test]
 async fn chat_inline_reference_is_uploaded_and_bound_to_video_preparation() {run_case_with_reference(true,false,true,true).await;}
@@ -112,9 +129,9 @@ async fn run_case(probe:bool,stream:bool,video_intent:bool) {
     run_case_with_reference(probe,stream,video_intent,false).await;
 }
 async fn run_case_with_reference(probe:bool,stream:bool,video_intent:bool,reference:bool) {
-    run_case_options(probe,stream,video_intent,reference,false).await;
+    run_case_options(probe,stream,video_intent,reference,false,false).await;
 }
-async fn run_case_options(probe:bool,stream:bool,video_intent:bool,reference:bool,resume_helper:bool) {
+async fn run_case_options(probe:bool,stream:bool,video_intent:bool,reference:bool,resume_helper:bool,background_only:bool) {
     let dir=Directory(std::env::temp_dir().join(format!("core-public-budget-{:032x}",rand::random::<u128>())));
     let store=Arc::new(CoreStore::open(dir.path()).unwrap());store.migrate().unwrap();
     store.create_user(NewUser {id:"admin".into(),name:"Admin".into(),role:UserRole::Admin},"bootstrap").unwrap();
@@ -123,7 +140,7 @@ async fn run_case_options(probe:bool,stream:bool,video_intent:bool,reference:boo
     let k=store.issue_api_key_as_admin_with_max_concurrency("user","Key",BTreeSet::from(["videos:submit".into(),"assets:write".into()]),1,&admin).unwrap();
     store.key_quota_grant_as_admin(&admin,KeyQuotaGrant {api_key_id:k.id.clone(),resource_kind:"credits".into(),amount:100_000_000,actor_user_id:"admin".into(),reason:"isolated test".into()}).unwrap();
     store.set_video_billing_control(aiwork_core::VideoBillingControlInput {mode:aiwork_core::VideoBillingMode::Active,reason:"fixture".into(),diagnostic_key_id:None,diagnostic_request_hash:None}).unwrap();
-    let bridge=Arc::new(Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent});
+    let bridge=Arc::new(Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent,large_downloads:std::sync::atomic::AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0))});
     let mut cfg=RouterConfig::defaults(dir.path().into());cfg.budget_billing_v2=true;
     let state=StarlinkRouterState::for_test(store.clone(),BridgeClient::from_transport("http://bridge","bridge-only",bridge.clone()),cfg);
     let principal=store.authenticate_api_key(&k.plaintext).unwrap();
@@ -152,6 +169,23 @@ async fn run_case_options(probe:bool,stream:bool,video_intent:bool,reference:boo
         let reopened=Arc::new(CoreStore::open(dir.path()).unwrap());reopened.migrate().unwrap();
         StarlinkRouterState::for_test(reopened,state.bridge.lock().unwrap().clone(),state.config.clone())
     } else {state};
+    if background_only {
+        // Simulate a crash after step execution and billing committed but before
+        // the parent operation was completed by its HTTP observer.
+        let child=bridge.claims.lock().unwrap().keys().next().unwrap().clone();
+        let step=store.budget_step_for_request(&child).unwrap().unwrap();
+        store.mark_budget_step_execution(&child,aiwork_core::BudgetExecutionState::Succeeded).unwrap();
+        store.apply_budget_receipt(aiwork_core::BudgetReceiptInput {
+            budget_id:step.budget_id,account_ref:step.account_ref,bridge_instance_id:step.bridge_instance_id,
+            receipt:aiwork_core::BillingReceipt {request_id:child,status:aiwork_core::BillingReceiptStatus::Final,
+                actual_credits:Some(aiwork_core::CreditAmount::parse("1.234567","credits").unwrap()),unit:"credits".into(),
+                source_ref:"fixture-session-final".into(),task_ref:None,observed_at_ms:chrono::Utc::now().timestamp_millis()},
+        }).unwrap();
+        for _ in 0..2 {starlink_dimension_router::user_routes::reconcile_pending_billing_requests_once(&state);}
+        assert_eq!(store.active_execution_count_for_key(&k.id).unwrap(),0,"finished text-only helper must not leave its parent occupying the sole execution slot");
+        assert_eq!(bridge.sends.load(Ordering::SeqCst),0,"background recovery must not resend the helper");
+        return;
+    }
     if probe {
         for _ in 0..2 {
             let r=user_routes::chat_completions(State(state.clone()),headers.clone(),Extension(principal.clone()),body.clone()).await;
@@ -160,6 +194,8 @@ async fn run_case_options(probe:bool,stream:bool,video_intent:bool,reference:boo
             let value:Value=if stream {
                 let wire=std::str::from_utf8(&bytes).unwrap();assert!(wire.contains("data: [DONE]"));
                 let frames:Vec<Value>=wire.lines().filter_map(|line|line.strip_prefix("data: ")).filter_map(|s|serde_json::from_str(s).ok()).collect();
+                assert_eq!(frames[0]["choices"][0]["delta"]["role"],"assistant");
+                assert!(frames[0]["choices"][0]["finish_reason"].is_null(),"first data frame must acknowledge an open stream before the final result");
                 assert!(!frames.is_empty());let last=frames.last().unwrap().clone();assert_eq!(last["choices"][0]["delta"]["content"],"你好，连接正常。");last
             } else {serde_json::from_slice(&bytes).unwrap()};
             if !stream && !video_intent {assert_eq!(value["choices"][0]["message"]["content"],"你好，连接正常。");}
@@ -192,6 +228,21 @@ async fn run_case_options(probe:bool,stream:bool,video_intent:bool,reference:boo
     let r=user_routes::video_content(State(state.clone()),Path(id.to_string()),HeaderMap::new(),Extension(principal.clone())).await;
     assert_eq!(r.status(),StatusCode::OK,"video download must not wait for its financial receipt");
     assert_eq!(&axum::body::to_bytes(r.into_body(),65536).await.unwrap()[..],b"fixture-mp4");
+    bridge.large_downloads.store(true,Ordering::SeqCst);
+    let mut downloads=Vec::new();
+    for _ in 0..4 {
+        let r=user_routes::video_content(State(state.clone()),Path(id.to_string()),HeaderMap::new(),Extension(principal.clone())).await;
+        assert_eq!(r.status(),StatusCode::OK);downloads.push(r);
+    }
+    let fifth=user_routes::video_content(State(state.clone()),Path(id.to_string()),HeaderMap::new(),Extension(principal.clone())).await;
+    let fifth_status=fifth.status();drop(fifth);drop(downloads);
+    tokio::time::timeout(std::time::Duration::from_secs(2),async {
+        while bridge.active_downloads.load(Ordering::SeqCst)>0 {tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+    }).await.expect("disconnect must release download worker");
+    assert_eq!(fifth_status,StatusCode::TOO_MANY_REQUESTS,"slow consumers must not create unbounded blocking readers");
+    bridge.large_downloads.store(false,Ordering::SeqCst);
+    let again=user_routes::video_content(State(state.clone()),Path(id.to_string()),HeaderMap::new(),Extension(principal.clone())).await;
+    assert_eq!(again.status(),StatusCode::OK,"released download permit must be reusable");drop(again);
     let mut other=principal.clone();other.key_id="unrelated-key".into();
     let r=user_routes::video_content(State(state.clone()),Path(id.to_string()),HeaderMap::new(),Extension(other)).await;
     assert_eq!(r.status(),StatusCode::NOT_FOUND,"same-user keys must not share video access");

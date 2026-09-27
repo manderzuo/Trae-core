@@ -5,7 +5,8 @@ use serde_json::{json, Value};
 use starlink_dimension_router::{bridge_client::{BridgeClient, BridgeTransport, BridgeResponse},
     state::StarlinkRouterState, config::RouterConfig, user_routes::reconcile_pending_billing_requests_once};
 
-struct Replies { execution: Value, billing: Mutex<Value>, events:Mutex<Vec<Value>>, generation:Mutex<String>, event_offsets:Mutex<Vec<i64>>, configuration_lock: Mutex<Option<std::sync::Weak<Mutex<BridgeClient>>>> }
+struct Replies { execution: Value, billing: Mutex<Value>, events:Mutex<Vec<Value>>, generation:Mutex<String>, event_offsets:Mutex<Vec<i64>>, configuration_lock: Mutex<Option<std::sync::Weak<Mutex<BridgeClient>>>>,
+    event_gate:Mutex<Option<std::sync::mpsc::Receiver<()>>>, execution_seen:Mutex<Option<std::sync::mpsc::Sender<()>>> }
 impl BridgeTransport for Replies {
     fn send(&self, method: &str, url: &str, headers: &BTreeMap<String,String>, _: &[u8]) -> Result<BridgeResponse,String> {
         assert_eq!(method, "GET", "recovery must never create a paid task");
@@ -14,11 +15,12 @@ impl BridgeTransport for Replies {
             if lock.try_lock().is_err() {return Err("network was called while holding shared bridge configuration lock".into());}
         }
         let value = if url.contains("/receipt-events?") {
+                if let Some(gate)=self.event_gate.lock().unwrap().take() {gate.recv().unwrap();}
                 let after=url.split("after=").nth(1).and_then(|s|s.split('&').next()).unwrap_or("0").parse::<i64>().unwrap();
                 self.event_offsets.lock().unwrap().push(after);
                 json!({"wire_version":2,"bridge_instance_id":"instance","generation":self.generation.lock().unwrap().clone(),"events":self.events.lock().unwrap().iter().filter(|v|v["sequence"].as_i64().unwrap()>after).cloned().collect::<Vec<_>>()})
             } else if url.ends_with("/v1/models") {json!({"data":[]})}
-            else if url.contains("/execution?") { self.execution.clone() }
+            else if url.contains("/execution?") { if let Some(seen)=self.execution_seen.lock().unwrap().take() {seen.send(()).unwrap();} self.execution.clone() }
             else if url.contains("/billing?") { self.billing.lock().unwrap().clone() }
             else if url.contains("/result?") {let mut v=self.execution.clone();v["status"]=json!("not_ready");v["result"]=Value::Null;v}
             else { return Err("unexpected recovery route".into()); };
@@ -44,6 +46,13 @@ fn prepared_but_never_dispatched_core_step_releases_on_verified_no_send() {
     run_recovery_with_dispatch(true,false);
 }
 fn run_recovery_with_dispatch(no_send:bool,dispatched:bool) {
+    run_recovery_with_event_gate(no_send,dispatched,false);
+}
+#[test]
+fn slow_receipt_event_feed_does_not_block_request_recovery_or_slot_release() {
+    run_recovery_with_event_gate(false,true,true);
+}
+fn run_recovery_with_event_gate(no_send:bool,dispatched:bool,block_events:bool) {
     let directory = Directory(std::env::temp_dir().join(format!("core-router-budget-{:032x}",rand::random::<u128>())));
     let store = Arc::new(CoreStore::open(&directory.0).unwrap()); store.migrate().unwrap();
     store.create_user(NewUser {id:"admin".into(),name:"Admin".into(),role:UserRole::Admin},"bootstrap").unwrap();
@@ -62,14 +71,21 @@ fn run_recovery_with_dispatch(no_send:bool,dispatched:bool) {
     execution["execution"] = json!({"request_id":request.id,"core_key_id":key.id,"budget_id":"budget-a","account_ref":"account","bridge_instance_id":"instance","state":"succeeded","step_kind":"video","task_ref":"task-a","started_at_ms":1,"finished_at_ms":2,"result_available":true});
     if no_send {execution["status"]=json!("not_started");execution["execution"]=Value::Null;}
     envelope["status"]=json!("pending"); envelope["event"]=Value::Null; envelope["receipt"]=Value::Null;
-    let replies = Arc::new(Replies {execution,billing:Mutex::new(envelope.clone()),events:Mutex::new(Vec::new()),generation:Mutex::new("generation".into()),event_offsets:Mutex::new(Vec::new()),configuration_lock:Mutex::new(None)});
+    let replies = Arc::new(Replies {execution,billing:Mutex::new(envelope.clone()),events:Mutex::new(Vec::new()),generation:Mutex::new("generation".into()),event_offsets:Mutex::new(Vec::new()),configuration_lock:Mutex::new(None),event_gate:Mutex::new(None),execution_seen:Mutex::new(None)});
     let state = StarlinkRouterState::for_test(store.clone(),BridgeClient::from_transport("http://bridge","test-bridge-only",replies.clone()),RouterConfig::defaults(directory.0.clone()));
     *replies.configuration_lock.lock().unwrap()=Some(Arc::downgrade(&state.bridge));
     let principal=store.authenticate_api_key(&key.plaintext).unwrap();
     let models=tokio::runtime::Runtime::new().unwrap().block_on(starlink_dimension_router::user_routes::models(
         axum::extract::State(state.clone()),axum::http::HeaderMap::new(),axum::Extension(principal)));
     assert_eq!(models.status(),axum::http::StatusCode::OK,"legacy routes must not hold the lock needed by the v2 reconciler across I/O");
-    reconcile_pending_billing_requests_once(&state);
+    if block_events {
+        let (release,gate)=std::sync::mpsc::channel();let (seen,received)=std::sync::mpsc::channel();
+        *replies.event_gate.lock().unwrap()=Some(gate);*replies.execution_seen.lock().unwrap()=Some(seen);
+        let s=state.clone();let worker=std::thread::spawn(move ||reconcile_pending_billing_requests_once(&s));
+        let independent=received.recv_timeout(std::time::Duration::from_secs(1)).is_ok();
+        release.send(()).unwrap();worker.join().unwrap();
+        assert!(independent,"slow event discovery must not delay request recovery");
+    } else {reconcile_pending_billing_requests_once(&state);}
     assert_eq!(store.active_execution_count_for_key(&key.id).unwrap(),if no_send {1} else {0},"only a proven terminal result releases execution before receipt");
     assert_eq!(store.budget_operation(&request.id).unwrap().unwrap().steps[0].financial_state,BudgetFinancialState::Held);
     let mut receipt = json!({"request_id":request.id,"status":"final","actual_credits":"12.345678","unit":"credits","source_ref":"session-final","task_ref":"task-a","observed_at_ms":chrono::Utc::now().timestamp_millis()});

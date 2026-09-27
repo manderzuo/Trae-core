@@ -1,0 +1,31 @@
+//! Public v2 machine codes only. Never forward provider text, SQL, URLs or keys.
+pub(crate) fn public_code(code:&str)->Option<&'static str> {
+    Some(match code {
+        "budget_policy_unconfigured"=>"budget_policy_unconfigured",
+        "budget_policy_expired"=>"budget_policy_expired",
+        "budget_policy_invalid"=>"budget_policy_invalid",
+        "upstream_account_unavailable"=>"upstream_account_unavailable",
+        "upstream_capacity_insufficient"=>"upstream_capacity_insufficient",
+        "upstream_capacity_unavailable"=>"upstream_capacity_unavailable",
+        "native_estimate_unavailable"=>"native_estimate_unavailable",
+        "bridge_recovery_required"=>"bridge_recovery_required",
+        "reference_video_budget_metadata_required"=>"reference_video_budget_metadata_required",
+        "budget_preparation_busy"=>"budget_preparation_busy",
+        "bridge_workers_busy"=>"bridge_workers_busy",
+        "budget_identity_conflict"=>"budget_identity_conflict",
+        "invalid_budget_business_request"=>"invalid_budget_business_request",
+        "budget_preparation_failed"=>"budget_preparation_failed",
+        "budget_dispatch_not_accepted"=>"budget_dispatch_not_accepted",
+        "bridge_state_unavailable"=>"bridge_state_unavailable",
+        "key_concurrency_exceeded"=>"key_concurrency_exceeded",
+        "quota_insufficient"=>"quota_insufficient",
+        "budget_not_sent"=>"budget_not_sent",
+        "budget_execution_wait_timeout"=>"budget_execution_wait_timeout",
+        "video_billing_paused"=>"video_billing_paused",
+        "video_execution_failed"=>"video_execution_failed",
+        "reference_upload_limited"=>"reference_upload_limited",
+        "reference_materialization_failed"=>"reference_materialization_failed",
+        "assist_result_invalid"=>"assist_result_invalid",
+        _=>return None,
+    })
+}

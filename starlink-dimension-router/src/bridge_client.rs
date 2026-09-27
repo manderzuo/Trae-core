@@ -769,6 +769,13 @@ impl BridgeClient {
             request_id.unwrap_or("core-control-check"),
         )?;
         if !(200..300).contains(&response.status) {
+            if path.starts_with("/internal/bridge/v2/") {
+                if let Ok(value)=serde_json::from_slice::<Value>(&response.body) {
+                    if let Some(code)=value.pointer("/error/code").and_then(Value::as_str).and_then(crate::budget_errors::public_code) {
+                        return Err(code.into());
+                    }
+                }
+            }
             return Err(format!("AI Work bridge 返回 HTTP {}", response.status));
         }
         serde_json::from_slice(&response.body).map_err(|e| format!("桥接响应不是有效 JSON: {e}"))
@@ -930,6 +937,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn v2_preserves_only_safe_machine_error_codes_not_upstream_messages() {
+        for (code,expected) in [("budget_policy_unconfigured","budget_policy_unconfigured"),("budget_preparation_busy","budget_preparation_busy"),("private-account-secret", "AI Work bridge 返回 HTTP 503")] {
+            let body=serde_json::to_vec(&serde_json::json!({"error":{"code":code,"message":"jwt-and-account-secret"}})).unwrap();
+            let client=BridgeClient::from_transport("http://bridge","bridge-secret",Arc::new(RecordingBridge::responding_with_body(503,&body)));
+            let error=client.json_request("POST","/internal/bridge/v2/budgets/prepare",b"{}",Some("request-test")).unwrap_err();
+            assert_eq!(error,expected);
+            assert!(!error.contains("jwt-and-account-secret"));
+        }
+    }
     #[test]
     fn upstream_credit_snapshot_requires_fresh_exact_decimal_totals() {
         let now = chrono::Utc::now().timestamp_millis();

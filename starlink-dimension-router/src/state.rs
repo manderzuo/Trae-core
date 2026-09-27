@@ -34,6 +34,7 @@ pub struct UserVideoJob {
 fn default_billing_state() -> String { "held".into() }
 
 pub struct StarlinkRouterState {
+    pub(crate) budget_download_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) budget_reconciler_started: std::sync::atomic::AtomicBool,
     pub store: Arc<CoreStore>,
     pub bridge: Arc<Mutex<BridgeClient>>,
@@ -75,6 +76,7 @@ impl StarlinkRouterState {
         ensure_initial_admin_credential(&store, initial_password.as_deref()).map_err(|e| e.to_string())?;
         let jobs = load_jobs(&config.data_dir);
         Ok(Arc::new(Self {
+            budget_download_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             budget_reconciler_started: std::sync::atomic::AtomicBool::new(false),
             store,
             bridge: Arc::new(Mutex::new(bridge)),
@@ -99,7 +101,7 @@ impl StarlinkRouterState {
         config: RouterConfig,
         key_vault: KeyVault,
     ) -> Arc<Self> {
-        Arc::new(Self { budget_reconciler_started: std::sync::atomic::AtomicBool::new(false), store, bridge: Arc::new(Mutex::new(bridge)), config, key_vault: Arc::new(key_vault), jobs: Arc::new(Mutex::new(HashMap::new())), video_stream_observers: Arc::new(Mutex::new(HashSet::new())), admin_sessions: Arc::new(AdminSessionStore::new(SESSION_TTL_MS)), login_throttle: Arc::new(LoginThrottle::new()), asset_limiter: Arc::new(AssetLimiter::from_env()), startup_cutoff_ms: chrono::Utc::now().timestamp_millis() })
+        Arc::new(Self { budget_download_slots:Arc::new(tokio::sync::Semaphore::new(4)),budget_reconciler_started: std::sync::atomic::AtomicBool::new(false), store, bridge: Arc::new(Mutex::new(bridge)), config, key_vault: Arc::new(key_vault), jobs: Arc::new(Mutex::new(HashMap::new())), video_stream_observers: Arc::new(Mutex::new(HashSet::new())), admin_sessions: Arc::new(AdminSessionStore::new(SESSION_TTL_MS)), login_throttle: Arc::new(LoginThrottle::new()), asset_limiter: Arc::new(AssetLimiter::from_env()), startup_cutoff_ms: chrono::Utc::now().timestamp_millis() })
     }
 
     pub fn replace_bridge(&self, bridge: BridgeClient) {
