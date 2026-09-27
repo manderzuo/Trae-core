@@ -123,6 +123,10 @@ async fn retry_after_core_restart_recovers_saved_helper_without_paying_for_it_ag
 async fn orphaned_helper_text_completion_releases_parent_without_client_retry() {
     run_case_options(true,false,false,false,true,true).await;
 }
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn background_restarts_video_from_encrypted_checkpoint_without_a_second_client_request() {
+    run_case_options(true,false,true,false,true,true).await;
+}
 #[tokio::test]
 async fn chat_inline_reference_is_uploaded_and_bound_to_video_preparation() {run_case_with_reference(true,false,true,true).await;}
 async fn run_case(probe:bool,stream:bool,video_intent:bool) {
@@ -164,6 +168,10 @@ async fn run_case_options(probe:bool,stream:bool,video_intent:bool,reference:boo
             request_fingerprint:store.request_fingerprint_for_billing(&child.id).unwrap(),endpoint:"chat".into(),model:"deepseek-v4-flash".into(),account_ref:"account".into(),bridge_instance_id:"instance".into(),profile_fingerprint:"normalized-profile".into(),policy_version:"fixture".into(),hold_credits:CreditAmount::parse("2","credits").unwrap(),expires_at_ms:chrono::Utc::now().timestamp_millis()+60_000
         }}).unwrap();
         store.mark_budget_step_dispatched(&child.id,&budget).unwrap();
+        let fingerprint=store.request_fingerprint_for_billing(&parent.id).unwrap();
+        let context=format!("budget-continuation-v1:{}:{}:{}",parent.id,principal.key_id,fingerprint);
+        let encrypted=state.key_vault.encrypt(&context,&input.to_string()).unwrap();
+        store.save_budget_continuation(&principal,&parent.id,&input,encrypted.key_version,&encrypted.ciphertext).unwrap();
     }
     let state=if resume_helper {
         let reopened=Arc::new(CoreStore::open(dir.path()).unwrap());reopened.migrate().unwrap();
@@ -182,6 +190,14 @@ async fn run_case_options(probe:bool,stream:bool,video_intent:bool,reference:boo
                 source_ref:"fixture-session-final".into(),task_ref:None,observed_at_ms:chrono::Utc::now().timestamp_millis()},
         }).unwrap();
         for _ in 0..2 {starlink_dimension_router::user_routes::reconcile_pending_billing_requests_once(&state);}
+        if video_intent {
+            let _router=starlink_dimension_router::server::build_router(state.clone());
+            tokio::time::timeout(std::time::Duration::from_secs(5),async {
+                while store.active_execution_count_for_key(&k.id).unwrap()!=0 {tokio::time::sleep(std::time::Duration::from_millis(20)).await;}
+            }).await.expect("persisted successful helper must continue without client retry");
+            assert_eq!(bridge.sends.load(Ordering::SeqCst),1,"only the not-yet-started video may be dispatched");
+            return;
+        }
         assert_eq!(store.active_execution_count_for_key(&k.id).unwrap(),0,"finished text-only helper must not leave its parent occupying the sole execution slot");
         assert_eq!(bridge.sends.load(Ordering::SeqCst),0,"background recovery must not resend the helper");
         return;
@@ -201,6 +217,9 @@ async fn run_case_options(probe:bool,stream:bool,video_intent:bool,reference:boo
             if !stream && !video_intent {assert_eq!(value["choices"][0]["message"]["content"],"你好，连接正常。");}
             if video_intent {assert_eq!(value["video_task"]["status"],"completed");}
             let op=store.budget_operation(value["request_id"].as_str().unwrap()).unwrap().unwrap();
+            let saved=store.budget_continuation(value["request_id"].as_str().unwrap()).unwrap().expect("public admission persists recovery before helper dispatch");
+            let restored=state.key_vault.decrypt(&saved.encryption_context(),saved.key_version,&saved.ciphertext).unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&restored).unwrap(),input);
             assert_eq!(op.steps.len(),if video_intent {2} else {1});assert_eq!(op.steps.iter().map(|s|s.hold_credits.as_microcredits()).sum::<i64>(),if video_intent {42_000_000} else {2_000_000});
             assert_eq!(op.steps[0].financial_state,aiwork_core::BudgetFinancialState::Held);
             assert_eq!(store.active_execution_count_for_key(&k.id).unwrap(),0);

@@ -155,10 +155,11 @@ fn inline_images(body:&Value)->Result<Vec<crate::assets::ParsedAssetUpload>,Stri
     }
     Ok(images)
 }
-async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Principal,request:String,mut original:Value,fresh:bool,images:Vec<crate::assets::ParsedAssetUpload>)->Result<Value,String> {
+async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Principal,request:String,mut original:Value,fresh:bool,images:Vec<crate::assets::ParsedAssetUpload>,dispatch_only:bool)->Result<Value,String> {
     use aiwork_core::{BeginRequest,BeginRequestInput,BudgetExecutionState};
     let operation=state.store.budget_operation(&request).map_err(|e|e.to_string())?;
     if let Some(video)=operation.as_ref().and_then(|op|op.steps.iter().find(|s|s.kind==BudgetStepKind::Video)).cloned() {
+        if dispatch_only {return Ok(json!({"request_id":request,"status":"already_dispatched"}));}
         let result=wait_result(state.clone(),video).await?;
         return completed_video(&state,&request,&result);
     }
@@ -222,6 +223,7 @@ async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Principal,reques
     }
     let s=state.clone();let p=principal.clone();let rid=request.clone();
     let step=tokio::task::spawn_blocking(move ||prepare_step(&s,&p,&rid,&rid,"seedance",body,BudgetStepKind::Video)).await.map_err(|_|"video worker failed")??;
+    if dispatch_only {return Ok(json!({"request_id":request,"status":"dispatched"}));}
     let result=wait_result(state.clone(),step).await?;
     completed_video(&state,&request,&result)
 }
@@ -274,6 +276,7 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
     let input=BeginRequestInput {user_id:principal.user_id.clone(),api_key_id:principal.key_id.clone(),protocol:"openai".into(),endpoint:"videos".into(),model:"seedance".into(),idempotency_key:supplied.unwrap_or_default().into(),body:body.clone()};
     let begun=if supplied.is_some() {state.store.begin_billed_request(input)} else {state.store.begin_implicit_billed_video_request(input)};
     let (request,fresh)=match begun {Ok(BeginRequest::Created(r))=>(r.id,true),Ok(BeginRequest::Existing(r))=>(r.id,false),Ok(BeginRequest::Conflict)=>return StatusCode::CONFLICT.into_response(),Err(_)=>return fail("budget_request_rejected")};
+    if crate::budget_continuation::save(&state,&principal,&request,&body).is_err() {return fail("budget_checkpoint_unavailable");}
     {
         let mut observers=state.video_stream_observers.lock().unwrap_or_else(|e|e.into_inner());
         if observers.len()>=128 || !observers.insert(request.clone()) {return (StatusCode::TOO_MANY_REQUESTS,Json(json!({"error":{"code":"budget_observer_busy"}}))).into_response();}
@@ -282,11 +285,11 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
     let (done,receive)=tokio::sync::oneshot::channel();
     let rid=request.clone();
     tokio::spawn(async move {
-        let outcome=seedance_work(state.clone(),principal,rid.clone(),body,fresh,images).await;
+        let outcome=seedance_work(state.clone(),principal,rid.clone(),body,fresh,images,false).await;
         if outcome.is_err() {
             // Only terminal steps may release execution. Unknown paid execution
             // is retained; its budget and receipt remain recoverable.
-            let _=state.store.finish_budget_execution(&rid,aiwork_core::BudgetExecutionState::Failed);
+            finish_definite_failure(&state,&rid,outcome.as_ref().err().unwrap());
         }
         state.video_stream_observers.lock().unwrap_or_else(|e|e.into_inner()).remove(&rid);
         let _=done.send(outcome);
@@ -331,4 +334,27 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
     response.headers_mut().insert("content-type","text/event-stream; charset=utf-8".parse().unwrap());
     response.headers_mut().insert("cache-control","no-cache, no-transform".parse().unwrap());
     response.headers_mut().insert("x-accel-buffering","no".parse().unwrap());response
+}
+
+pub(crate) fn finish_definite_failure(state:&StarlinkRouterState,request:&str,code:&str) {
+    // Transport/storage/read errors are not evidence the workflow has ended.
+    if matches!(code,"assist_result_invalid"|"video_execution_failed"|"budget_not_sent"|"video_billing_paused"|
+        "quota_insufficient"|"budget_policy_unconfigured"|"budget_policy_expired"|"budget_policy_invalid"|
+        "reference_video_budget_metadata_required"|"invalid_budget_business_request"|"reference_image_limit"|
+        "invalid_image_asset_ids"|"invalid_reference_image"|"video_continuation_not_authorized") {
+        let _=state.store.finish_budget_execution(request,aiwork_core::BudgetExecutionState::Failed);
+    }
+}
+pub(crate) async fn resume_checkpoint(state:Arc<StarlinkRouterState>,checkpoint:aiwork_core::BudgetContinuation)->Result<(),String> {
+    let context=checkpoint.encryption_context();
+    let principal=checkpoint.principal.ok_or("video_continuation_not_authorized")?;
+    aiwork_core::require_scope(&principal,"videos:submit").map_err(|_|"video_continuation_not_authorized")?;
+    let text=zeroize::Zeroizing::new(state.key_vault.decrypt(&context,checkpoint.key_version,&checkpoint.ciphertext).map_err(|_|"budget_checkpoint_invalid")?);
+    let body:Value=serde_json::from_str(&text).map_err(|_|"budget_checkpoint_invalid")?;
+    // Re-check the original request hash and current user/Key status before any
+    // paid continuation. This call cannot replace the immutable checkpoint.
+    state.store.save_budget_continuation(&principal,&checkpoint.request_id,&body,checkpoint.key_version,&checkpoint.ciphertext).map_err(|_|"budget_checkpoint_invalid")?;
+    let images=inline_images(&body)?;
+    if !images.is_empty() {aiwork_core::require_scope(&principal,"assets:write").map_err(|_|"video_continuation_not_authorized")?;}
+    seedance_work(state,principal,checkpoint.request_id,body,false,images,true).await.map(|_|())
 }

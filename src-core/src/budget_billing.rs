@@ -3504,7 +3504,7 @@ mod tests {
         connection.execute("UPDATE schema_meta SET value='25' WHERE key='schema_version'", []).unwrap();
         drop(connection);
         store.migrate().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 27);
+        assert_eq!(store.schema_version().unwrap(), crate::CURRENT_SCHEMA_VERSION);
 
         let connection = Connection::open(&database).unwrap();
         let history_after: Vec<(i64, String, Vec<u8>)> = {

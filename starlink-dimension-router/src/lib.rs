@@ -19,3 +19,4 @@ pub mod video_reconciler;
 pub(crate) mod budget_reconciler;
 pub(crate) mod budget_flow;
 pub(crate) mod budget_errors;
+pub(crate) mod budget_continuation;

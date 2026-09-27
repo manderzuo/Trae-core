@@ -1795,7 +1795,7 @@ fn v27_reconcile_indexes_migrate_and_cover_event_group_and_cursor_plans() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(schema_version, "27", "V26 databases must receive V27 explicitly");
+    assert_eq!(schema_version, aiwork_core::CURRENT_SCHEMA_VERSION.to_string(), "V26 databases must receive all subsequent migrations explicitly");
     let index_names = {
         let mut statement = connection.prepare("SELECT name FROM sqlite_master WHERE type='index'").unwrap();
         statement
@@ -1947,7 +1947,7 @@ fn v27_reconcile_indexes_migrate_and_cover_event_group_and_cursor_plans() {
                 |row| row.get::<_, String>(0),
             )
             .unwrap(),
-        "27",
+        aiwork_core::CURRENT_SCHEMA_VERSION.to_string(),
         "reopening must keep the migrated schema version",
     );
 }
@@ -3191,7 +3191,7 @@ fn fresh_database_migrates_to_v27_budget_schema() {
 
     store.migrate().unwrap();
 
-    assert_eq!(store.schema_version().unwrap(), 27);
+    assert_eq!(store.schema_version().unwrap(), aiwork_core::CURRENT_SCHEMA_VERSION);
     assert_eq!(store.table_count("budget_operations").unwrap(), 1);
     assert_eq!(store.table_count("budget_steps").unwrap(), 1);
     assert!(store.foreign_keys_enabled().unwrap());
@@ -3449,7 +3449,7 @@ fn v24_to_v27_upgrade_preserves_legacy_held_unknown_and_settled_billing() {
 
     store.migrate().unwrap();
 
-    assert_eq!(store.schema_version().unwrap(), 27);
+    assert_eq!(store.schema_version().unwrap(), aiwork_core::CURRENT_SCHEMA_VERSION);
     assert_eq!(legacy_billing_snapshot(&database, request_ids), before);
     assert_eq!(store.table_count("budget_operations").unwrap(), 1);
     drop(store);
@@ -5117,7 +5117,7 @@ fn v25_to_v27_upgrade_backfills_revision_one_without_changing_financial_facts_or
 
     let upgraded = CoreStore::open(&directory.0).unwrap();
     upgraded.migrate().unwrap();
-    assert_eq!(upgraded.schema_version().unwrap(), 27);
+    assert_eq!(upgraded.schema_version().unwrap(), aiwork_core::CURRENT_SCHEMA_VERSION);
     let connection = Connection::open(&database).unwrap();
     let step_count: i64 = connection
         .query_row("SELECT COUNT(*) FROM budget_steps", [], |row| row.get(0))

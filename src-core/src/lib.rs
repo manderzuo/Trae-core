@@ -1,5 +1,7 @@
 mod cost;
 mod budget_billing;
+mod budget_continuation;
+pub use budget_continuation::BudgetContinuation;
 mod credits;
 mod controlled_billing;
 mod admin_summary;

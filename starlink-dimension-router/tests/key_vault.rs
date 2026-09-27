@@ -217,14 +217,26 @@ async fn rotated_key_is_persistently_copyable_and_old_key_stops_authenticating()
 #[tokio::test]
 async fn admin_rewraps_all_key_copies_before_the_previous_vault_key_is_removed() {
     let dir = TestDir::new();
-    let (key_id, plaintext) = {
+    let (key_id, plaintext, continuation_request) = {
         let old_app = test_app_with_vault(
             &dir,
             true,
             KeyVault::from_material(1, [0x31; 32], BTreeMap::new()).unwrap(),
         );
         let old_cookie = login(&old_app).await;
-        create_key(&old_app, &old_cookie).await
+        let (key_id,plaintext)=create_key(&old_app,&old_cookie).await;
+        let store=aiwork_core::CoreStore::open(dir.path()).unwrap();
+        let principal=store.authenticate_api_key(&plaintext).unwrap();
+        let body=json!({"model":"seedance","messages":[{"role":"user","content":"private recovery prompt"}]});
+        let aiwork_core::BeginRequest::Created(request)=store.begin_billed_request(aiwork_core::BeginRequestInput {
+            user_id:principal.user_id.clone(),api_key_id:key_id.clone(),protocol:"openai".into(),endpoint:"videos".into(),model:"seedance".into(),idempotency_key:"checkpoint-rotation".into(),body:body.clone(),
+        }).unwrap() else {panic!("request")};
+        let fingerprint=store.request_fingerprint_for_billing(&request.id).unwrap();
+        let context=format!("budget-continuation-v1:{}:{key_id}:{fingerprint}",request.id);
+        let vault=KeyVault::from_material(1,[0x31;32],BTreeMap::new()).unwrap();
+        let encrypted=vault.encrypt(&context,&body.to_string()).unwrap();
+        store.save_budget_continuation(&principal,&request.id,&body,encrypted.key_version,&encrypted.ciphertext).unwrap();
+        (key_id,plaintext,request.id)
     };
 
     let new_keyring_app = test_app_with_vault(
@@ -240,7 +252,13 @@ async fn admin_rewraps_all_key_copies_before_the_previous_vault_key_is_removed()
         json!({}),
     ).await;
     assert_eq!(rewrapped.status(), StatusCode::OK);
-    assert_eq!(response_json(rewrapped).await["rewrapped"], 1);
+    let result=response_json(rewrapped).await;
+    assert_eq!(result["rewrapped"],1);
+    assert_eq!(result["continuations_rewrapped"],1,"workflow data must survive removing the old vault key too");
+    let store=aiwork_core::CoreStore::open(dir.path()).unwrap();
+    let saved=store.budget_continuation(&continuation_request).unwrap().unwrap();
+    let active_only=KeyVault::from_material(2,[0x42;32],BTreeMap::new()).unwrap();
+    assert!(active_only.decrypt(&saved.encryption_context(),saved.key_version,&saved.ciphertext).unwrap().contains("private recovery prompt"));
     drop(new_keyring_app);
 
     let active_only_app = test_app_with_vault(

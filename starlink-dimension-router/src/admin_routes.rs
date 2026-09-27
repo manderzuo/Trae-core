@@ -562,7 +562,12 @@ async fn rewrap_api_key_vault(
             Ok((encrypted.ciphertext, encrypted.key_version))
         },
     ).map_err(key_vault_admin_error)?;
-    Ok(no_store_json(json!({ "rewrapped": rewrapped, "active_key_version": active_version })))
+    let (continuations_rewrapped,continuations_remaining)=state.store.rewrap_budget_continuations_as_admin(&principal,active_version,|context,version,ciphertext| {
+        let encrypted=state.key_vault.reencrypt(context,version,ciphertext).map_err(|_|CoreError::ApiKeyEncryptionUnavailable)?;
+        Ok((encrypted.ciphertext,encrypted.key_version))
+    }).map_err(key_vault_admin_error)?;
+    Ok(no_store_json(json!({ "rewrapped": rewrapped, "active_key_version": active_version,
+        "continuations_rewrapped":continuations_rewrapped,"continuations_remaining":continuations_remaining })))
 }
 
 fn no_store_json(value: serde_json::Value) -> Response {

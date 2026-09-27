@@ -190,6 +190,7 @@ fn reconcile_page(state: &StarlinkRouterState, after: &str) -> Result<String,Str
 pub(crate) fn spawn(state: &std::sync::Arc<StarlinkRouterState>) {
     use std::{sync::{Arc,atomic::Ordering},time::Duration};
     if state.budget_reconciler_started.swap(true,Ordering::AcqRel) {return;}
+    crate::budget_continuation::spawn(state);
     // Independent, bounded lanes: a slow event feed cannot delay execution slot
     // release, and slow request reads cannot postpone newly published receipts.
     // Each lane awaits its own worker before the next tick (no overlap/backlog).

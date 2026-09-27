@@ -857,3 +857,13 @@ CREATE INDEX IF NOT EXISTS quota_ledger_by_event_group_entry
 CREATE INDEX IF NOT EXISTS quota_reservations_by_created_id
   ON quota_reservations(created_at_ms, id);
 "#;
+
+pub(crate) const SCHEMA_V28: &str = r#"
+CREATE TABLE IF NOT EXISTS budget_continuations (
+  request_id TEXT PRIMARY KEY REFERENCES requests(id),
+  request_hash BLOB NOT NULL CHECK(length(request_hash)=32),
+  key_version INTEGER NOT NULL CHECK(key_version>0),
+  ciphertext BLOB NOT NULL CHECK(length(ciphertext) BETWEEN 28 AND 8392704),
+  created_at_ms INTEGER NOT NULL CHECK(created_at_ms>0)
+);
+"#;
