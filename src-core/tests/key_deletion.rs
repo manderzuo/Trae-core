@@ -103,7 +103,6 @@ fn v20_to_v21_migration_preserves_keys_and_quota_history_and_is_idempotent() {
     let upgraded = CoreStore::open(&dir.0).unwrap();
     upgraded.migrate().unwrap();
     assert_eq!(upgraded.schema_version().unwrap(), aiwork_core::CURRENT_SCHEMA_VERSION);
-    assert_eq!(aiwork_core::CURRENT_SCHEMA_VERSION, 25);
 
     let listed = upgraded
         .list_api_keys_as_admin(&admin, Some(&key.user_id))

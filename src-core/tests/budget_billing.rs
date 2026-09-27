@@ -1740,13 +1740,13 @@ fn reconcile_v1_commit_and_release_event_groups_without_quarantining_key() {
 }
 
 #[test]
-fn fresh_database_migrates_to_v25_budget_schema() {
+fn fresh_database_migrates_to_v26_budget_schema() {
     let directory = TestDirectory::new("fresh-schema");
     let store = CoreStore::open(&directory.0).unwrap();
 
     store.migrate().unwrap();
 
-    assert_eq!(store.schema_version().unwrap(), 25);
+    assert_eq!(store.schema_version().unwrap(), 26);
     assert_eq!(store.table_count("budget_operations").unwrap(), 1);
     assert_eq!(store.table_count("budget_steps").unwrap(), 1);
     assert!(store.foreign_keys_enabled().unwrap());
@@ -1765,6 +1765,8 @@ fn fresh_database_creates_separate_v2_budget_tables() {
         "budget_steps",
         "budget_receipt_evidence",
         "budget_settlements",
+        "budget_authorization_revisions",
+        "legacy_execution_evidence",
     ] {
         assert_eq!(store.table_count(table).unwrap(), 1, "missing table {table}");
     }
@@ -1776,6 +1778,40 @@ fn fresh_database_creates_separate_v2_budget_tables() {
 }
 
 #[test]
+fn newly_created_v2_reserve_is_tagged_with_local_authorization_revision_one() {
+    let (directory, store, key_id, _) = budget_fixture("revision-one-reserve", 1, 20_000_000);
+    let parent_request_id = begin_video_parent(&store, &key_id, "revision-one-reserve-parent");
+    store
+        .begin_budget_operation(
+            &parent_request_id,
+            video_budget_step(&store, &key_id, &parent_request_id, "revision-one-reserve-budget"),
+        )
+        .unwrap();
+
+    let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+    let revision_column_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('quota_ledger') WHERE name = 'authorization_revision')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(revision_column_exists, "V26 must add the local authorization revision column");
+    let rows: Vec<(Option<i64>, Option<i64>)> = connection
+        .prepare(
+            "SELECT authorization_revision, budget_version FROM quota_ledger
+             WHERE request_id = ?1 AND event_kind = 'reserve' ORDER BY budget_account_id",
+        )
+        .unwrap()
+        .query_map([&parent_request_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!rows.is_empty());
+    assert!(rows.iter().all(|(revision, account_version)| *revision == Some(1) && account_version.is_some()));
+}
+
+#[test]
 fn v24_upgrade_preserves_legacy_held_unknown_and_settled_billing() {
     let directory = TestDirectory::new("v24-preservation");
     let store = CoreStore::open(&directory.0).unwrap();
@@ -1784,7 +1820,15 @@ fn v24_upgrade_preserves_legacy_held_unknown_and_settled_billing() {
     let connection = Connection::open(&database).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE IF EXISTS budget_settlements;
+            "DROP INDEX IF EXISTS quota_ledger_authorization_adjust_unique;
+             DROP TRIGGER IF EXISTS budget_authorization_revisions_no_update;
+             DROP TRIGGER IF EXISTS budget_authorization_revisions_no_delete;
+             DROP TRIGGER IF EXISTS legacy_execution_evidence_no_update;
+             DROP TRIGGER IF EXISTS legacy_execution_evidence_no_delete;
+             DROP TABLE IF EXISTS legacy_execution_evidence;
+             DROP TABLE IF EXISTS budget_authorization_revisions;
+             ALTER TABLE quota_ledger DROP COLUMN authorization_revision;
+             DROP TABLE IF EXISTS budget_settlements;
              DROP TABLE IF EXISTS budget_receipt_evidence;
              DROP TABLE IF EXISTS budget_steps;
              DROP TABLE IF EXISTS budget_operations;
@@ -1861,7 +1905,7 @@ fn v24_upgrade_preserves_legacy_held_unknown_and_settled_billing() {
 
     store.migrate().unwrap();
 
-    assert_eq!(store.schema_version().unwrap(), 25);
+    assert_eq!(store.schema_version().unwrap(), 26);
     assert_eq!(legacy_billing_snapshot(&database, request_ids), before);
     assert_eq!(store.table_count("budget_operations").unwrap(), 1);
     drop(store);
@@ -3404,4 +3448,266 @@ fn v2_final_receipt_can_exceed_hold_and_observed_time_retry_is_duplicate() {
         )
         .unwrap();
     assert_eq!(settlement, (3_000_000, -1_000_000, 0));
+}
+
+#[test]
+fn v25_upgrade_backfills_revision_one_without_changing_financial_facts_or_inventing_finish_time() {
+    let (directory, store, key_id, _) = budget_fixture("v25-to-v26", 2, 20_000_000);
+    let database = directory.0.join("data").join(CORE_DB_FILE);
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "INSERT INTO quota_budget_accounts
+             (id, scope, user_id, api_key_id, resource_kind, enabled, version,
+              migration_state, created_at_ms, updated_at_ms)
+             VALUES ('v26-user-cap', 'user_cap', 'budget-user', NULL, 'credits', 1, 1, 'ready', 1, 1)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO quota_ledger
+             (entry_id, user_id, resource_kind, event_kind, amount, delta, actor_user_id,
+              reason, created_at_ms, budget_account_id, event_group_id, budget_version)
+             VALUES ('v26-user-cap-grant', 'budget-user', 'credits', 'adjust', 20000000, 20000000,
+                     'budget-admin', 'migration fixture', 1, 'v26-user-cap', 'v26-user-cap-grant', 1)",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let held_parent = begin_video_parent(&store, &key_id, "v25-held-parent");
+    store
+        .begin_budget_operation(
+            &held_parent,
+            video_budget_step(&store, &key_id, &held_parent, "v25-held-budget"),
+        )
+        .unwrap();
+
+    let settled_parent = begin_video_parent(&store, &key_id, "v25-settled-parent");
+    store
+        .begin_budget_operation(
+            &settled_parent,
+            video_budget_step(&store, &key_id, &settled_parent, "v25-settled-budget"),
+        )
+        .unwrap();
+    store.mark_budget_step_dispatched(&settled_parent).unwrap();
+    store.bind_budget_video_task(&settled_parent, "v25-settled-task").unwrap();
+    store
+        .mark_budget_step_execution(&settled_parent, aiwork_core::BudgetExecutionState::Succeeded)
+        .unwrap();
+    let mut receipt = final_budget_receipt(&settled_parent, "v25-settled-budget", "1");
+    receipt.receipt.task_ref = Some("v25-settled-task".into());
+    store.apply_budget_receipt(receipt).unwrap();
+    store
+        .finish_budget_execution(&settled_parent, aiwork_core::BudgetExecutionState::Succeeded)
+        .unwrap();
+
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute("UPDATE budget_steps SET created_at_ms = 0 WHERE request_id = ?1", [&held_parent])
+        .unwrap();
+    let reservations_before: Vec<(String, String, i64, String, i64)> = connection
+        .prepare("SELECT id, request_id, amount, state, expires_at_ms FROM quota_reservations ORDER BY id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let ledger_before: Vec<(Option<String>, Option<String>, Option<String>, String, i64, i64, Option<i64>)> = connection
+        .prepare(
+            "SELECT request_id, event_group_id, budget_account_id, event_kind, amount, delta, budget_version
+             FROM quota_ledger ORDER BY entry_id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let account_balances_before: Vec<(String, i64, i64, i64)> = connection
+        .prepare(
+            "SELECT account.id, account.version,
+                    COALESCE((SELECT SUM(delta) FROM quota_ledger WHERE budget_account_id = account.id), 0),
+                    COALESCE((SELECT SUM(amount) FROM quota_reservations
+                              WHERE (key_budget_account_id = account.id OR user_cap_account_id = account.id)
+                                AND state IN ('held','unknown')), 0)
+             FROM quota_budget_accounts account ORDER BY account.id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    drop(connection);
+
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "DROP INDEX IF EXISTS quota_ledger_authorization_adjust_unique;
+             DROP TABLE IF EXISTS legacy_execution_evidence;
+             DROP TABLE IF EXISTS budget_authorization_revisions;",
+        )
+        .unwrap();
+    for (table, column) in [
+        ("budget_operations", "execution_finished_at_ms"),
+        ("quota_ledger", "authorization_revision"),
+    ] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                rusqlite::params![table, column],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if exists {
+            connection
+                .execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column};"))
+                .unwrap();
+        }
+    }
+    connection
+        .execute("UPDATE schema_meta SET value = '25' WHERE key = 'schema_version'", [])
+        .unwrap();
+    drop(connection);
+    drop(store);
+
+    let upgraded = CoreStore::open(&directory.0).unwrap();
+    upgraded.migrate().unwrap();
+    assert_eq!(upgraded.schema_version().unwrap(), 26);
+    let connection = Connection::open(&database).unwrap();
+    let step_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM budget_steps", [], |row| row.get(0))
+        .unwrap();
+    let history_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM budget_authorization_revisions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(history_count, step_count);
+    let invalid_history_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM budget_authorization_revisions history
+             JOIN budget_steps step USING(request_id)
+             WHERE history.local_revision <> 1 OR history.budget_id <> step.budget_id
+                OR history.authorization_hash <> step.authorization_hash
+                OR history.hold_microcredits <> step.hold_microcredits
+                OR history.previous_budget_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(invalid_history_count, 0);
+    let migrated_adopted_at: i64 = connection
+        .query_row(
+            "SELECT adopted_at_ms FROM budget_authorization_revisions WHERE request_id = ?1 AND local_revision = 1",
+            [&held_parent],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(migrated_adopted_at, 0, "migration must preserve valid V25 zero timestamps");
+    let terminal_timestamp: Option<i64> = connection
+        .query_row(
+            "SELECT execution_finished_at_ms FROM budget_operations WHERE parent_request_id = ?1",
+            [&settled_parent],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(terminal_timestamp, None);
+    let tagged_event_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM quota_ledger WHERE request_id IN (?1, ?2)
+               AND event_kind IN ('reserve','release','commit') AND authorization_revision = 1",
+            rusqlite::params![held_parent, settled_parent],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(tagged_event_count >= 4, "both key and user-cap V2 rows must be tagged");
+    let reservations_after: Vec<(String, String, i64, String, i64)> = connection
+        .prepare("SELECT id, request_id, amount, state, expires_at_ms FROM quota_reservations ORDER BY id")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let ledger_after: Vec<(Option<String>, Option<String>, Option<String>, String, i64, i64, Option<i64>)> = connection
+        .prepare(
+            "SELECT request_id, event_group_id, budget_account_id, event_kind, amount, delta, budget_version
+             FROM quota_ledger ORDER BY entry_id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let account_balances_after: Vec<(String, i64, i64, i64)> = connection
+        .prepare(
+            "SELECT account.id, account.version,
+                    COALESCE((SELECT SUM(delta) FROM quota_ledger WHERE budget_account_id = account.id), 0),
+                    COALESCE((SELECT SUM(amount) FROM quota_reservations
+                              WHERE (key_budget_account_id = account.id OR user_cap_account_id = account.id)
+                                AND state IN ('held','unknown')), 0)
+             FROM quota_budget_accounts account ORDER BY account.id",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(reservations_after, reservations_before);
+    assert_eq!(ledger_after, ledger_before);
+    assert_eq!(account_balances_after, account_balances_before);
+    drop(connection);
+
+    drop(upgraded);
+    let reopened = CoreStore::open(&directory.0).unwrap();
+    reopened.migrate().unwrap();
+    let connection = Connection::open(&database).unwrap();
+    let reopened_history_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM budget_authorization_revisions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(reopened_history_count, step_count);
+}
+
+#[test]
+fn v2_terminal_time_is_written_once_and_not_moved_by_replay_or_late_receipt() {
+    let (directory, store, key_id, _) = budget_fixture("execution-finished-at", 1, 20_000_000);
+    let parent_request_id = begin_video_parent(&store, &key_id, "execution-finished-at-parent");
+    store
+        .begin_budget_operation(
+            &parent_request_id,
+            video_budget_step(&store, &key_id, &parent_request_id, "execution-finished-at-budget"),
+        )
+        .unwrap();
+    store.mark_budget_step_dispatched(&parent_request_id).unwrap();
+    store.bind_budget_video_task(&parent_request_id, "execution-finished-at-task").unwrap();
+    store
+        .mark_budget_step_execution(&parent_request_id, aiwork_core::BudgetExecutionState::Succeeded)
+        .unwrap();
+    assert_eq!(
+        store.finish_budget_execution(&parent_request_id, aiwork_core::BudgetExecutionState::Succeeded).unwrap(),
+        aiwork_core::BudgetMutation::Applied,
+    );
+    let connection = Connection::open(directory.0.join("data").join(CORE_DB_FILE)).unwrap();
+    let first_finished_at: Option<i64> = connection
+        .query_row(
+            "SELECT execution_finished_at_ms FROM budget_operations WHERE parent_request_id = ?1",
+            [&parent_request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(first_finished_at.is_some_and(|value| value > 0));
+
+    assert_eq!(
+        store.finish_budget_execution(&parent_request_id, aiwork_core::BudgetExecutionState::Succeeded).unwrap(),
+        aiwork_core::BudgetMutation::Duplicate,
+    );
+    let mut receipt = final_budget_receipt(&parent_request_id, "execution-finished-at-budget", "1");
+    receipt.receipt.task_ref = Some("execution-finished-at-task".into());
+    store.apply_budget_receipt(receipt).unwrap();
+    let final_finished_at: Option<i64> = connection
+        .query_row(
+            "SELECT execution_finished_at_ms FROM budget_operations WHERE parent_request_id = ?1",
+            [&parent_request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(final_finished_at, first_finished_at);
 }

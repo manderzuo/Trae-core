@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -29,11 +29,42 @@ const IMPLICIT_VIDEO_RETRY_WINDOW_MS: i64 = 2 * 60 * 1000;
 const IMPLICIT_VIDEO_RETRY_QUERY: &str =
     "SELECT r.id FROM idempotency_keys i
      JOIN requests r ON r.id = i.request_id
+     LEFT JOIN budget_operations operation ON operation.parent_request_id = r.id
+     LEFT JOIN legacy_execution_evidence evidence ON evidence.request_id = r.id
      WHERE i.scope = ?1 AND i.client_key LIKE 'core-implicit:%'
        AND i.request_hash = ?2 AND r.model = ?3
-       AND (r.created_at_ms >= ?4 OR r.state IN
-         ('reserved','queued','dispatched','completing','unknown'))
+       AND (
+         (operation.operation_id IS NOT NULL AND (
+           operation.execution_state IN ('ready','running','unknown')
+           OR (operation.execution_state IN ('succeeded','failed','canceled')
+             AND CASE WHEN operation.execution_finished_at_ms IS NULL
+                      THEN r.created_at_ms >= ?4
+                      ELSE operation.execution_finished_at_ms >= ?4 END)
+         ))
+         OR (evidence.request_id IS NOT NULL AND evidence.observed_at_ms >= ?4)
+         OR (operation.operation_id IS NULL AND evidence.request_id IS NULL
+           AND (r.created_at_ms >= ?4 OR r.state IN
+             ('reserved','queued','dispatched','completing','unknown')))
+       )
      ORDER BY r.created_at_ms DESC LIMIT 1";
+
+fn implicit_video_retry_request_id(
+    connection: &Connection,
+    scope: &str,
+    request_hash: &[u8],
+    model: &str,
+    now_ms: i64,
+) -> Result<Option<String>, CoreError> {
+    let cutoff = now_ms.saturating_sub(IMPLICIT_VIDEO_RETRY_WINDOW_MS);
+    connection
+        .query_row(
+            IMPLICIT_VIDEO_RETRY_QUERY,
+            params![scope, request_hash, model, cutoff],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
 
 impl CoreStore {
     /// Read-only idempotency lookup used by stream routes before checking
@@ -1005,9 +1036,25 @@ impl CoreStore {
         model: &str,
         body: &Value,
     ) -> Result<Option<BeginRequest>, CoreError> {
+        self.lookup_implicit_billed_video_request_at(
+            user_id,
+            api_key_id,
+            model,
+            body,
+            Utc::now().timestamp_millis(),
+        )
+    }
+
+    fn lookup_implicit_billed_video_request_at(
+        &self,
+        user_id: &str,
+        api_key_id: &str,
+        model: &str,
+        body: &Value,
+        now_ms: i64,
+    ) -> Result<Option<BeginRequest>, CoreError> {
         let scope = format!("{user_id}:{api_key_id}:videos");
         let hash = request_hash("videos", model, body);
-        let cutoff = Utc::now().timestamp_millis().saturating_sub(IMPLICIT_VIDEO_RETRY_WINDOW_MS);
         let connection = self.connection.lock().expect("core store mutex poisoned");
         let active_key = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = ?1 AND user_id = ?2 AND status = 'active')",
@@ -1020,11 +1067,7 @@ impl CoreStore {
                 api_key_id: api_key_id.into(),
             });
         }
-        let request_id = connection.query_row(
-            IMPLICIT_VIDEO_RETRY_QUERY,
-            params![scope, hash.to_vec(), model, cutoff],
-            |row| row.get::<_, String>(0),
-        ).optional()?;
+        let request_id = implicit_video_retry_request_id(&connection, &scope, &hash, model, now_ms)?;
         request_id.map(|id| {
             Self::request_handle_in_connection(&connection, &id).map(BeginRequest::Existing)
         }).transpose()
@@ -1210,6 +1253,25 @@ impl CoreStore {
         assist_parent_request_id: Option<&str>,
         budget_preparation: bool,
     ) -> Result<BeginRequest, CoreError> {
+        self.begin_request_internal_at(
+            input,
+            require_local_cost_policy,
+            coalesce_implicit_video_retry,
+            assist_parent_request_id,
+            budget_preparation,
+            Utc::now().timestamp_millis(),
+        )
+    }
+
+    fn begin_request_internal_at(
+        &self,
+        input: BeginRequestInput,
+        require_local_cost_policy: bool,
+        coalesce_implicit_video_retry: bool,
+        assist_parent_request_id: Option<&str>,
+        budget_preparation: bool,
+        now: i64,
+    ) -> Result<BeginRequest, CoreError> {
         if budget_preparation && assist_parent_request_id.is_none() {
             return Err(CoreError::InvalidConfiguration {
                 key: "budget_preparations.parent_request_id".into(),
@@ -1223,7 +1285,6 @@ impl CoreStore {
         }
         let request_hash = request_hash(&input.endpoint, &input.model, &input.body);
         let scope = format!("{}:{}:{}", input.user_id, input.api_key_id, input.endpoint);
-        let now = Utc::now().timestamp_millis();
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
@@ -1243,13 +1304,13 @@ impl CoreStore {
         }
 
         if coalesce_implicit_video_retry {
-            let previous_request_id = transaction
-                .query_row(
-                    IMPLICIT_VIDEO_RETRY_QUERY,
-                    params![&scope, request_hash.to_vec(), &input.model, now.saturating_sub(IMPLICIT_VIDEO_RETRY_WINDOW_MS)],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
+            let previous_request_id = implicit_video_retry_request_id(
+                &transaction,
+                &scope,
+                &request_hash,
+                &input.model,
+                now,
+            )?;
             if let Some(request_id) = previous_request_id {
                 return Ok(BeginRequest::Existing(Self::request_handle_in_transaction(
                     &transaction,
@@ -1940,5 +2001,272 @@ fn write_canonical_json(value: &Value, output: &mut Vec<u8>) {
             }
             output.push(b'}');
         }
+    }
+}
+
+#[cfg(test)]
+mod implicit_video_retry_tests {
+    use std::{collections::BTreeSet, fs, path::PathBuf, sync::{Arc, Barrier}, thread};
+
+    use rusqlite::{params, Connection};
+    use serde_json::json;
+
+    use super::*;
+    use crate::{BeginRequest, BeginRequestInput, CoreStore, NewUser, UserRole};
+
+    struct Fixture(PathBuf);
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture() -> (Fixture, CoreStore, String) {
+        let root = std::env::temp_dir().join(format!("implicit-video-retry-{}", rand::random::<u64>()));
+        fs::create_dir_all(&root).unwrap();
+        let store = CoreStore::open(&root).unwrap();
+        store.migrate().unwrap();
+        store.create_user(NewUser { id: "admin".into(), name: "Admin".into(), role: UserRole::Admin }, "bootstrap").unwrap();
+        store.create_user(NewUser { id: "user".into(), name: "User".into(), role: UserRole::User }, "admin").unwrap();
+        let key = store.issue_api_key("user", "video", BTreeSet::new(), "admin").unwrap();
+        (Fixture(root), store, key.id)
+    }
+
+    fn video_input(key_id: &str, idempotency_key: &str) -> BeginRequestInput {
+        BeginRequestInput {
+            user_id: "user".into(),
+            api_key_id: key_id.into(),
+            protocol: "openai".into(),
+            endpoint: "videos".into(),
+            model: "seedance-fast".into(),
+            idempotency_key: idempotency_key.into(),
+            body: json!({"model":"seedance-fast","prompt":"long running kite"}),
+        }
+    }
+
+    fn create_v2_terminal_candidate(store: &CoreStore, root: &PathBuf, key_id: &str, suffix: &str) -> String {
+        let request = match store.begin_billed_request(video_input(key_id, &format!("core-implicit:{suffix}"))).unwrap() {
+            BeginRequest::Created(request) => request,
+            other => panic!("expected a new candidate request, got {other:?}"),
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let created_at = now - 600_000;
+        let finished_at = now - 300_000;
+        let connection = Connection::open(root.join("data").join(crate::CORE_DB_FILE)).unwrap();
+        connection.execute(
+            "UPDATE requests SET state='unknown', created_at_ms=?1, updated_at_ms=?2 WHERE id=?3",
+            params![created_at, now, request.id],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO budget_operations
+             (operation_id,parent_request_id,api_key_id,execution_state,created_at_ms,updated_at_ms,execution_finished_at_ms)
+             VALUES (?1,?2,?3,'succeeded',?4,?5,?6)",
+            params![format!("operation-{suffix}"), request.id, key_id, created_at, now, finished_at],
+        ).unwrap();
+        request.id
+    }
+
+    fn create_request_at(
+        store: &CoreStore,
+        root: &PathBuf,
+        key_id: &str,
+        suffix: &str,
+        created_at_ms: i64,
+        updated_at_ms: i64,
+    ) -> String {
+        let request = match store.begin_billed_request(video_input(key_id, &format!("core-implicit:{suffix}"))).unwrap() {
+            BeginRequest::Created(request) => request,
+            other => panic!("expected a new candidate request, got {other:?}"),
+        };
+        let connection = Connection::open(root.join("data").join(crate::CORE_DB_FILE)).unwrap();
+        connection.execute(
+            "UPDATE requests SET state='unknown', created_at_ms=?1, updated_at_ms=?2 WHERE id=?3",
+            params![created_at_ms, updated_at_ms, request.id],
+        ).unwrap();
+        request.id
+    }
+
+    fn attach_v2_operation(
+        root: &PathBuf,
+        request_id: &str,
+        key_id: &str,
+        suffix: &str,
+        execution_state: &str,
+        created_at_ms: i64,
+        updated_at_ms: i64,
+        finished_at_ms: Option<i64>,
+    ) {
+        let connection = Connection::open(root.join("data").join(crate::CORE_DB_FILE)).unwrap();
+        connection.execute(
+            "INSERT INTO budget_operations
+             (operation_id,parent_request_id,api_key_id,execution_state,created_at_ms,updated_at_ms,execution_finished_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![format!("operation-{suffix}"), request_id, key_id, execution_state, created_at_ms, updated_at_ms, finished_at_ms],
+        ).unwrap();
+    }
+
+    fn result_id(result: Option<BeginRequest>) -> Option<String> {
+        match result {
+            Some(BeginRequest::Existing(request)) => Some(request.id),
+            Some(other) => panic!("expected an existing request, got {other:?}"),
+            None => None,
+        }
+    }
+
+    #[test]
+    fn read_only_precheck_does_not_reuse_long_finished_v2_execution_for_unknown_request_state() {
+        let (_fixture, store, key_id) = fixture();
+        let root = _fixture.0.clone();
+        let request_id = create_v2_terminal_candidate(&store, &root, &key_id, "read-only-stale-terminal");
+        let body = json!({"model":"seedance-fast","prompt":"long running kite"});
+        let lookup = store.lookup_implicit_billed_video_request("user", &key_id, "seedance-fast", &body).unwrap();
+        assert!(lookup.is_none(), "stale execution finish time must not be extended by request.state=unknown: {request_id}");
+    }
+
+    #[test]
+    fn transaction_creation_does_not_coalesce_long_finished_v2_execution() {
+        let (_fixture, store, key_id) = fixture();
+        let root = _fixture.0.clone();
+        let request_id = create_v2_terminal_candidate(&store, &root, &key_id, "create-stale-terminal");
+        let result = store.begin_implicit_billed_video_request(video_input(&key_id, "ignored-client-key")).unwrap();
+        match result {
+            BeginRequest::Created(created) => assert_ne!(created.id, request_id),
+            BeginRequest::Existing(existing) => panic!("stale execution was incorrectly coalesced as {}", existing.id),
+            BeginRequest::Conflict => panic!("unexpected idempotency conflict"),
+        }
+    }
+
+    #[test]
+    fn controlled_v2_finish_time_window_ignores_late_request_updates() {
+        const T0: i64 = 1_700_000_000_000;
+        const T1: i64 = T0 + 300_000;
+        let (_fixture, store, key_id) = fixture();
+        let root = _fixture.0.clone();
+        let request_id = create_request_at(&store, &root, &key_id, "controlled-v2-finish", T0, T1);
+        attach_v2_operation(&root, &request_id, &key_id, "controlled-v2-finish", "succeeded", T0, T1, Some(T1));
+        let body = json!({"model":"seedance-fast","prompt":"long running kite"});
+
+        let at_first_retry = T1 + 1;
+        assert_eq!(result_id(store.lookup_implicit_billed_video_request_at("user", &key_id, "seedance-fast", &body, at_first_retry).unwrap()), Some(request_id.clone()));
+        let created = store.begin_request_internal_at(video_input(&key_id, "core-implicit:controlled-v2-first"), false, true, None, false, at_first_retry).unwrap();
+        assert!(matches!(created, BeginRequest::Existing(request) if request.id == request_id));
+
+        let late_receipt_time = T1 + 60_000;
+        let connection = Connection::open(root.join("data").join(crate::CORE_DB_FILE)).unwrap();
+        connection.execute("UPDATE requests SET updated_at_ms=?1 WHERE id=?2", params![late_receipt_time, request_id]).unwrap();
+        connection.execute("UPDATE budget_operations SET updated_at_ms=?1 WHERE parent_request_id=?2", params![late_receipt_time, request_id]).unwrap();
+        drop(connection);
+        assert_eq!(result_id(store.lookup_implicit_billed_video_request_at("user", &key_id, "seedance-fast", &body, late_receipt_time).unwrap()), Some(request_id.clone()));
+        let created = store.begin_request_internal_at(video_input(&key_id, "core-implicit:controlled-v2-late-receipt"), false, true, None, false, late_receipt_time).unwrap();
+        assert!(matches!(created, BeginRequest::Existing(request) if request.id == request_id));
+
+        let after_window = T1 + IMPLICIT_VIDEO_RETRY_WINDOW_MS + 1;
+        assert!(store.lookup_implicit_billed_video_request_at("user", &key_id, "seedance-fast", &body, after_window).unwrap().is_none());
+        let created = store.begin_request_internal_at(video_input(&key_id, "core-implicit:controlled-v2-after-window"), false, true, None, false, after_window).unwrap();
+        assert!(matches!(created, BeginRequest::Created(request) if request.id != request_id));
+    }
+
+    #[test]
+    fn controlled_v25_terminal_without_finish_time_uses_only_original_creation_time() {
+        const T0: i64 = 1_700_000_000_000;
+        let (_fixture, store, key_id) = fixture();
+        let root = _fixture.0.clone();
+        let request_id = create_request_at(&store, &root, &key_id, "controlled-v25-null-finish", T0, T0);
+        attach_v2_operation(&root, &request_id, &key_id, "controlled-v25-null-finish", "failed", T0, T0, None);
+        let body = json!({"model":"seedance-fast","prompt":"long running kite"});
+
+        let just_inside_window = T0 + IMPLICIT_VIDEO_RETRY_WINDOW_MS - 1;
+        assert_eq!(result_id(store.lookup_implicit_billed_video_request_at("user", &key_id, "seedance-fast", &body, just_inside_window).unwrap()), Some(request_id.clone()));
+        let outside_window = T0 + IMPLICIT_VIDEO_RETRY_WINDOW_MS + 1;
+        assert!(store.lookup_implicit_billed_video_request_at("user", &key_id, "seedance-fast", &body, outside_window).unwrap().is_none());
+        let created = store.begin_request_internal_at(video_input(&key_id, "core-implicit:controlled-v25-outside"), false, true, None, false, outside_window).unwrap();
+        assert!(matches!(created, BeginRequest::Created(request) if request.id != request_id));
+    }
+
+    #[test]
+    fn controlled_unknown_v2_is_reused_after_one_day() {
+        const T0: i64 = 1_700_000_000_000;
+        let (_fixture, store, key_id) = fixture();
+        let root = _fixture.0.clone();
+        let unknown_v2 = create_request_at(&store, &root, &key_id, "controlled-unknown-v2", T0, T0);
+        attach_v2_operation(&root, &unknown_v2, &key_id, "controlled-unknown-v2", "unknown", T0, T0, None);
+        let body = json!({"model":"seedance-fast","prompt":"long running kite"});
+        let a_day_later = T0 + 24 * 60 * 60 * 1000;
+
+        assert_eq!(result_id(store.lookup_implicit_billed_video_request_at("user", &key_id, "seedance-fast", &body, a_day_later).unwrap()), Some(unknown_v2.clone()));
+        let created = store.begin_request_internal_at(video_input(&key_id, "core-implicit:controlled-unknown-v2-active"), false, true, None, false, a_day_later).unwrap();
+        assert!(matches!(created, BeginRequest::Existing(request) if request.id == unknown_v2));
+    }
+
+    #[test]
+    fn controlled_legacy_unknown_without_evidence_keeps_existing_reuse_semantics() {
+        const T0: i64 = 1_700_000_000_000;
+        let (_fixture, store, key_id) = fixture();
+        let root = _fixture.0.clone();
+        let legacy = create_request_at(&store, &root, &key_id, "controlled-legacy-unknown", T0, T0);
+        let body = json!({"model":"seedance-fast","prompt":"long running kite"});
+        let a_day_later = T0 + 24 * 60 * 60 * 1000;
+
+        assert_eq!(result_id(store.lookup_implicit_billed_video_request_at("user", &key_id, "seedance-fast", &body, a_day_later).unwrap()), Some(legacy.clone()));
+        let created = store.begin_request_internal_at(video_input(&key_id, "core-implicit:controlled-legacy-active"), false, true, None, false, a_day_later).unwrap();
+        assert!(matches!(created, BeginRequest::Existing(request) if request.id == legacy));
+    }
+
+    #[test]
+    fn controlled_v1_evidence_window_expires_even_when_request_is_unknown() {
+        const T0: i64 = 1_700_000_000_000;
+        const OBSERVED: i64 = T0 + 300_000;
+        let (_fixture, store, key_id) = fixture();
+        let root = _fixture.0.clone();
+        let request_id = create_request_at(&store, &root, &key_id, "controlled-v1-evidence", T0, OBSERVED);
+        let connection = Connection::open(root.join("data").join(crate::CORE_DB_FILE)).unwrap();
+        connection.execute(
+            "INSERT INTO legacy_execution_evidence
+             (request_id,api_key_id,task_ref,terminal_state,source_ref,observed_at_ms,recorded_at_ms)
+             VALUES (?1,?2,'trusted-task','succeeded','trusted-source',?3,?3)",
+            params![request_id, key_id, OBSERVED],
+        ).unwrap();
+        drop(connection);
+        let body = json!({"model":"seedance-fast","prompt":"long running kite"});
+
+        assert_eq!(result_id(store.lookup_implicit_billed_video_request_at("user", &key_id, "seedance-fast", &body, OBSERVED + 60_000).unwrap()), Some(request_id.clone()));
+        let after_window = OBSERVED + IMPLICIT_VIDEO_RETRY_WINDOW_MS + 1;
+        assert!(store.lookup_implicit_billed_video_request_at("user", &key_id, "seedance-fast", &body, after_window).unwrap().is_none());
+        let created = store.begin_request_internal_at(video_input(&key_id, "core-implicit:controlled-v1-expired"), false, true, None, false, after_window).unwrap();
+        assert!(matches!(created, BeginRequest::Created(request) if request.id != request_id));
+    }
+
+    #[test]
+    fn two_threads_same_implicit_intent_create_only_one_request() {
+        const NOW: i64 = 1_700_000_000_000;
+        let (_fixture, _store, key_id) = fixture();
+        let root = _fixture.0.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let threads = (0..2).map(|index| {
+            let root = root.clone();
+            let key_id = key_id.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let store = CoreStore::open(&root).unwrap();
+                barrier.wait();
+                store.begin_request_internal_at(
+                    video_input(&key_id, &format!("core-implicit:race-{index}")),
+                    false, true, None, false, NOW,
+                ).unwrap()
+            })
+        }).collect::<Vec<_>>();
+        let results = threads.into_iter().map(|thread| thread.join().unwrap()).collect::<Vec<_>>();
+        let ids = results.into_iter().map(|result| match result {
+            BeginRequest::Created(request) | BeginRequest::Existing(request) => request.id,
+            BeginRequest::Conflict => panic!("unexpected implicit retry conflict"),
+        }).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids.len(), 1);
+        let connection = Connection::open(root.join("data").join(crate::CORE_DB_FILE)).unwrap();
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM idempotency_keys WHERE scope=?1 AND client_key LIKE 'core-implicit:race-%'",
+            [format!("user:{key_id}:videos")], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
     }
 }

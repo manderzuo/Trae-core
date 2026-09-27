@@ -134,6 +134,17 @@ pub enum BudgetMutation {
     Duplicate,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[allow(dead_code)] // The approved bridge integration consumes this internal proof in Task4.
+pub(crate) struct BudgetCancellationProof {
+    pub budget_id: String,
+    pub request_id: String,
+    pub bridge_instance_id: String,
+    pub cancel_ref: String,
+    pub revision: i64,
+    pub canceled_at_ms: i64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BudgetStepView {
     pub operation_id: String,
@@ -238,6 +249,38 @@ struct BudgetReceiptConflictContext {
     user_id: String,
     request_key_id: String,
     request_fingerprint: String,
+    request_hash: Vec<u8>,
+}
+
+#[allow(dead_code)] // Only constructed by the deferred internal authorization-refresh entry point.
+struct BudgetRefreshContext {
+    parent_request_id: String,
+    operation_key_id: String,
+    operation_state: String,
+    kind: String,
+    budget_id: String,
+    core_key_id: String,
+    request_fingerprint: String,
+    endpoint: String,
+    model: String,
+    account_ref: String,
+    bridge_instance_id: String,
+    profile_fingerprint: String,
+    policy_version: String,
+    authorization_hash: Vec<u8>,
+    hold_microcredits: i64,
+    expires_at_ms: i64,
+    reservation_id: String,
+    dispatch_attempted: i64,
+    step_execution_state: String,
+    financial_state: String,
+    parent_user_id: String,
+    parent_key_id: String,
+    parent_state: String,
+    request_user_id: String,
+    request_key_id: String,
+    request_endpoint: String,
+    request_model: String,
     request_hash: Vec<u8>,
 }
 
@@ -998,8 +1041,9 @@ impl CoreStore {
         }
         Self::finish_parent_request_execution(&transaction, parent_request_id, terminal, now)?;
         let changed = transaction.execute(
-            "UPDATE budget_operations SET execution_state = ?1, updated_at_ms = ?2
-             WHERE operation_id = ?3 AND execution_state = ?4",
+            "UPDATE budget_operations
+             SET execution_state = ?1, updated_at_ms = ?2, execution_finished_at_ms = ?2
+             WHERE operation_id = ?3 AND execution_state = ?4 AND execution_finished_at_ms IS NULL",
             params![terminal.as_str(), now, &operation_id, current_operation.as_str()],
         )?;
         if changed != 1 {
@@ -1891,6 +1935,15 @@ impl CoreStore {
             return Err(CoreError::IdempotencyConflict);
         }
 
+        let budget_id_used: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM budget_authorization_revisions WHERE budget_id = ?1)",
+            [&input.authorization.budget_id],
+            |row| row.get(0),
+        )?;
+        if budget_id_used {
+            return Err(CoreError::IdempotencyConflict);
+        }
+
         if input.authorization.expires_at_ms <= now {
             return Err(CoreError::BillingQuoteExpired {
                 request_id: input.authorization.request_id,
@@ -2016,6 +2069,17 @@ impl CoreStore {
             }
         };
 
+        let expected_reserve_rows = 1 + i64::from(reservation.user_cap_account_id.is_some());
+        let tagged_reserve_rows = transaction.execute(
+            "UPDATE quota_ledger SET authorization_revision = 1
+             WHERE event_group_id = ?1 AND request_id = ?2 AND event_kind = 'reserve'
+               AND authorization_revision IS NULL",
+            params![reservation.event_group_id.as_deref(), &input.authorization.request_id],
+        )?;
+        if tagged_reserve_rows != expected_reserve_rows as usize {
+            return Err(CoreError::IdempotencyConflict);
+        }
+
         let operation_id = Self::new_id("budget-operation");
         transaction.execute(
             "INSERT INTO budget_operations
@@ -2047,6 +2111,21 @@ impl CoreStore {
                 hold_microcredits,
                 input.authorization.expires_at_ms,
                 &reservation.id,
+                now,
+            ],
+        )?;
+
+        transaction.execute(
+            "INSERT INTO budget_authorization_revisions
+             (request_id, local_revision, budget_id, authorization_json, authorization_hash,
+              hold_microcredits, previous_budget_id, adopted_at_ms)
+             VALUES (?1, 1, ?2, ?3, ?4, ?5, NULL, ?6)",
+            params![
+                &input.authorization.request_id,
+                &input.authorization.budget_id,
+                serde_json::to_string(&input.authorization)?,
+                &authorization_hash,
+                hold_microcredits,
                 now,
             ],
         )?;
@@ -2087,6 +2166,274 @@ impl CoreStore {
                 value: parent_request_id.into(),
             }
         })
+    }
+
+    /// Replace an authorization only while its step is still ready and the
+    /// old upstream budget has a verified cancellation proof. The reservation
+    /// identity is stable; only its held amount and immutable local history move.
+    #[allow(dead_code)] // The approved bridge integration consumes this internal entry point in Task4.
+    pub(crate) fn refresh_budget_authorization(
+        &self,
+        request_id: &str,
+        expected_old_budget_id: &str,
+        replacement: BudgetAuthorization,
+        proof: BudgetCancellationProof,
+    ) -> Result<BudgetMutation, CoreError> {
+        if request_id.trim().is_empty() || expected_old_budget_id.trim().is_empty() {
+            return Err(CoreError::IdempotencyConflict);
+        }
+        let now = Utc::now().timestamp_millis();
+        let replacement_json = serde_json::to_string(&replacement)?;
+        let replacement_hash = canonical_json_hash(&serde_json::to_value(&replacement)?).to_vec();
+        let proof_hash = canonical_json_hash(&serde_json::to_value(&proof)?).to_vec();
+        let mut connection = self.connection.lock().expect("core store mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Check accepted semantic replays before current Key, expiry or step
+        // state: retries remain idempotent after those mutable facts change.
+        let prior: Option<(String, i64, String, Vec<u8>, Option<Vec<u8>>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>, Option<i64>)> = transaction
+            .query_row(
+                "SELECT request_id, local_revision, authorization_json, authorization_hash,
+                        cancellation_proof_hash, previous_budget_id, cancellation_budget_id, cancellation_request_id,
+                        cancellation_bridge_instance_id, cancellation_ref,
+                        cancellation_bridge_revision, cancellation_canceled_at_ms
+                 FROM budget_authorization_revisions WHERE budget_id = ?1",
+                [&replacement.budget_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?)),
+            )
+            .optional()?;
+        if let Some((stored_request_id, local_revision, stored_json, stored_hash, stored_proof_hash, previous_budget_id,
+                     cancellation_budget_id, cancellation_request_id, cancellation_bridge_instance_id,
+                     cancellation_ref, cancellation_revision, cancellation_canceled_at)) = prior
+        {
+            let stored_authorization = serde_json::from_str::<BudgetAuthorization>(&stored_json).ok();
+            if stored_request_id == request_id
+                && local_revision > 1
+                && previous_budget_id.as_deref() == Some(expected_old_budget_id)
+                && stored_authorization.as_ref() == Some(&replacement)
+                && stored_hash == replacement_hash
+                && stored_proof_hash.as_deref() == Some(proof_hash.as_slice())
+                && cancellation_budget_id.as_deref() == Some(proof.budget_id.as_str())
+                && cancellation_request_id.as_deref() == Some(proof.request_id.as_str())
+                && cancellation_bridge_instance_id.as_deref() == Some(proof.bridge_instance_id.as_str())
+                && cancellation_ref.as_deref() == Some(proof.cancel_ref.as_str())
+                && cancellation_revision == Some(proof.revision)
+                && cancellation_canceled_at == Some(proof.canceled_at_ms)
+            {
+                transaction.commit()?;
+                return Ok(BudgetMutation::Duplicate);
+            }
+            return Err(CoreError::IdempotencyConflict);
+        }
+
+        validate_budget_authorization(
+            &BudgetStepInput { kind: BudgetStepKind::Video, authorization: replacement.clone() },
+            now,
+            false,
+        )?;
+        if proof.budget_id != expected_old_budget_id
+            || proof.request_id != request_id
+            || proof.bridge_instance_id.trim().is_empty()
+            || proof.cancel_ref.trim().is_empty()
+            || proof.revision <= 0
+            || proof.canceled_at_ms <= 0
+            || proof.canceled_at_ms > now
+            || replacement.request_id != request_id
+        {
+            return Err(CoreError::BillingQuoteMismatch { request_id: request_id.into() });
+        }
+
+        let context = transaction
+            .query_row(
+                "SELECT operation.parent_request_id, operation.api_key_id, operation.execution_state,
+                        step.kind, step.budget_id, step.core_key_id, step.request_fingerprint,
+                        step.endpoint, step.model, step.account_ref, step.bridge_instance_id,
+                        step.profile_fingerprint, step.policy_version, step.authorization_hash,
+                        step.hold_microcredits, step.expires_at_ms, step.reservation_id,
+                        step.dispatch_attempted, step.execution_state, step.financial_state,
+                        parent.user_id, parent.api_key_id, parent.state,
+                        request.user_id, request.api_key_id, request.endpoint, request.model, request.request_hash
+                 FROM budget_steps step
+                 JOIN budget_operations operation ON operation.operation_id = step.operation_id
+                 JOIN requests request ON request.id = step.request_id
+                 JOIN requests parent ON parent.id = operation.parent_request_id
+                 WHERE step.request_id = ?1",
+                [request_id],
+                |row| Ok(BudgetRefreshContext {
+                    parent_request_id: row.get(0)?, operation_key_id: row.get(1)?, operation_state: row.get(2)?,
+                    kind: row.get(3)?, budget_id: row.get(4)?, core_key_id: row.get(5)?, request_fingerprint: row.get(6)?,
+                    endpoint: row.get(7)?, model: row.get(8)?, account_ref: row.get(9)?, bridge_instance_id: row.get(10)?,
+                    profile_fingerprint: row.get(11)?, policy_version: row.get(12)?, authorization_hash: row.get(13)?,
+                    hold_microcredits: row.get(14)?, expires_at_ms: row.get(15)?, reservation_id: row.get(16)?,
+                    dispatch_attempted: row.get(17)?, step_execution_state: row.get(18)?, financial_state: row.get(19)?,
+                    parent_user_id: row.get(20)?, parent_key_id: row.get(21)?, parent_state: row.get(22)?,
+                    request_user_id: row.get(23)?, request_key_id: row.get(24)?, request_endpoint: row.get(25)?,
+                    request_model: row.get(26)?, request_hash: row.get(27)?,
+                }),
+            )
+            .optional()?
+            .ok_or_else(|| CoreError::RequestNotFound { request_id: request_id.into() })?;
+        if context.budget_id != expected_old_budget_id
+            || context.dispatch_attempted != 0
+            || context.step_execution_state != BudgetExecutionState::Ready.as_str()
+            || context.financial_state != BudgetFinancialState::Held.as_str()
+            || matches!(context.operation_state.as_str(), "succeeded" | "failed" | "canceled")
+            || matches!(context.parent_state.as_str(), "succeeded" | "failed" | "canceled" | "settled")
+        {
+            return Err(CoreError::IdempotencyConflict);
+        }
+        let current_hold = CreditAmount::try_from_microcredits(context.hold_microcredits)
+            .ok_or(CoreError::InvalidQuotaAmount)?;
+        let current_authorization = BudgetAuthorization {
+            budget_id: context.budget_id.clone(), parent_request_id: context.parent_request_id.clone(),
+            request_id: request_id.into(), core_key_id: context.core_key_id.clone(),
+            request_fingerprint: context.request_fingerprint.clone(), endpoint: context.endpoint.clone(),
+            model: context.model.clone(), account_ref: context.account_ref.clone(),
+            bridge_instance_id: context.bridge_instance_id.clone(), profile_fingerprint: context.profile_fingerprint.clone(),
+            policy_version: context.policy_version.clone(), hold_credits: current_hold,
+            expires_at_ms: context.expires_at_ms,
+        };
+        let current_hash = canonical_json_hash(&serde_json::to_value(&current_authorization)?).to_vec();
+        if current_hash != context.authorization_hash
+            || context.operation_key_id != context.core_key_id
+            || context.parent_key_id != context.core_key_id
+            || context.request_key_id != context.core_key_id
+            || context.parent_user_id != context.request_user_id
+            || context.request_endpoint != context.endpoint
+            || context.request_model != context.model
+            || URL_SAFE_NO_PAD.encode(&context.request_hash) != context.request_fingerprint
+            || replacement.parent_request_id != context.parent_request_id
+            || replacement.core_key_id != context.core_key_id
+            || replacement.request_fingerprint != context.request_fingerprint
+            || replacement.endpoint != context.endpoint
+            || replacement.model != context.model
+            || replacement.bridge_instance_id != context.bridge_instance_id
+            || proof.bridge_instance_id != context.bridge_instance_id
+            || replacement.budget_id == context.budget_id
+            || proof.budget_id != context.budget_id
+            || proof.request_id != request_id
+            || context.kind.trim().is_empty()
+        {
+            return Err(CoreError::BillingQuoteMismatch { request_id: request_id.into() });
+        }
+
+        let history: (i64, i64, String, Vec<u8>, i64) = transaction.query_row(
+            "SELECT COUNT(*), COALESCE(MAX(local_revision), 0),
+                    COALESCE((SELECT budget_id FROM budget_authorization_revisions WHERE request_id = ?1 ORDER BY local_revision DESC LIMIT 1), ''),
+                    COALESCE((SELECT authorization_hash FROM budget_authorization_revisions WHERE request_id = ?1 ORDER BY local_revision DESC LIMIT 1), X''),
+                    COALESCE((SELECT hold_microcredits FROM budget_authorization_revisions WHERE request_id = ?1 ORDER BY local_revision DESC LIMIT 1), 0)
+             FROM budget_authorization_revisions WHERE request_id = ?1",
+            [request_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )?;
+        if history.0 <= 0 || history.0 != history.1 || history.2 != context.budget_id || history.3 != context.authorization_hash || history.4 != context.hold_microcredits {
+            return Err(CoreError::IdempotencyConflict);
+        }
+        let local_revision = history.0.checked_add(1).ok_or(CoreError::InvalidQuotaAmount)?;
+
+        let key_active: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = ?1 AND user_id = ?2 AND status = 'active')",
+            params![&context.core_key_id, &context.request_user_id], |row| row.get(0),
+        )?;
+        let billing_blocked: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM api_key_billing_blocks WHERE key_id = ?1)
+             OR EXISTS(SELECT 1 FROM budget_steps WHERE core_key_id = ?1 AND financial_state = 'conflict')",
+            [&context.core_key_id], |row| row.get(0),
+        )?;
+        if !key_active {
+            return Err(CoreError::InvalidRequestIdentity { user_id: context.request_user_id, api_key_id: context.core_key_id });
+        }
+        if billing_blocked {
+            return Err(CoreError::ApiKeyBillingBlocked { api_key_id: context.core_key_id });
+        }
+
+        let reservation = Self::reservation_by_id(&transaction, &context.reservation_id)?.ok_or_else(|| CoreError::ReservationNotFound {
+            reservation_id: context.reservation_id.clone(),
+        })?;
+        if reservation.request_id != request_id
+            || reservation.state != ReservationState::Held
+            || reservation.amount != context.hold_microcredits
+            || reservation.resource_kind != "credits"
+            || reservation.user_id != context.request_user_id
+            || reservation.api_key_id.as_deref() != Some(context.core_key_id.as_str())
+        {
+            return Err(CoreError::ReservationSettlementConflict { reservation_id: reservation.id });
+        }
+        let event_group_id = reservation.event_group_id.as_deref().ok_or_else(|| CoreError::IdempotencyConflict)?;
+        let key_account_id = reservation.key_budget_account_id.as_deref().ok_or_else(|| CoreError::IdempotencyConflict)?;
+        let mut account_ids = vec![(key_account_id.to_owned(), "key")];
+        if let Some(user_account_id) = reservation.user_cap_account_id.as_deref() {
+            if user_account_id == key_account_id {
+                return Err(CoreError::IdempotencyConflict);
+            }
+            account_ids.push((user_account_id.to_owned(), "user_cap"));
+        }
+        let mut available = i64::MAX;
+        for (account_id, scope) in &account_ids {
+            Self::ensure_budget_account_ready_in_transaction(&transaction, account_id)?;
+            let (stored_scope, user_id, key_id, resource_kind): (String, String, Option<String>, String) = transaction.query_row(
+                "SELECT scope, user_id, api_key_id, resource_kind FROM quota_budget_accounts WHERE id = ?1",
+                [account_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            let expected_key = (*scope == "key").then_some(context.core_key_id.as_str());
+            if stored_scope != *scope || user_id != context.request_user_id || key_id.as_deref() != expected_key || resource_kind != "credits" {
+                return Err(CoreError::IdempotencyConflict);
+            }
+            available = available.min(Self::budget_balance_in_transaction(&transaction, account_id)?.available);
+        }
+        let delta = context.hold_microcredits.checked_sub(replacement.hold_credits.as_microcredits()).ok_or(CoreError::InvalidQuotaAmount)?;
+        let adjustment_amount = delta.checked_abs().ok_or(CoreError::InvalidQuotaAmount)?;
+        let extra = if delta < 0 { adjustment_amount } else { 0 };
+        if available < extra {
+            return Err(CoreError::QuotaInsufficient { available, required: extra });
+        }
+
+        let changed = transaction.execute(
+            "UPDATE budget_steps SET budget_id = ?1, account_ref = ?2, profile_fingerprint = ?3,
+                    policy_version = ?4, authorization_hash = ?5, hold_microcredits = ?6,
+                    expires_at_ms = ?7, updated_at_ms = ?8
+             WHERE request_id = ?9 AND budget_id = ?10 AND dispatch_attempted = 0
+               AND execution_state = 'ready' AND financial_state = 'held'",
+            params![replacement.budget_id, replacement.account_ref, replacement.profile_fingerprint,
+                replacement.policy_version, replacement_hash, replacement.hold_credits.as_microcredits(),
+                replacement.expires_at_ms, now, request_id, expected_old_budget_id],
+        )?;
+        if changed != 1 {
+            return Err(CoreError::IdempotencyConflict);
+        }
+        let changed = transaction.execute(
+            "UPDATE quota_reservations SET amount = ?1, expires_at_ms = ?2
+             WHERE id = ?3 AND state = 'held' AND amount = ?4",
+            params![replacement.hold_credits.as_microcredits(), replacement.expires_at_ms, &reservation.id, context.hold_microcredits],
+        )?;
+        if changed != 1 {
+            return Err(CoreError::ReservationSettlementConflict { reservation_id: reservation.id });
+        }
+
+        for (account_id, _) in &account_ids {
+            let version = Self::advance_budget_account(&transaction, account_id, now)?;
+            transaction.execute(
+                "INSERT INTO quota_ledger
+                 (entry_id, user_id, resource_kind, event_kind, amount, delta, request_id,
+                  created_at_ms, budget_account_id, event_group_id, api_key_id, budget_version, authorization_revision)
+                 VALUES (?1, ?2, 'credits', 'budget_authorization_adjust', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![Self::new_id("quota"), &reservation.user_id, adjustment_amount, delta, request_id,
+                    now, account_id, event_group_id, context.core_key_id, version, local_revision],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO budget_authorization_revisions
+            (request_id, local_revision, budget_id, authorization_json, authorization_hash,
+              hold_microcredits, previous_budget_id, cancellation_budget_id, cancellation_request_id,
+              cancellation_bridge_instance_id, cancellation_ref, cancellation_bridge_revision,
+              cancellation_canceled_at_ms, cancellation_proof_hash, adopted_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?1, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![request_id, local_revision, replacement.budget_id, replacement_json, replacement_hash,
+                replacement.hold_credits.as_microcredits(), expected_old_budget_id, proof.bridge_instance_id,
+                proof.cancel_ref, proof.revision, proof.canceled_at_ms, proof_hash, now],
+        )?;
+        transaction.commit()?;
+        Ok(BudgetMutation::Applied)
     }
 
     pub fn budget_operation(
@@ -2149,29 +2496,37 @@ impl CoreStore {
         api_key_id: &str,
         exclude_request_id: Option<&str>,
     ) -> Result<i64, CoreError> {
-        connection
-            .query_row(
-                "SELECT
-                   (SELECT COUNT(*) FROM budget_operations
-                    WHERE api_key_id = ?1 AND execution_state IN ('ready','running','unknown'))
-                   +
-                   (SELECT COUNT(*) FROM requests request
-                    WHERE request.api_key_id = ?1
-                      AND request.state IN ('received','validating','reserved','queued','dispatched','completing','cancel_requested','unknown')
-                      AND (?2 IS NULL OR request.id <> ?2)
-                      AND NOT EXISTS (
-                        SELECT 1 FROM request_relations relation
-                        WHERE relation.child_request_id = request.id
-                          AND relation.relationship_kind = 'seedance_assist'
-                      )
-                      AND NOT EXISTS (
-                        SELECT 1 FROM budget_operations operation
-                        WHERE operation.parent_request_id = request.id
-                      ))",
-                params![api_key_id, exclude_request_id],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
+        let evidence_table_exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_execution_evidence')",
+            [],
+            |row| row.get(0),
+        )?;
+        let evidence_exclusion = if evidence_table_exists {
+            "AND NOT EXISTS (SELECT 1 FROM legacy_execution_evidence evidence WHERE evidence.request_id = request.id)"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT
+               (SELECT COUNT(*) FROM budget_operations
+                WHERE api_key_id = ?1 AND execution_state IN ('ready','running','unknown'))
+               +
+               (SELECT COUNT(*) FROM requests request
+                WHERE request.api_key_id = ?1
+                  AND request.state IN ('received','validating','reserved','queued','dispatched','completing','cancel_requested','unknown')
+                  AND (?2 IS NULL OR request.id <> ?2)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM request_relations relation
+                    WHERE relation.child_request_id = request.id
+                      AND relation.relationship_kind = 'seedance_assist'
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM budget_operations operation
+                    WHERE operation.parent_request_id = request.id
+                  )
+                  {evidence_exclusion})"
+        );
+        connection.query_row(&sql, params![api_key_id, exclude_request_id], |row| row.get(0)).map_err(Into::into)
     }
 
     pub(crate) fn active_execution_count_for_budget_admission_in_connection(
@@ -2202,6 +2557,11 @@ impl CoreStore {
             [],
             |row| row.get(0),
         )?;
+        let evidence_table_exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'legacy_execution_evidence')",
+            [],
+            |row| row.get(0),
+        )?;
         let active_budget_operations = if budget_operations_exist {
             connection.query_row(
                 "SELECT COUNT(*) FROM budget_operations
@@ -2213,7 +2573,7 @@ impl CoreStore {
         } else {
             0
         };
-        let legacy_requests_sql = if budget_operations_exist {
+        let mut legacy_requests_sql = String::from(
             "SELECT COUNT(*) FROM requests request
              WHERE request.api_key_id = ?1
                AND request.state IN ('received','validating','reserved','queued','dispatched','completing','cancel_requested','unknown')
@@ -2226,28 +2586,20 @@ impl CoreStore {
                  SELECT 1 FROM request_relations relation
                  WHERE relation.child_request_id = request.id
                    AND relation.relationship_kind = 'seedance_assist'
-               )
-               AND NOT EXISTS (
-                 SELECT 1 FROM budget_operations operation
-                 WHERE operation.parent_request_id = request.id
-               )"
-        } else {
-            "SELECT COUNT(*) FROM requests request
-             WHERE request.api_key_id = ?1
-               AND request.state IN ('received','validating','reserved','queued','dispatched','completing','cancel_requested','unknown')
-               AND request.id <> ?2
-               AND (?3 IS NULL OR request.id <> ?3)
-               AND (request.state <> 'received'
-                 OR request.created_at_ms < ?4
-                 OR (request.created_at_ms = ?4 AND request.id < ?2))
-               AND NOT EXISTS (
-                 SELECT 1 FROM request_relations relation
-                 WHERE relation.child_request_id = request.id
-                   AND relation.relationship_kind = 'seedance_assist'
-               )"
-        };
+               )",
+        );
+        if budget_operations_exist {
+            legacy_requests_sql.push_str(
+                "\nAND NOT EXISTS (SELECT 1 FROM budget_operations operation WHERE operation.parent_request_id = request.id)",
+            );
+        }
+        if evidence_table_exists {
+            legacy_requests_sql.push_str(
+                "\nAND NOT EXISTS (SELECT 1 FROM legacy_execution_evidence evidence WHERE evidence.request_id = request.id)",
+            );
+        }
         let active_legacy_requests: i64 = connection.query_row(
-            legacy_requests_sql,
+            &legacy_requests_sql,
             params![api_key_id, request_id, assist_parent_request_id, received_at_ms],
             |row| row.get(0),
         )?;
@@ -2496,4 +2848,424 @@ fn validate_budget_request_identity(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeSet, fs, path::PathBuf};
+
+    use rusqlite::{params, Connection};
+    use serde_json::json;
+
+    use super::*;
+
+    struct Fixture(PathBuf);
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture() -> (Fixture, CoreStore, String, crate::Principal) {
+        fixture_with_quotas(20_000_000, 20_000_000)
+    }
+
+    fn fixture_with_quotas(pool_credits: i64, key_credits: i64) -> (Fixture, CoreStore, String, crate::Principal) {
+        let root = std::env::temp_dir().join(format!("budget-refresh-{}", CoreStore::new_id("test")));
+        fs::create_dir_all(&root).unwrap();
+        let store = CoreStore::open(&root).unwrap();
+        store.migrate().unwrap();
+        store.create_user(crate::NewUser { id: "admin".into(), name: "Admin".into(), role: crate::UserRole::Admin }, "bootstrap").unwrap();
+        store.create_user(crate::NewUser { id: "user".into(), name: "User".into(), role: crate::UserRole::User }, "admin").unwrap();
+        let admin_key = store.issue_api_key("admin", "admin", BTreeSet::from(["admin:*".into()]), "bootstrap").unwrap();
+        let admin = store.authenticate_api_key(&admin_key.plaintext).unwrap();
+        let user_key = store.issue_api_key_as_admin_with_max_concurrency(
+            "user", "budget", BTreeSet::from(["video:submit".into()]), 4, &admin,
+        ).unwrap();
+        store.quota_pool_grant_as_admin(&admin, crate::QuotaGrant {
+            user_id: "user".into(), resource_kind: "credits".into(), amount: pool_credits,
+            actor_user_id: "admin".into(), reason: "refresh test pool".into(),
+        }).unwrap();
+        store.key_quota_grant_as_admin(&admin, crate::KeyQuotaGrant {
+            api_key_id: user_key.id.clone(), resource_kind: "credits".into(), amount: key_credits,
+            actor_user_id: "admin".into(), reason: "refresh test key".into(),
+        }).unwrap();
+        (Fixture(root), store, user_key.id, admin)
+    }
+
+    fn new_authorization(store: &CoreStore, key_id: &str, parent_id: &str, budget_id: &str, hold: &str) -> BudgetAuthorization {
+        BudgetAuthorization {
+            budget_id: budget_id.into(), parent_request_id: parent_id.into(), request_id: parent_id.into(),
+            core_key_id: key_id.into(), request_fingerprint: store.request_fingerprint_for_billing(parent_id).unwrap(),
+            endpoint: "videos".into(), model: "seedance-fast".into(), account_ref: "account-test".into(),
+            bridge_instance_id: "bridge-test".into(), profile_fingerprint: "profile-hash".into(),
+            policy_version: "policy-v1".into(), hold_credits: CreditAmount::parse(hold, "credits").unwrap(),
+            expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
+        }
+    }
+
+    fn proof(budget_id: &str, request_id: &str, revision: i64) -> BudgetCancellationProof {
+        BudgetCancellationProof {
+            budget_id: budget_id.into(), request_id: request_id.into(), bridge_instance_id: "bridge-test".into(),
+            cancel_ref: format!("cancel-{revision}"), revision, canceled_at_ms: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+
+    fn begin_video_parent(store: &CoreStore, key_id: &str, idempotency_key: &str) -> String {
+        match store.begin_billed_request(BeginRequestInput {
+            user_id: "user".into(), api_key_id: key_id.into(), protocol: "openai".into(), endpoint: "videos".into(),
+            model: "seedance-fast".into(), idempotency_key: idempotency_key.into(),
+            body: json!({"model":"seedance-fast","prompt":"kite"}),
+        }).unwrap() {
+            BeginRequest::Created(request) => request.id,
+            other => panic!("expected created parent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authorization_refresh_adjusts_both_caps_atomically_and_tags_terminal_revision() {
+        let (fixture, store, key_id, admin) = fixture();
+        let parent = match store.begin_billed_request(BeginRequestInput {
+            user_id: "user".into(), api_key_id: key_id.clone(), protocol: "openai".into(), endpoint: "videos".into(),
+            model: "seedance-fast".into(), idempotency_key: "refresh-parent".into(), body: json!({"model":"seedance-fast","prompt":"kite"}),
+        }).unwrap() {
+            BeginRequest::Created(request) => request.id,
+            other => panic!("expected created parent, got {other:?}"),
+        };
+        let initial = new_authorization(&store, &key_id, &parent, "refresh-budget-1", "2");
+        store.begin_budget_operation(&parent, BudgetStepInput { kind: BudgetStepKind::Video, authorization: initial.clone() }).unwrap();
+        let reservation_before = store.reservation_for_request(&parent).unwrap().unwrap();
+
+        let second = new_authorization(&store, &key_id, &parent, "refresh-budget-2", "3");
+        let second_proof = proof(&initial.budget_id, &parent, 1);
+        assert_eq!(store.refresh_budget_authorization(&parent, &initial.budget_id, second.clone(), second_proof.clone()).unwrap(), BudgetMutation::Applied);
+        assert_eq!(store.refresh_budget_authorization(&parent, &initial.budget_id, second.clone(), second_proof).unwrap(), BudgetMutation::Duplicate);
+
+        let third = new_authorization(&store, &key_id, &parent, "refresh-budget-3", "1.5");
+        assert_eq!(store.refresh_budget_authorization(&parent, &second.budget_id, third.clone(), proof(&second.budget_id, &parent, 3)).unwrap(), BudgetMutation::Applied);
+        let mut metadata_only = new_authorization(&store, &key_id, &parent, "refresh-budget-4", "1.5");
+        metadata_only.policy_version = "policy-v2".into();
+        metadata_only.expires_at_ms = third.expires_at_ms + 60_000;
+        assert_eq!(store.refresh_budget_authorization(&parent, &third.budget_id, metadata_only.clone(), proof(&third.budget_id, &parent, 4)).unwrap(), BudgetMutation::Applied);
+        let reservation_after = store.reservation_for_request(&parent).unwrap().unwrap();
+        assert_eq!(reservation_after.id, reservation_before.id);
+        assert_eq!(reservation_after.event_group_id, reservation_before.event_group_id);
+        assert_eq!(reservation_after.amount, third.hold_credits.as_microcredits());
+        assert_ne!(reservation_before.expires_at_ms, metadata_only.expires_at_ms);
+        assert_eq!(reservation_after.expires_at_ms, metadata_only.expires_at_ms);
+        let key_balance = store.key_quota_balance_as_admin(&admin, &key_id, "credits").unwrap();
+        let pool_balance = store.quota_pool_balance_as_admin(&admin, "user", "credits").unwrap();
+        assert_eq!((key_balance.available, key_balance.held), (18_500_000, 1_500_000));
+        assert_eq!((pool_balance.available, pool_balance.held), (18_500_000, 1_500_000));
+
+        let database = fixture.0.join("data").join(crate::CORE_DB_FILE);
+        let connection = Connection::open(database).unwrap();
+        let revisions: Vec<(i64, String, Option<String>, Option<i64>)> = {
+            let mut statement = connection.prepare("SELECT local_revision,budget_id,previous_budget_id,cancellation_bridge_revision FROM budget_authorization_revisions WHERE request_id=?1 ORDER BY local_revision").unwrap();
+            statement.query_map([&parent], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap().collect::<Result<_,_>>().unwrap()
+        };
+        assert_eq!(revisions, vec![
+            (1, initial.budget_id.clone(), None, None),
+            (2, second.budget_id.clone(), Some(initial.budget_id.clone()), Some(1)),
+            (3, third.budget_id.clone(), Some(second.budget_id.clone()), Some(3)),
+            (4, metadata_only.budget_id.clone(), Some(third.budget_id.clone()), Some(4)),
+        ]);
+        let (adjustment_count, zero_adjustments): (i64, i64) = connection.query_row(
+            "SELECT COUNT(*), SUM(CASE WHEN amount=0 AND delta=0 THEN 1 ELSE 0 END)
+             FROM quota_ledger WHERE event_group_id=?1 AND event_kind='budget_authorization_adjust'",
+            params![reservation_after.event_group_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(adjustment_count, 6);
+        assert_eq!(zero_adjustments, 2);
+        drop(connection);
+
+        assert_eq!(store.reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis()).unwrap(), 0);
+
+        assert_eq!(store.release_unattempted_budget_step(&parent, "verified never dispatched").unwrap(), BudgetMutation::Applied);
+        let connection = Connection::open(fixture.0.join("data").join(crate::CORE_DB_FILE)).unwrap();
+        let final_revision: i64 = connection.query_row("SELECT authorization_revision FROM quota_ledger WHERE event_group_id=?1 AND event_kind='release' LIMIT 1", params![reservation_after.event_group_id], |row| row.get(0)).unwrap();
+        assert_eq!(final_revision, 4);
+        drop(connection);
+        assert_eq!(store.reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis()).unwrap(), 0);
+
+        let attempted_parent = begin_video_parent(&store, &key_id, "refresh-attempted-parent");
+        let attempted_old = new_authorization(&store, &key_id, &attempted_parent, "attempted-budget-old", "2");
+        store.begin_budget_operation(&attempted_parent, BudgetStepInput { kind: BudgetStepKind::Video, authorization: attempted_old.clone() }).unwrap();
+        store.mark_budget_step_dispatched(&attempted_parent).unwrap();
+        let attempted_replacement = new_authorization(&store, &key_id, &attempted_parent, "attempted-budget-new", "3");
+        let attempted_reservation_before = store.reservation_for_request(&attempted_parent).unwrap().unwrap();
+        let attempted_balance_before = store.key_quota_balance_as_admin(&admin, &key_id, "credits").unwrap();
+        assert!(store.refresh_budget_authorization(&attempted_parent, &attempted_old.budget_id, attempted_replacement, proof(&attempted_old.budget_id, &attempted_parent, 1)).is_err());
+        let attempted_reservation_after = store.reservation_for_request(&attempted_parent).unwrap().unwrap();
+        let attempted_step_after = store.budget_operation(&attempted_parent).unwrap().unwrap().steps.remove(0);
+        let attempted_balance_after = store.key_quota_balance_as_admin(&admin, &key_id, "credits").unwrap();
+        assert_eq!(attempted_reservation_after, attempted_reservation_before);
+        assert_eq!(attempted_step_after.budget_id, attempted_old.budget_id);
+        assert_eq!((attempted_balance_after.available, attempted_balance_after.held), (attempted_balance_before.available, attempted_balance_before.held));
+    }
+
+    #[test]
+    fn authorization_refresh_insufficient_key_or_user_cap_rolls_back_every_write() {
+        for (pool_credits, key_credits) in [(2_500_000, 20_000_000), (20_000_000, 2_500_000)] {
+            let (fixture, store, key_id, admin) = fixture_with_quotas(pool_credits, key_credits);
+            let parent = begin_video_parent(&store, &key_id, "refresh-cap-parent");
+            let initial = new_authorization(&store, &key_id, &parent, "refresh-cap-old", "2");
+            store.begin_budget_operation(&parent, BudgetStepInput { kind: BudgetStepKind::Video, authorization: initial.clone() }).unwrap();
+            let before_key = store.key_quota_balance_as_admin(&admin, &key_id, "credits").unwrap();
+            let before_pool = store.quota_pool_balance_as_admin(&admin, "user", "credits").unwrap();
+            let before_reservation = store.reservation_for_request(&parent).unwrap().unwrap();
+            let replacement = new_authorization(&store, &key_id, &parent, "refresh-cap-new", "3");
+            let error = store.refresh_budget_authorization(&parent, &initial.budget_id, replacement, proof(&initial.budget_id, &parent, 1)).unwrap_err();
+            assert!(matches!(error, CoreError::QuotaInsufficient { .. }));
+            assert_eq!(store.reservation_for_request(&parent).unwrap().unwrap(), before_reservation);
+            assert_eq!(store.budget_operation(&parent).unwrap().unwrap().steps[0].budget_id, initial.budget_id);
+            let after_key = store.key_quota_balance_as_admin(&admin, &key_id, "credits").unwrap();
+            let after_pool = store.quota_pool_balance_as_admin(&admin, "user", "credits").unwrap();
+            assert_eq!((after_key.available, after_key.held, after_key.version), (before_key.available, before_key.held, before_key.version));
+            assert_eq!((after_pool.available, after_pool.held, after_pool.version), (before_pool.available, before_pool.held, before_pool.version));
+            let connection = Connection::open(fixture.0.join("data").join(crate::CORE_DB_FILE)).unwrap();
+            let (history, adjustments): (i64, i64) = connection.query_row(
+                "SELECT (SELECT COUNT(*) FROM budget_authorization_revisions WHERE request_id=?1),
+                        (SELECT COUNT(*) FROM quota_ledger WHERE request_id=?1 AND event_kind='budget_authorization_adjust')",
+                [&parent], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!((history, adjustments), (1, 0));
+        }
+    }
+
+    #[test]
+    fn authorization_refresh_rejects_conflicting_proofs_and_reused_ids() {
+        let (_fixture, store, key_id, _) = fixture();
+        let parent = begin_video_parent(&store, &key_id, "refresh-proof-parent");
+        let initial = new_authorization(&store, &key_id, &parent, "refresh-proof-old", "2");
+        store.begin_budget_operation(&parent, BudgetStepInput { kind: BudgetStepKind::Video, authorization: initial.clone() }).unwrap();
+        let replacement = new_authorization(&store, &key_id, &parent, "refresh-proof-new", "3");
+        let mut wrong_proof = proof(&initial.budget_id, &parent, 1);
+        wrong_proof.bridge_instance_id = "other-bridge".into();
+        assert!(store.refresh_budget_authorization(&parent, &initial.budget_id, replacement.clone(), wrong_proof).is_err());
+        assert_eq!(store.budget_operation(&parent).unwrap().unwrap().steps[0].budget_id, initial.budget_id);
+        store.refresh_budget_authorization(&parent, &initial.budget_id, replacement.clone(), proof(&initial.budget_id, &parent, 1)).unwrap();
+        let mut changed_content = replacement.clone();
+        changed_content.profile_fingerprint = "different-profile".into();
+        assert!(store.refresh_budget_authorization(&parent, &initial.budget_id, changed_content, proof(&initial.budget_id, &parent, 1)).is_err());
+        let wrong_old_candidate = new_authorization(&store, &key_id, &parent, "refresh-proof-wrong-old", "2.5");
+        assert!(store.refresh_budget_authorization(&parent, &initial.budget_id, wrong_old_candidate, proof(&replacement.budget_id, &parent, 3)).is_err());
+        let reused_old_id = new_authorization(&store, &key_id, &parent, &initial.budget_id, "2.5");
+        assert!(store.refresh_budget_authorization(&parent, &replacement.budget_id, reused_old_id, proof(&replacement.budget_id, &parent, 3)).is_err());
+    }
+
+    #[test]
+    fn authorization_refresh_observes_existing_v2_key_conflict_gate() {
+        let (fixture, store, key_id, admin) = fixture();
+        let candidate_parent = begin_video_parent(&store, &key_id, "refresh-conflict-candidate");
+        let candidate = new_authorization(&store, &key_id, &candidate_parent, "refresh-conflict-candidate-old", "2");
+        store.begin_budget_operation(&candidate_parent, BudgetStepInput { kind: BudgetStepKind::Video, authorization: candidate.clone() }).unwrap();
+        let candidate_reservation_before = store.reservation_for_request(&candidate_parent).unwrap().unwrap();
+        let conflict_parent = begin_video_parent(&store, &key_id, "refresh-conflict-source");
+        store.begin_budget_operation(&conflict_parent, BudgetStepInput {
+            kind: BudgetStepKind::Video,
+            authorization: new_authorization(&store, &key_id, &conflict_parent, "refresh-conflict-source-budget", "1"),
+        }).unwrap();
+        let connection = Connection::open(fixture.0.join("data").join(crate::CORE_DB_FILE)).unwrap();
+        let explicit_block_count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM api_key_billing_blocks WHERE key_id=?1", [&key_id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(explicit_block_count, 0);
+        connection.execute("UPDATE budget_steps SET financial_state='conflict' WHERE request_id=?1", [&conflict_parent]).unwrap();
+        drop(connection);
+        let candidate_balance_before = store.key_quota_balance_as_admin(&admin, &key_id, "credits").unwrap();
+        let result = store.refresh_budget_authorization(
+            &candidate_parent, &candidate.budget_id,
+            new_authorization(&store, &key_id, &candidate_parent, "refresh-conflict-candidate-new", "3"),
+            proof(&candidate.budget_id, &candidate_parent, 1),
+        );
+        assert!(matches!(result, Err(CoreError::ApiKeyBillingBlocked { .. })));
+        assert_eq!(store.budget_operation(&candidate_parent).unwrap().unwrap().steps[0].budget_id, candidate.budget_id);
+        assert_eq!(store.reservation_for_request(&candidate_parent).unwrap().unwrap(), candidate_reservation_before);
+        let candidate_balance_after = store.key_quota_balance_as_admin(&admin, &key_id, "credits").unwrap();
+        assert_eq!((candidate_balance_after.available, candidate_balance_after.held, candidate_balance_after.version),
+                   (candidate_balance_before.available, candidate_balance_before.held, candidate_balance_before.version));
+        let connection = Connection::open(fixture.0.join("data").join(crate::CORE_DB_FILE)).unwrap();
+        let (history_count, adjustment_count): (i64, i64) = connection.query_row(
+            "SELECT (SELECT COUNT(*) FROM budget_authorization_revisions WHERE request_id=?1),
+                    (SELECT COUNT(*) FROM quota_ledger WHERE request_id=?1 AND event_kind='budget_authorization_adjust')",
+            [&candidate_parent], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!((history_count, adjustment_count), (1, 0));
+    }
+
+    #[test]
+    fn authorization_adjustment_corruption_is_quarantined() {
+        let (fixture, store, key_id, _) = fixture();
+        let parent = begin_video_parent(&store, &key_id, "refresh-corruption-parent");
+        let initial = new_authorization(&store, &key_id, &parent, "refresh-corruption-old", "2");
+        store.begin_budget_operation(&parent, BudgetStepInput { kind: BudgetStepKind::Video, authorization: initial.clone() }).unwrap();
+        let replacement = new_authorization(&store, &key_id, &parent, "refresh-corruption-new", "3");
+        store.refresh_budget_authorization(&parent, &initial.budget_id, replacement, proof(&initial.budget_id, &parent, 1)).unwrap();
+        let connection = Connection::open(fixture.0.join("data").join(crate::CORE_DB_FILE)).unwrap();
+        connection.execute(
+            "UPDATE quota_ledger SET amount = amount + 1
+             WHERE request_id = ?1 AND event_kind='budget_authorization_adjust' AND authorization_revision=2",
+            [&parent],
+        ).unwrap();
+        drop(connection);
+        assert_eq!(store.reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis()).unwrap(), 1);
+        let connection = Connection::open(fixture.0.join("data").join(crate::CORE_DB_FILE)).unwrap();
+        let quarantined: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM quota_budget_accounts WHERE api_key_id=?1 AND migration_state='reconcile_required'",
+            [&key_id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(quarantined, 1);
+    }
+
+    #[test]
+    fn authorization_revision_gap_is_quarantined() {
+        let (fixture, store, key_id, _) = fixture();
+        let parent = begin_video_parent(&store, &key_id, "refresh-gap-parent");
+        let initial = new_authorization(&store, &key_id, &parent, "refresh-gap-old", "2");
+        store.begin_budget_operation(&parent, BudgetStepInput { kind: BudgetStepKind::Video, authorization: initial.clone() }).unwrap();
+        let replacement = new_authorization(&store, &key_id, &parent, "refresh-gap-new", "3");
+        store.refresh_budget_authorization(&parent, &initial.budget_id, replacement, proof(&initial.budget_id, &parent, 1)).unwrap();
+        let connection = Connection::open(fixture.0.join("data").join(crate::CORE_DB_FILE)).unwrap();
+        connection.execute("DROP TRIGGER budget_authorization_revisions_no_update", []).unwrap();
+        connection.execute(
+            "UPDATE budget_authorization_revisions SET local_revision=3 WHERE request_id=?1 AND local_revision=2",
+            [&parent],
+        ).unwrap();
+        drop(connection);
+        assert_eq!(store.reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis()).unwrap(), 1);
+    }
+
+    #[test]
+    fn schema_v26_replay_preserves_adjusted_history_and_latest_final_revision() {
+        let (fixture, store, key_id, _) = fixture();
+        let parent = begin_video_parent(&store, &key_id, "v26-replay-parent");
+        let initial = new_authorization(&store, &key_id, &parent, "v26-replay-old", "2");
+        store.begin_budget_operation(&parent, BudgetStepInput { kind: BudgetStepKind::Video, authorization: initial.clone() }).unwrap();
+        let replacement = new_authorization(&store, &key_id, &parent, "v26-replay-new", "3");
+        store.refresh_budget_authorization(&parent, &initial.budget_id, replacement.clone(), proof(&initial.budget_id, &parent, 1)).unwrap();
+        store.release_unattempted_budget_step(&parent, "migration replay fixture").unwrap();
+
+        let database = fixture.0.join("data").join(crate::CORE_DB_FILE);
+        let connection = Connection::open(&database).unwrap();
+        let history_before: Vec<(i64, String, Vec<u8>)> = {
+            let mut statement = connection.prepare(
+                "SELECT local_revision,budget_id,authorization_hash FROM budget_authorization_revisions WHERE request_id=?1 ORDER BY local_revision",
+            ).unwrap();
+            statement.query_map([&parent], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap().collect::<Result<_,_>>().unwrap()
+        };
+        let ledger_before: Vec<(String, i64, i64)> = {
+            let mut statement = connection.prepare(
+                "SELECT event_kind,authorization_revision,budget_version FROM quota_ledger WHERE request_id=?1 ORDER BY entry_id",
+            ).unwrap();
+            statement.query_map([&parent], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap().collect::<Result<_,_>>().unwrap()
+        };
+        let reservation_before: (i64, i64, String) = connection.query_row(
+            "SELECT amount,expires_at_ms,state FROM quota_reservations WHERE request_id=?1",
+            [&parent], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        let finish_time_before: Option<i64> = connection.query_row(
+            "SELECT execution_finished_at_ms FROM budget_operations WHERE parent_request_id=?1",
+            [&parent], |row| row.get(0),
+        ).unwrap();
+        drop(connection);
+
+        let connection = Connection::open(&database).unwrap();
+        connection.execute("UPDATE schema_meta SET value='25' WHERE key='schema_version'", []).unwrap();
+        drop(connection);
+        store.migrate().unwrap();
+        assert_eq!(store.schema_version().unwrap(), 26);
+
+        let connection = Connection::open(&database).unwrap();
+        let history_after: Vec<(i64, String, Vec<u8>)> = {
+            let mut statement = connection.prepare(
+                "SELECT local_revision,budget_id,authorization_hash FROM budget_authorization_revisions WHERE request_id=?1 ORDER BY local_revision",
+            ).unwrap();
+            statement.query_map([&parent], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap().collect::<Result<_,_>>().unwrap()
+        };
+        let ledger_after: Vec<(String, i64, i64)> = {
+            let mut statement = connection.prepare(
+                "SELECT event_kind,authorization_revision,budget_version FROM quota_ledger WHERE request_id=?1 ORDER BY entry_id",
+            ).unwrap();
+            statement.query_map([&parent], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap().collect::<Result<_,_>>().unwrap()
+        };
+        let reservation_after: (i64, i64, String) = connection.query_row(
+            "SELECT amount,expires_at_ms,state FROM quota_reservations WHERE request_id=?1",
+            [&parent], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        let finish_time_after: Option<i64> = connection.query_row(
+            "SELECT execution_finished_at_ms FROM budget_operations WHERE parent_request_id=?1",
+            [&parent], |row| row.get(0),
+        ).unwrap();
+        let latest_release_revision: i64 = connection.query_row(
+            "SELECT authorization_revision FROM quota_ledger WHERE request_id=?1 AND event_kind='release' LIMIT 1",
+            [&parent], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(history_after, history_before);
+        assert_eq!(ledger_after, ledger_before);
+        assert_eq!(reservation_after, reservation_before);
+        assert_eq!(finish_time_after, finish_time_before);
+        assert_eq!(latest_release_revision, 2);
+        assert_eq!(reservation_after.0, replacement.hold_credits.as_microcredits());
+    }
+
+    #[test]
+    fn authorization_refresh_rejects_gapped_history_before_adding_revision() {
+        let (fixture, store, key_id, admin) = fixture();
+        let parent = begin_video_parent(&store, &key_id, "refresh-gap-append-parent");
+        let initial = new_authorization(&store, &key_id, &parent, "refresh-gap-append-old", "2");
+        store.begin_budget_operation(&parent, BudgetStepInput { kind: BudgetStepKind::Video, authorization: initial.clone() }).unwrap();
+        let current = new_authorization(&store, &key_id, &parent, "refresh-gap-append-current", "3");
+        store.refresh_budget_authorization(&parent, &initial.budget_id, current.clone(), proof(&initial.budget_id, &parent, 1)).unwrap();
+
+        let database = fixture.0.join("data").join(crate::CORE_DB_FILE);
+        let connection = Connection::open(&database).unwrap();
+        connection.execute("DROP TRIGGER budget_authorization_revisions_no_update", []).unwrap();
+        connection.execute(
+            "UPDATE budget_authorization_revisions SET local_revision=4 WHERE request_id=?1 AND local_revision=2",
+            [&parent],
+        ).unwrap();
+        drop(connection);
+
+        let reservation_before = store.reservation_for_request(&parent).unwrap().unwrap();
+        let balance_before = store.key_quota_balance_as_admin(&admin, &key_id, "credits").unwrap();
+        let candidate = new_authorization(&store, &key_id, &parent, "refresh-gap-append-next", "2.5");
+        let result = store.refresh_budget_authorization(
+            &parent, &current.budget_id, candidate, proof(&current.budget_id, &parent, 3),
+        );
+        assert!(matches!(result, Err(CoreError::IdempotencyConflict)));
+        assert_eq!(store.reservation_for_request(&parent).unwrap().unwrap(), reservation_before);
+        assert_eq!(store.budget_operation(&parent).unwrap().unwrap().steps[0].budget_id, current.budget_id);
+        let balance_after = store.key_quota_balance_as_admin(&admin, &key_id, "credits").unwrap();
+        assert_eq!((balance_after.available, balance_after.held, balance_after.version),
+                   (balance_before.available, balance_before.held, balance_before.version));
+        let connection = Connection::open(database).unwrap();
+        let (history_count, max_revision, adjustment_count): (i64, i64, i64) = connection.query_row(
+            "SELECT (SELECT COUNT(*) FROM budget_authorization_revisions WHERE request_id=?1),
+                    (SELECT MAX(local_revision) FROM budget_authorization_revisions WHERE request_id=?1),
+                    (SELECT COUNT(*) FROM quota_ledger WHERE request_id=?1 AND event_kind='budget_authorization_adjust')",
+            [&parent], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).unwrap();
+        assert_eq!((history_count, max_revision, adjustment_count), (2, 4, 2));
+    }
+
+    #[test]
+    fn authorization_cancellation_proof_corruption_is_quarantined() {
+        let (fixture, store, key_id, _) = fixture();
+        let parent = begin_video_parent(&store, &key_id, "refresh-proof-tamper-parent");
+        let initial = new_authorization(&store, &key_id, &parent, "refresh-proof-tamper-old", "2");
+        store.begin_budget_operation(&parent, BudgetStepInput { kind: BudgetStepKind::Video, authorization: initial.clone() }).unwrap();
+        let replacement = new_authorization(&store, &key_id, &parent, "refresh-proof-tamper-new", "3");
+        store.refresh_budget_authorization(&parent, &initial.budget_id, replacement, proof(&initial.budget_id, &parent, 1)).unwrap();
+        let connection = Connection::open(fixture.0.join("data").join(crate::CORE_DB_FILE)).unwrap();
+        connection.execute("DROP TRIGGER budget_authorization_revisions_no_update", []).unwrap();
+        connection.execute(
+            "UPDATE budget_authorization_revisions SET cancellation_ref='altered-proof'
+             WHERE request_id=?1 AND local_revision=2",
+            [&parent],
+        ).unwrap();
+        drop(connection);
+        assert_eq!(store.reconcile_quota_event_groups(chrono::Utc::now().timestamp_millis()).unwrap(), 1);
+    }
 }

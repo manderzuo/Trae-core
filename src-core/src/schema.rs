@@ -771,3 +771,82 @@ CREATE TABLE budget_settlements (
   settled_at_ms INTEGER NOT NULL CHECK(settled_at_ms > 0)
 );
 "#;
+
+pub(crate) const SCHEMA_V26: &str = r#"
+CREATE TABLE IF NOT EXISTS budget_authorization_revisions (
+  request_id TEXT NOT NULL REFERENCES budget_steps(request_id),
+  local_revision INTEGER NOT NULL CHECK(local_revision > 0),
+  budget_id TEXT NOT NULL UNIQUE CHECK(length(trim(budget_id)) > 0),
+  authorization_json TEXT NOT NULL CHECK(length(trim(authorization_json)) > 0),
+  authorization_hash BLOB NOT NULL CHECK(length(authorization_hash) > 0),
+  hold_microcredits INTEGER NOT NULL CHECK(hold_microcredits > 0),
+  previous_budget_id TEXT,
+  cancellation_budget_id TEXT,
+  cancellation_request_id TEXT,
+  cancellation_bridge_instance_id TEXT,
+  cancellation_ref TEXT,
+  cancellation_bridge_revision INTEGER,
+  cancellation_canceled_at_ms INTEGER,
+  cancellation_proof_hash BLOB,
+  adopted_at_ms INTEGER NOT NULL CHECK(adopted_at_ms >= 0),
+  PRIMARY KEY(request_id, local_revision),
+  UNIQUE(request_id, budget_id),
+  FOREIGN KEY(request_id, previous_budget_id)
+    REFERENCES budget_authorization_revisions(request_id, budget_id),
+  CHECK(
+    (local_revision = 1 AND previous_budget_id IS NULL
+      AND cancellation_budget_id IS NULL AND cancellation_request_id IS NULL
+      AND cancellation_bridge_instance_id IS NULL AND cancellation_ref IS NULL
+      AND cancellation_bridge_revision IS NULL AND cancellation_canceled_at_ms IS NULL
+      AND cancellation_proof_hash IS NULL)
+    OR
+    (local_revision > 1 AND previous_budget_id IS NOT NULL AND length(trim(previous_budget_id)) > 0
+      AND cancellation_budget_id = previous_budget_id AND cancellation_request_id = request_id
+      AND cancellation_bridge_instance_id IS NOT NULL AND length(trim(cancellation_bridge_instance_id)) > 0
+      AND cancellation_ref IS NOT NULL AND length(trim(cancellation_ref)) > 0
+      AND cancellation_bridge_revision IS NOT NULL AND cancellation_bridge_revision > 0
+      AND cancellation_canceled_at_ms IS NOT NULL AND cancellation_canceled_at_ms > 0
+      AND cancellation_proof_hash IS NOT NULL AND length(cancellation_proof_hash) > 0)
+  )
+);
+CREATE INDEX IF NOT EXISTS budget_authorization_revisions_by_request
+  ON budget_authorization_revisions(request_id, local_revision);
+CREATE TRIGGER IF NOT EXISTS budget_authorization_revisions_no_update
+  BEFORE UPDATE ON budget_authorization_revisions
+  BEGIN SELECT RAISE(ABORT, 'budget authorization revisions are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS budget_authorization_revisions_no_delete
+  BEFORE DELETE ON budget_authorization_revisions
+  BEGIN SELECT RAISE(ABORT, 'budget authorization revisions are append-only'); END;
+
+UPDATE quota_ledger
+SET authorization_revision = 1
+WHERE event_kind IN ('reserve','release','commit')
+  AND authorization_revision IS NULL
+  AND event_group_id IS NOT NULL
+  AND EXISTS (
+    SELECT 1 FROM quota_reservations reservation
+    JOIN budget_steps step ON step.reservation_id = reservation.id
+    WHERE reservation.event_group_id = quota_ledger.event_group_id
+  );
+CREATE UNIQUE INDEX IF NOT EXISTS quota_ledger_authorization_adjust_unique
+  ON quota_ledger(event_group_id, budget_account_id, authorization_revision)
+  WHERE event_kind = 'budget_authorization_adjust';
+
+CREATE TABLE IF NOT EXISTS legacy_execution_evidence (
+  request_id TEXT PRIMARY KEY REFERENCES requests(id),
+  api_key_id TEXT NOT NULL,
+  task_ref TEXT NOT NULL CHECK(length(trim(task_ref)) > 0),
+  terminal_state TEXT NOT NULL CHECK(terminal_state IN ('succeeded','failed','canceled')),
+  source_ref TEXT NOT NULL CHECK(length(trim(source_ref)) > 0),
+  observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms > 0),
+  recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms > 0)
+);
+CREATE INDEX IF NOT EXISTS legacy_execution_evidence_by_key_terminal
+  ON legacy_execution_evidence(api_key_id, terminal_state, observed_at_ms, request_id);
+CREATE TRIGGER IF NOT EXISTS legacy_execution_evidence_no_update
+  BEFORE UPDATE ON legacy_execution_evidence
+  BEGIN SELECT RAISE(ABORT, 'legacy execution evidence is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS legacy_execution_evidence_no_delete
+  BEFORE DELETE ON legacy_execution_evidence
+  BEGIN SELECT RAISE(ABORT, 'legacy execution evidence is append-only'); END;
+"#;

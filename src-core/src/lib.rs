@@ -7,6 +7,7 @@ mod admin_credentials;
 mod error;
 mod identity;
 mod jobs;
+mod legacy_execution;
 mod models;
 mod ports;
 mod quota;

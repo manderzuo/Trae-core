@@ -13,7 +13,7 @@ use crate::{
         SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V6_FINISH,
         SCHEMA_V7, SCHEMA_V8, SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
         SCHEMA_V16, SCHEMA_V17, SCHEMA_V19, SCHEMA_V20, SCHEMA_V21, SCHEMA_V22, SCHEMA_V23,
-        SCHEMA_V24, SCHEMA_V25,
+        SCHEMA_V24, SCHEMA_V25, SCHEMA_V26,
     },
     upstream::{
         account_health_decision, audit_hash, audit_identifier, audit_label,
@@ -23,12 +23,12 @@ use crate::{
     ApiKeySecretRecord, AuthError, CoreApiKeyAdminView, CoreError, CoreQuotaBalanceView, CoreUserAdminView, IssuedApiKey, LegacyMigrationBatch, LegacyMigrationResult, LeaseState,
     AdminCredentialRecord, AssetState, CoreAsset, CreateAssetInput, NewAdminCredential, NewUser, ObservationStatus, Principal, RegisterUpstreamAccount, UpstreamAccount,
     UpstreamAccountState, QuotaMigrationState, VideoBillingControl, VideoBillingControlInput,
-    VideoBillingMode, VideoDiagnosticClaim,
+    VideoBillingMode, VideoDiagnosticClaim, BudgetAuthorization, CreditAmount,
     UpstreamLease, UpstreamObservation, User,
 };
 
 pub const CORE_DB_FILE: &str = "core.sqlite3";
-pub const CURRENT_SCHEMA_VERSION: u32 = 25;
+pub const CURRENT_SCHEMA_VERSION: u32 = 26;
 pub const DEFAULT_API_KEY_MAX_CONCURRENCY: i64 = 32;
 
 pub struct CoreStore {
@@ -255,7 +255,7 @@ impl CoreStore {
             11 => {}
             12 => {}
             13 => {}
-            14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | CURRENT_SCHEMA_VERSION => Self::harden_v6_records(&transaction)?,
+            14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | CURRENT_SCHEMA_VERSION => Self::harden_v6_records(&transaction)?,
                 version => return Err(CoreError::UnsupportedSchemaVersion { version }),
             }
 
@@ -301,6 +301,54 @@ impl CoreStore {
             if version < 25 {
                 transaction.execute_batch(SCHEMA_V25).map_err(CoreError::migration)?;
             }
+            if version < 26 {
+                let authorization_history_existed: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='budget_authorization_revisions')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let execution_finish_column_exists: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('budget_operations') WHERE name='execution_finished_at_ms')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if !execution_finish_column_exists {
+                    transaction.execute_batch(
+                        "ALTER TABLE budget_operations ADD COLUMN execution_finished_at_ms INTEGER
+                         CHECK(execution_finished_at_ms IS NULL OR execution_finished_at_ms > 0)",
+                    ).map_err(CoreError::migration)?;
+                }
+                let authorization_revision_column_exists: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('quota_ledger') WHERE name='authorization_revision')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if !authorization_revision_column_exists {
+                    transaction.execute_batch(
+                        "ALTER TABLE quota_ledger ADD COLUMN authorization_revision INTEGER
+                         CHECK(authorization_revision IS NULL OR authorization_revision > 0)",
+                    ).map_err(CoreError::migration)?;
+                }
+                transaction.execute_batch(SCHEMA_V26).map_err(CoreError::migration)?;
+                if authorization_history_existed {
+                    let missing_initial_revisions: i64 = transaction.query_row(
+                        "SELECT COUNT(*) FROM budget_steps step
+                         WHERE NOT EXISTS (
+                           SELECT 1 FROM budget_authorization_revisions history
+                           WHERE history.request_id=step.request_id AND history.local_revision=1
+                         )",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    if missing_initial_revisions != 0 {
+                        return Err(CoreError::MigrationValidation {
+                            reason: "existing V26 authorization history is incomplete; refusing to reconstruct or overwrite it".into(),
+                        });
+                    }
+                } else {
+                    Self::backfill_v26_budget_authorization_revisions(&transaction)?;
+                }
+            }
             if version < CURRENT_SCHEMA_VERSION {
                 transaction
                     .execute(
@@ -324,6 +372,76 @@ impl CoreStore {
             restore_result?;
         }
         migration_result
+    }
+
+    fn backfill_v26_budget_authorization_revisions(
+        transaction: &rusqlite::Transaction<'_>,
+    ) -> Result<(), CoreError> {
+        let rows = {
+            let mut statement = transaction.prepare(
+                "SELECT step.request_id, step.budget_id, operation.parent_request_id,
+                        step.core_key_id, step.request_fingerprint, step.endpoint, step.model,
+                        step.account_ref, step.bridge_instance_id, step.profile_fingerprint,
+                        step.policy_version, step.authorization_hash, step.hold_microcredits,
+                        step.expires_at_ms, step.created_at_ms
+                 FROM budget_steps step
+                 JOIN budget_operations operation ON operation.operation_id = step.operation_id
+                 ORDER BY step.request_id",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?, row.get::<_, String>(10)?, row.get::<_, Vec<u8>>(11)?,
+                        row.get::<_, i64>(12)?, row.get::<_, i64>(13)?, row.get::<_, i64>(14)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for (
+            request_id, budget_id, parent_request_id, core_key_id, request_fingerprint,
+            endpoint, model, account_ref, bridge_instance_id, profile_fingerprint, policy_version,
+            authorization_hash, hold_microcredits, expires_at_ms, created_at_ms,
+        ) in rows
+        {
+            let hold_credits = CreditAmount::try_from_microcredits(hold_microcredits)
+                .ok_or(CoreError::InvalidQuotaAmount)?;
+            let authorization = BudgetAuthorization {
+                budget_id: budget_id.clone(),
+                parent_request_id,
+                request_id: request_id.clone(),
+                core_key_id,
+                request_fingerprint,
+                endpoint,
+                model,
+                account_ref,
+                bridge_instance_id,
+                profile_fingerprint,
+                policy_version,
+                hold_credits,
+                expires_at_ms,
+            };
+            transaction.execute(
+                "INSERT INTO budget_authorization_revisions
+                 (request_id, local_revision, budget_id, authorization_json, authorization_hash,
+                  hold_microcredits, previous_budget_id, cancellation_budget_id, cancellation_request_id,
+                  cancellation_bridge_instance_id, cancellation_ref, cancellation_bridge_revision,
+                  cancellation_canceled_at_ms, adopted_at_ms)
+                 VALUES (?1, 1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?6)",
+                params![
+                    request_id,
+                    budget_id,
+                    serde_json::to_string(&authorization)?,
+                    authorization_hash,
+                    hold_microcredits,
+                    created_at_ms,
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn schema_version(&self) -> Result<u32, CoreError> {

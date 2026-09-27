@@ -64,6 +64,7 @@ struct BudgetLedgerEvent {
     resource_kind: String,
     api_key_id: Option<String>,
     budget_version: Option<i64>,
+    authorization_revision: Option<i64>,
 }
 
 impl CoreStore {
@@ -1029,8 +1030,7 @@ impl CoreStore {
         let Some(hold_credits) = CreditAmount::try_from_microcredits(step.hold_microcredits) else {
             return Ok((false, "v2_step_hold_invalid".into()));
         };
-        let expected_authorization_hash = crate::canonical_json_hash(&serde_json::to_value(
-            crate::BudgetAuthorization {
+        let current_authorization = crate::BudgetAuthorization {
                 budget_id: step.budget_id.clone(),
                 parent_request_id: step.parent_request_id.clone(),
                 request_id: reservation.request_id.clone(),
@@ -1044,10 +1044,99 @@ impl CoreStore {
                 policy_version: step.policy_version.clone(),
                 hold_credits,
                 expires_at_ms: step.expires_at_ms,
-            },
-        )?);
+            };
+        let expected_authorization_hash = crate::canonical_json_hash(&serde_json::to_value(&current_authorization)?);
         if expected_authorization_hash.as_slice() != step.authorization_hash.as_slice() {
             return Ok((false, "v2_authorization_hash_mismatch".into()));
+        }
+
+        let (history_count, history_max): (i64, i64) = transaction.query_row(
+            "SELECT COUNT(*), COALESCE(MAX(local_revision), 0)
+             FROM budget_authorization_revisions WHERE request_id = ?1",
+            [&reservation.request_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if history_count <= 0 || history_count != history_max {
+            return Ok((false, "v2_authorization_revision_gap".into()));
+        }
+        let history_rows = {
+            let mut statement = transaction.prepare(
+                "SELECT local_revision, budget_id, authorization_json, authorization_hash,
+                        hold_microcredits, previous_budget_id, cancellation_budget_id,
+                        cancellation_request_id, cancellation_bridge_instance_id, cancellation_ref,
+                        cancellation_bridge_revision, cancellation_canceled_at_ms,
+                        cancellation_proof_hash, adopted_at_ms
+                 FROM budget_authorization_revisions WHERE request_id = ?1 ORDER BY local_revision",
+            )?;
+            let rows = statement.query_map([&reservation.request_id], |row| Ok((
+                row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?, row.get::<_, i64>(4)?, row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?, row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?, row.get::<_, Option<i64>>(10)?, row.get::<_, Option<i64>>(11)?,
+                row.get::<_, Option<Vec<u8>>>(12)?, row.get::<_, i64>(13)?,
+            )))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut prior_authorization: Option<crate::BudgetAuthorization> = None;
+        let mut revision_holds = Vec::with_capacity(history_rows.len());
+        for (index, row) in history_rows.iter().enumerate() {
+            let expected_revision = index as i64 + 1;
+            let authorization = match serde_json::from_str::<crate::BudgetAuthorization>(&row.2) {
+                Ok(value) => value,
+                Err(_) => return Ok((false, "v2_authorization_history_json_invalid".into())),
+            };
+            let history_hash = crate::canonical_json_hash(&serde_json::to_value(&authorization)?);
+            if row.0 != expected_revision
+                || row.1 != authorization.budget_id
+                || history_hash.as_slice() != row.3.as_slice()
+                || row.4 != authorization.hold_credits.as_microcredits()
+                || authorization.request_id != reservation.request_id
+                || authorization.parent_request_id != step.parent_request_id
+                || authorization.core_key_id != step.core_key_id
+                || authorization.request_fingerprint != step.request_fingerprint
+                || authorization.endpoint != step.endpoint
+                || authorization.model != step.model
+                || row.13 < 0
+            {
+                return Ok((false, "v2_authorization_history_fields_mismatch".into()));
+            }
+            if let Some(previous) = prior_authorization.as_ref() {
+                let (Some(cancel_ref), Some(bridge_revision), Some(canceled_at)) =
+                    (row.9.as_deref(), row.10, row.11)
+                else {
+                    return Ok((false, "v2_authorization_cancellation_proof_mismatch".into()));
+                };
+                let expected_proof_hash = crate::canonical_json_hash(&serde_json::json!({
+                    "budget_id": previous.budget_id,
+                    "request_id": reservation.request_id,
+                    "bridge_instance_id": previous.bridge_instance_id,
+                    "cancel_ref": cancel_ref,
+                    "revision": bridge_revision,
+                    "canceled_at_ms": canceled_at,
+                }));
+                if row.5.as_deref() != Some(previous.budget_id.as_str())
+                    || row.6.as_deref() != Some(previous.budget_id.as_str())
+                    || row.7.as_deref() != Some(reservation.request_id.as_str())
+                    || row.8.as_deref() != Some(previous.bridge_instance_id.as_str())
+                    || cancel_ref.is_empty()
+                    || bridge_revision <= 0
+                    || canceled_at <= 0
+                    || row.12.as_deref() != Some(expected_proof_hash.as_slice())
+                {
+                    return Ok((false, "v2_authorization_cancellation_proof_mismatch".into()));
+                }
+            } else if row.5.is_some() || row.6.is_some() || row.7.is_some() || row.8.is_some()
+                || row.9.is_some() || row.10.is_some() || row.11.is_some() || row.12.is_some()
+            {
+                return Ok((false, "v2_initial_authorization_history_invalid".into()));
+            }
+            revision_holds.push(row.4);
+            prior_authorization = Some(authorization);
+        }
+        if prior_authorization.as_ref() != Some(&current_authorization)
+            || revision_holds.last().copied() != Some(reservation.amount)
+        {
+            return Ok((false, "v2_current_authorization_history_mismatch".into()));
         }
         match step.kind.as_str() {
             "assist" => {
@@ -1136,7 +1225,7 @@ impl CoreStore {
         let events = {
             let mut statement = transaction.prepare(
                 "SELECT budget_account_id, event_kind, amount, delta, request_id,
-                        user_id, resource_kind, api_key_id, budget_version
+                        user_id, resource_kind, api_key_id, budget_version, authorization_revision
                  FROM quota_ledger WHERE event_group_id = ?1 ORDER BY entry_id",
             )?;
             let rows = statement.query_map([event_group_id], |row| {
@@ -1150,15 +1239,18 @@ impl CoreStore {
                     resource_kind: row.get(6)?,
                     api_key_id: row.get(7)?,
                     budget_version: row.get(8)?,
+                    authorization_revision: row.get(9)?,
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        let expected_event_count = account_ids.len() * (1 + usize::from(final_kind.is_some()));
+        let adjustment_revision_count = revision_holds.len().saturating_sub(1);
+        let expected_event_count = account_ids.len() * (1 + adjustment_revision_count + usize::from(final_kind.is_some()));
         if events.len() != expected_event_count {
             return Ok((false, "v2_ledger_event_count_mismatch".into()));
         }
         let mut reserve_versions = vec![None; account_ids.len()];
+        let mut adjustment_versions = vec![vec![None; account_ids.len()]; revision_holds.len()];
         let mut final_versions = vec![None; account_ids.len()];
         for event in &events {
             let Some(event_account_id) = event.account_id.as_deref() else {
@@ -1180,13 +1272,35 @@ impl CoreStore {
                 return Ok((false, "v2_ledger_event_owner_or_version_mismatch".into()));
             }
             match event.event_kind.as_str() {
-                "reserve" if event.amount == reservation.amount && event.delta == -reservation.amount => {
+                "reserve"
+                    if event.authorization_revision == Some(1)
+                        && event.amount == revision_holds[0]
+                        && event.delta == -revision_holds[0] =>
+                {
                     if reserve_versions[account_index].replace(event_version).is_some() {
                         return Ok((false, "reserve_event_missing_or_duplicate".into()));
                     }
                 }
+                "budget_authorization_adjust" => {
+                    let Some(revision) = event.authorization_revision else {
+                        return Ok((false, "v2_adjustment_revision_missing".into()));
+                    };
+                    if revision < 2 || revision as usize > revision_holds.len() {
+                        return Ok((false, "v2_adjustment_revision_invalid".into()));
+                    }
+                    let old_hold = revision_holds[revision as usize - 2];
+                    let new_hold = revision_holds[revision as usize - 1];
+                    let delta = old_hold.checked_sub(new_hold).ok_or(CoreError::InvalidQuotaAmount)?;
+                    let amount = delta.checked_abs().ok_or(CoreError::InvalidQuotaAmount)?;
+                    if event.amount != amount || event.delta != delta
+                        || adjustment_versions[revision as usize - 1][account_index].replace(event_version).is_some()
+                    {
+                        return Ok((false, "v2_adjustment_event_mismatch".into()));
+                    }
+                }
                 "release"
                     if final_kind == Some("release")
+                        && event.authorization_revision == Some(history_max)
                         && event.amount == reservation.amount
                         && event.delta == reservation.amount =>
                 {
@@ -1196,6 +1310,7 @@ impl CoreStore {
                 }
                 "commit"
                     if final_kind == Some("commit")
+                        && event.authorization_revision == Some(history_max)
                         && Some(event.amount) == step.actual_microcredits
                         && step.hold_microcredits.checked_sub(event.amount) == Some(event.delta) =>
                 {
@@ -1210,11 +1325,21 @@ impl CoreStore {
             let Some(reserve_version) = reserve_versions[index] else {
                 return Ok((false, "reserve_event_missing_or_duplicate".into()));
             };
+            let mut prior_version = reserve_version;
+            for revision in 1..revision_holds.len() {
+                let Some(adjustment_version) = adjustment_versions[revision][index] else {
+                    return Ok((false, "v2_adjustment_event_missing_or_duplicate".into()));
+                };
+                if adjustment_version <= prior_version {
+                    return Ok((false, "v2_adjustment_event_version_order_mismatch".into()));
+                }
+                prior_version = adjustment_version;
+            }
             if final_kind.is_some() {
                 let Some(final_version) = final_versions[index] else {
                     return Ok((false, "settlement_event_missing_or_duplicate".into()));
                 };
-                if final_version < reserve_version {
+                if final_version < prior_version {
                     return Ok((false, "v2_ledger_event_version_order_mismatch".into()));
                 }
             }
@@ -1977,7 +2102,7 @@ impl CoreStore {
         Ok(())
     }
 
-    fn advance_budget_account(
+    pub(crate) fn advance_budget_account(
         transaction: &Transaction<'_>,
         account_id: &str,
         now: i64,
@@ -3375,6 +3500,30 @@ impl CoreStore {
                 reservation.api_key_id.as_deref(),
                 user_version,
             )?;
+        }
+        if matches!(event_kind, "release" | "commit") {
+            let history_table_exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='budget_authorization_revisions')",
+                [],
+                |row| row.get(0),
+            )?;
+            let local_revision: Option<i64> = if history_table_exists {
+                transaction.query_row(
+                    "SELECT MAX(local_revision) FROM budget_authorization_revisions WHERE request_id = ?1",
+                    [&reservation.request_id],
+                    |row| row.get(0),
+                )?
+            } else {
+                None
+            };
+            if let Some(local_revision) = local_revision {
+                transaction.execute(
+                    "UPDATE quota_ledger SET authorization_revision = ?1
+                     WHERE event_group_id = ?2 AND request_id = ?3 AND event_kind = ?4
+                       AND authorization_revision IS NULL",
+                    rusqlite::params![local_revision, event_group_id, &reservation.request_id, event_kind],
+                )?;
+            }
         }
         Ok(())
     }
