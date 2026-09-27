@@ -15,7 +15,9 @@ pub(crate) fn fail(code:&str)->Response {
         "key_concurrency_exceeded"|"video_download_busy"|"budget_preparation_busy"|"bridge_workers_busy"|"reference_upload_limited"=>StatusCode::TOO_MANY_REQUESTS,
         "quota_insufficient"=>StatusCode::PAYMENT_REQUIRED,
         "video_not_ready"|"budget_identity_conflict"=>StatusCode::CONFLICT,
-        "invalid_budget_business_request"|"invalid_chat_image"=>StatusCode::BAD_REQUEST,
+        "invalid_budget_business_request"|"invalid_chat_image"|"reference_video_metadata_invalid"|
+        "reference_video_format_unsupported"|"reference_asset_type_mismatch"|
+        "reference_asset_unavailable"|"reference_video_budget_metadata_required"=>StatusCode::BAD_REQUEST,
         "budget_chat_input_too_large"=>StatusCode::PAYLOAD_TOO_LARGE,
         _=>StatusCode::SERVICE_UNAVAILABLE,
     };
@@ -34,6 +36,9 @@ mod error_tests {
         assert_eq!(fail("budget_policy_unconfigured").status(),StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(fail("invalid_chat_image").status(),StatusCode::BAD_REQUEST);
         assert_eq!(fail("budget_chat_input_too_large").status(),StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(fail("reference_video_metadata_invalid").status(),StatusCode::BAD_REQUEST);
+        assert_eq!(fail("reference_video_format_unsupported").status(),StatusCode::BAD_REQUEST);
+        assert_eq!(fail("reference_asset_type_mismatch").status(),StatusCode::BAD_REQUEST);
     }
 }
 fn post(client:&BridgeClient,path:&str,body:&Value,request:&str)->Result<Value,String> {
