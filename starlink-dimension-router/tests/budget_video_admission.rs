@@ -127,6 +127,26 @@ async fn orphaned_helper_text_completion_releases_parent_without_client_retry() 
 async fn background_restarts_video_from_encrypted_checkpoint_without_a_second_client_request() {
     run_case_options(true,false,true,false,true,true).await;
 }
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn corrupt_checkpoint_does_not_block_other_background_jobs() {
+    run_case_with_fault(true,false,true,false,true,true,BackgroundFault::CorruptNeighbor).await;
+}
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn background_does_not_dispatch_after_key_revocation() {
+    run_case_with_fault(true,false,true,false,true,true,BackgroundFault::RevokedKey).await;
+}
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn background_does_not_dispatch_after_video_scope_removed() {
+    run_case_with_fault(true,false,true,false,true,true,BackgroundFault::RemovedScope).await;
+}
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn background_and_http_retry_share_one_paid_video_dispatch() {
+    run_case_with_fault(true,false,true,false,true,true,BackgroundFault::HttpRace).await;
+}
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn background_discards_aged_completed_input_without_changing_pending_billing() {
+    run_case_with_fault(true,false,false,false,false,false,BackgroundFault::Cleanup).await;
+}
 #[tokio::test]
 async fn chat_inline_reference_is_uploaded_and_bound_to_video_preparation() {run_case_with_reference(true,false,true,true).await;}
 async fn run_case(probe:bool,stream:bool,video_intent:bool) {
@@ -136,12 +156,18 @@ async fn run_case_with_reference(probe:bool,stream:bool,video_intent:bool,refere
     run_case_options(probe,stream,video_intent,reference,false,false).await;
 }
 async fn run_case_options(probe:bool,stream:bool,video_intent:bool,reference:bool,resume_helper:bool,background_only:bool) {
+    run_case_with_fault(probe,stream,video_intent,reference,resume_helper,background_only,BackgroundFault::None).await;
+}
+#[derive(Clone,Copy,PartialEq,Eq)]
+enum BackgroundFault {None,CorruptNeighbor,RevokedKey,RemovedScope,HttpRace,Cleanup}
+async fn run_case_with_fault(probe:bool,stream:bool,video_intent:bool,reference:bool,resume_helper:bool,background_only:bool,fault:BackgroundFault) {
+    let corrupt_neighbor=fault==BackgroundFault::CorruptNeighbor;
     let dir=Directory(std::env::temp_dir().join(format!("core-public-budget-{:032x}",rand::random::<u128>())));
     let store=Arc::new(CoreStore::open(dir.path()).unwrap());store.migrate().unwrap();
     store.create_user(NewUser {id:"admin".into(),name:"Admin".into(),role:UserRole::Admin},"bootstrap").unwrap();
     store.create_user(NewUser {id:"user".into(),name:"User".into(),role:UserRole::User},"admin").unwrap();
     let a=store.issue_api_key("admin","admin",BTreeSet::from(["admin:*".into()]),"bootstrap").unwrap();let admin=store.authenticate_api_key(&a.plaintext).unwrap();
-    let k=store.issue_api_key_as_admin_with_max_concurrency("user","Key",BTreeSet::from(["videos:submit".into(),"assets:write".into()]),1,&admin).unwrap();
+    let k=store.issue_api_key_as_admin_with_max_concurrency("user","Key",BTreeSet::from(["videos:submit".into(),"assets:write".into()]),if corrupt_neighbor {2} else {1},&admin).unwrap();
     store.key_quota_grant_as_admin(&admin,KeyQuotaGrant {api_key_id:k.id.clone(),resource_kind:"credits".into(),amount:100_000_000,actor_user_id:"admin".into(),reason:"isolated test".into()}).unwrap();
     store.set_video_billing_control(aiwork_core::VideoBillingControlInput {mode:aiwork_core::VideoBillingMode::Active,reason:"fixture".into(),diagnostic_key_id:None,diagnostic_request_hash:None}).unwrap();
     let bridge=Arc::new(Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent,large_downloads:std::sync::atomic::AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0))});
@@ -191,11 +217,38 @@ async fn run_case_options(probe:bool,stream:bool,video_intent:bool,reference:boo
         }).unwrap();
         for _ in 0..2 {starlink_dimension_router::user_routes::reconcile_pending_billing_requests_once(&state);}
         if video_intent {
+            if corrupt_neighbor {
+                use aiwork_core::{BeginRequest,BeginRequestInput,BudgetAuthorization,BudgetStepInput,BudgetStepKind,CreditAmount};
+                let BeginRequest::Created(parent)=store.begin_billed_request(BeginRequestInput {user_id:principal.user_id.clone(),api_key_id:principal.key_id.clone(),protocol:"openai".into(),endpoint:"videos".into(),model:"seedance".into(),idempotency_key:"corrupt-neighbor".into(),body:input.clone()}).unwrap() else {panic!("parent")};
+                let BeginRequest::Created(child)=store.begin_budget_assist_request(&parent.id,BeginRequestInput {user_id:principal.user_id.clone(),api_key_id:principal.key_id.clone(),protocol:"openai".into(),endpoint:"chat".into(),model:"deepseek-v4-flash".into(),idempotency_key:format!("budget-assist:{}",parent.id),body:json!({"messages":[]})}).unwrap() else {panic!("child")};
+                bridge.claims.lock().unwrap().insert(child.id.clone(),json!({"parent_request_id":parent.id,"request_id":child.id,"core_key_id":principal.key_id,"step_kind":"assist"}));
+                let budget=format!("budget-{}",child.id);
+                store.begin_budget_operation(&parent.id,BudgetStepInput {kind:BudgetStepKind::Assist,authorization:BudgetAuthorization {
+                    budget_id:budget.clone(),parent_request_id:parent.id.clone(),request_id:child.id.clone(),core_key_id:principal.key_id.clone(),
+                    request_fingerprint:store.request_fingerprint_for_billing(&child.id).unwrap(),endpoint:"chat".into(),model:"deepseek-v4-flash".into(),account_ref:"account".into(),bridge_instance_id:"instance".into(),profile_fingerprint:"normalized-profile".into(),policy_version:"fixture".into(),hold_credits:CreditAmount::parse("2","credits").unwrap(),expires_at_ms:chrono::Utc::now().timestamp_millis()+60_000
+                }}).unwrap();
+                store.mark_budget_step_dispatched(&child.id,&budget).unwrap();store.mark_budget_step_execution(&child.id,aiwork_core::BudgetExecutionState::Succeeded).unwrap();
+                let context=format!("budget-continuation-v1:{}:{}:{}",parent.id,principal.key_id,store.request_fingerprint_for_billing(&parent.id).unwrap());
+                let encrypted=state.key_vault.encrypt(&context,&input.to_string()).unwrap();
+                store.save_budget_continuation(&principal,&parent.id,&input,encrypted.key_version,&encrypted.ciphertext).unwrap();
+                let db=rusqlite::Connection::open(dir.path().join("data").join(aiwork_core::CORE_DB_FILE)).unwrap();
+                db.execute("UPDATE budget_continuations SET request_hash=?1 WHERE request_id=?2",rusqlite::params![vec![1u8;32],parent.id]).unwrap();
+            }
+            if matches!(fault,BackgroundFault::RevokedKey|BackgroundFault::RemovedScope) {
+                let db=rusqlite::Connection::open(dir.path().join("data").join(aiwork_core::CORE_DB_FILE)).unwrap();
+                if fault==BackgroundFault::RevokedKey {db.execute("UPDATE api_keys SET status='revoked' WHERE id=?1",[&k.id]).unwrap();}
+                else {db.execute("UPDATE api_keys SET scopes_json='[\"models:read\"]' WHERE id=?1",[&k.id]).unwrap();}
+            }
             let _router=starlink_dimension_router::server::build_router(state.clone());
+            if fault==BackgroundFault::HttpRace {
+                let r=user_routes::chat_completions(State(state.clone()),headers.clone(),Extension(principal.clone()),body.clone()).await;
+                assert!(matches!(r.status(),StatusCode::OK|StatusCode::TOO_MANY_REQUESTS));
+                let _=axum::body::to_bytes(r.into_body(),65536).await.unwrap();
+            }
             tokio::time::timeout(std::time::Duration::from_secs(5),async {
-                while store.active_execution_count_for_key(&k.id).unwrap()!=0 {tokio::time::sleep(std::time::Duration::from_millis(20)).await;}
+                while store.active_execution_count_for_key(&k.id).unwrap()!=if corrupt_neighbor {1} else {0} {tokio::time::sleep(std::time::Duration::from_millis(20)).await;}
             }).await.expect("persisted successful helper must continue without client retry");
-            assert_eq!(bridge.sends.load(Ordering::SeqCst),1,"only the not-yet-started video may be dispatched");
+            assert_eq!(bridge.sends.load(Ordering::SeqCst),if matches!(fault,BackgroundFault::RevokedKey|BackgroundFault::RemovedScope) {0} else {1},"only an authorized not-yet-started video may be dispatched once");
             return;
         }
         assert_eq!(store.active_execution_count_for_key(&k.id).unwrap(),0,"finished text-only helper must not leave its parent occupying the sole execution slot");
@@ -230,6 +283,20 @@ async fn run_case_options(probe:bool,stream:bool,video_intent:bool,reference:boo
             let video=claims.values().find(|c|c["step_kind"]=="video").unwrap();
             assert_eq!(video["body"]["image_asset_ids"],json!(["bridge-image"]),"the prepared video must contain the uploaded reference, never discard it");
             assert!(!claims.values().find(|c|c["step_kind"]=="assist").unwrap().to_string().contains("iVBOR"),"binary references must not enter the text-only helper");
+        }
+        if fault==BackgroundFault::Cleanup {
+            let id=bridge.claims.lock().unwrap().values().next().unwrap()["parent_request_id"].as_str().unwrap().to_owned();
+            let before=store.budget_operation(&id).unwrap();
+            let db=rusqlite::Connection::open(dir.path().join("data").join(aiwork_core::CORE_DB_FILE)).unwrap();
+            let old=chrono::Utc::now().timestamp_millis()-86_400_001;
+            db.execute("UPDATE budget_operations SET execution_finished_at_ms=?1 WHERE parent_request_id=?2",rusqlite::params![old,id]).unwrap();
+            db.execute("UPDATE budget_continuations SET created_at_ms=?1 WHERE request_id=?2",rusqlite::params![old,id]).unwrap();
+            let _router=starlink_dimension_router::server::build_router(state.clone());
+            tokio::time::timeout(std::time::Duration::from_secs(5),async {
+                while store.budget_continuation(&id).unwrap().is_some() {tokio::time::sleep(std::time::Duration::from_millis(20)).await;}
+            }).await.expect("completed temporary input must be pruned by background maintenance");
+            assert_eq!(store.budget_operation(&id).unwrap(),before,"financial state and results are independent of temporary input retention");
+            assert_eq!(bridge.sends.load(Ordering::SeqCst),1,"maintenance must not dispatch paid requests");
         }
         return;
     }

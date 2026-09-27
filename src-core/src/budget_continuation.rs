@@ -18,6 +18,21 @@ impl BudgetContinuation {
     }
 }
 impl CoreStore {
+    /// Drop only temporary input ciphertext after a completed execution has
+    /// aged for a day. Financial holds/receipts, results and unknown work are
+    /// independent records and must not be changed by this retention policy.
+    pub fn prune_completed_budget_continuations(&self,now_ms:i64,limit:usize)->Result<usize,CoreError> {
+        if !(1..=100).contains(&limit) {return Err(CoreError::Validation {field:"continuation.limit".into(),reason:"must be 1..100".into()});}
+        let Some(cutoff)=now_ms.checked_sub(86_400_000) else {return Ok(0)};
+        let connection=self.connection.lock().expect("core store mutex poisoned");
+        Ok(connection.execute("DELETE FROM budget_continuations WHERE request_id IN (
+            SELECT c.request_id FROM budget_continuations c
+            JOIN budget_operations o ON o.parent_request_id=c.request_id
+            WHERE o.execution_state IN ('succeeded','failed','canceled')
+              AND o.execution_finished_at_ms<?1 AND c.created_at_ms<?1
+            ORDER BY o.execution_finished_at_ms,c.request_id LIMIT ?2)",params![cutoff,limit as i64])?)
+    }
+
     /// Bounded rotation; crypto runs outside the SQLite lock. Call again while
     /// remaining > 0, and keep prior vault keys until every record is rewrapped.
     pub fn rewrap_budget_continuations_as_admin<F>(&self,principal:&Principal,target:u32,mut rewrap:F)->Result<(usize,usize),CoreError>
@@ -80,6 +95,14 @@ impl CoreStore {
     }
 
     pub fn pending_budget_continuations_after(&self,after:&str,limit:usize)->Result<Vec<BudgetContinuation>,CoreError> {
+        let ids=self.pending_budget_continuation_ids_after(after,limit)?;
+        let connection=self.connection.lock().expect("core store mutex poisoned");
+        ids.into_iter().map(|id|continuation_in_connection(&connection,&id)?.ok_or(CoreError::RequestNotFound {request_id:id})).collect()
+    }
+
+    /// Enumerate identities before loading protected data. One damaged row must
+    /// not prevent a bounded worker from advancing to unrelated requests.
+    pub fn pending_budget_continuation_ids_after(&self,after:&str,limit:usize)->Result<Vec<String>,CoreError> {
         if !(1..=100).contains(&limit) {return Err(CoreError::Validation {field:"continuation.limit".into(),reason:"must be 1..100".into()});}
         let connection=self.connection.lock().expect("core store mutex poisoned");
         let mut stmt=connection.prepare("SELECT c.request_id FROM budget_continuations c
@@ -89,7 +112,7 @@ impl CoreStore {
             AND NOT EXISTS(SELECT 1 FROM budget_steps s WHERE s.operation_id=o.operation_id AND s.kind='video')
             ORDER BY c.request_id LIMIT ?2")?;
         let ids=stmt.query_map(params![after,limit as i64],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        ids.into_iter().map(|id|continuation_in_connection(&connection,&id)?.ok_or(CoreError::RequestNotFound {request_id:id})).collect()
+        Ok(ids)
     }
 }
 fn continuation_in_connection(connection:&Connection,request:&str)->Result<Option<BudgetContinuation>,CoreError> {
