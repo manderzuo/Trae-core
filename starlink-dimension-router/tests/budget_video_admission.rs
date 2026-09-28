@@ -344,6 +344,84 @@ async fn completed_video_stream_calls_client_download_tool_and_receipt_never_reg
     let bash_result:Value=serde_json::from_slice(&axum::body::to_bytes(bash_retry.into_body(),131072).await.unwrap()).unwrap();
     assert_eq!(bash_result["choices"][0]["message"]["tool_calls"][0]["function"]["name"],"Bash");
     assert_eq!(bridge.sends.load(Ordering::SeqCst),before+1,"same schema reuses its planner; a different tool schema has one bounded plan");
+    let pwsh_tool=json!({"type":"function","function":{"name":"pwsh","description":"Execute a PowerShell command","parameters":{"type":"object","required":["command","description"],"properties":{"command":{"type":"string"},"description":{"type":"string"},"workdir":{"type":"string"},"timeoutMs":{"type":"number"}}}}});
+    for _ in 0..2 {
+        let response=router.clone().oneshot(axum::http::Request::builder().method("POST").uri(format!("/v1/videos/{request}/delivery"))
+            .header("authorization",format!("Bearer {}",k.plaintext)).header("content-type","application/json")
+            .body(axum::body::Body::from(json!({"stream":true,"tools":[pwsh_tool]}).to_string())).unwrap()).await.unwrap();
+        let wire=String::from_utf8(axum::body::to_bytes(response.into_body(),131072).await.unwrap().to_vec()).unwrap();
+        let frame:Value=serde_json::from_str(wire.lines().find_map(|s|s.strip_prefix("data: ")).unwrap()).unwrap();
+        let native=&frame["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(native["function"]["name"],"pwsh");
+        let args:Value=serde_json::from_str(native["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["description"],"Download completed Seedance video to system Downloads");
+        assert!(args["command"].as_str().unwrap().contains("$deliveryUrl = "));
+        assert!(!args["command"].as_str().unwrap().contains(&k.plaintext));
+    }
+    assert_eq!(bridge.sends.load(Ordering::SeqCst),before+2,"native terminal retries reuse the billed planner; no video is regenerated");
+    let restricted=json!({"type":"function","function":{"name":"bash","description":"Run commands in a bash shell (Git Bash on Windows). You don't have access to the internet via this tool.","parameters":{"type":"object","required":["command"],"properties":{"command":{"type":"string"},"workdir":{"type":"string"}}}}});
+    let blocked=router.clone().oneshot(axum::http::Request::builder().method("POST").uri(format!("/v1/videos/{request}/delivery"))
+        .header("authorization",format!("Bearer {}",k.plaintext)).header("content-type","application/json")
+        .body(axum::body::Body::from(json!({"tools":[restricted]}).to_string())).unwrap()).await.unwrap();
+    let blocked:Value=serde_json::from_slice(&axum::body::to_bytes(blocked.into_body(),131072).await.unwrap()).unwrap();
+    assert_eq!(blocked["video_delivery"]["reason"],"client_network_restricted");
+    assert!(blocked["choices"][0]["message"]["tool_calls"].is_null(),"never bypass an explicitly restricted terminal");
+    assert_eq!(bridge.sends.load(Ordering::SeqCst),before+2,"unavailable local tools must not consume another helper budget");
+    let search_tool=json!({"type":"function","function":{"name":"dev_tool_search","description":"Discover and unlock tools not currently available.","parameters":{"type":"object","required":[],"properties":{"query":{"type":"string"},"toolNames":{"type":"array","items":{"type":"string"}}}}}});
+    let discover_input=json!({"tools":[restricted,search_tool]});
+    let discovered=router.clone().oneshot(axum::http::Request::builder().method("POST").uri(format!("/v1/videos/{request}/delivery"))
+        .header("authorization",format!("Bearer {}",k.plaintext)).header("content-type","application/json")
+        .body(axum::body::Body::from(discover_input.to_string())).unwrap()).await.unwrap();
+    let discovered:Value=serde_json::from_slice(&axum::body::to_bytes(discovered.into_body(),131072).await.unwrap()).unwrap();
+    let find_call=&discovered["choices"][0]["message"]["tool_calls"][0];
+    assert_eq!(find_call["function"]["name"],"dev_tool_search","discover permitted tools instead of bypassing the restricted Bash");
+    let find_args:Value=serde_json::from_str(find_call["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(find_args["query"],"powershell");
+    assert!(!find_args.to_string().contains("ticket="));
+    let search_follow=json!({"model":"seedance","tools":[restricted,search_tool],"messages":[
+        {"role":"assistant","tool_calls":[find_call]},
+        {"role":"tool","tool_call_id":find_call["id"],"content":"Matching tools (1):\n- pwsh: Execute a PowerShell command\nUnlock with dev_tool_search."}]});
+    let unlocked=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(principal.clone()),Bytes::from(search_follow.to_string())).await;
+    assert_eq!(unlocked.status(),StatusCode::OK);
+    let unlocked:Value=serde_json::from_slice(&axum::body::to_bytes(unlocked.into_body(),131072).await.unwrap()).unwrap();
+    let unlock_call=&unlocked["choices"][0]["message"]["tool_calls"][0];
+    assert_eq!(unlock_call["function"]["name"],"dev_tool_search");
+    let unlock_args:Value=serde_json::from_str(unlock_call["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(unlock_args["toolNames"],json!(["pwsh"]));
+    let unlock_follow=json!({"model":"seedance","tools":[restricted,search_tool,pwsh_tool],"messages":[
+        {"role":"assistant","tool_calls":[unlock_call]},
+        {"role":"tool","tool_call_id":unlock_call["id"],"content":"Unlocked for the next request: pwsh"}]});
+    let ready=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(principal.clone()),Bytes::from(unlock_follow.to_string())).await;
+    assert_eq!(ready.status(),StatusCode::OK);
+    let ready:Value=serde_json::from_slice(&axum::body::to_bytes(ready.into_body(),131072).await.unwrap()).unwrap();
+    assert_eq!(ready["choices"][0]["message"]["tool_calls"][0]["function"]["name"],"pwsh");
+    let mut no_unlock=unlock_follow.clone();no_unlock["tools"]=json!([restricted,search_tool]);
+    let stopped=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(principal.clone()),Bytes::from(no_unlock.to_string())).await;
+    assert_eq!(stopped.status(),StatusCode::OK);
+    let stopped:Value=serde_json::from_slice(&axum::body::to_bytes(stopped.into_body(),131072).await.unwrap()).unwrap();
+    assert_eq!(stopped["choices"][0]["finish_reason"],"stop","failed discovery is bounded, not an endless tool loop");
+    assert_eq!(stopped["video_delivery"]["reason"],"client_network_restricted");
+    assert_eq!(bridge.sends.load(Ordering::SeqCst),before+2,"discovery and same-schema delivery reuse the completed video and planner");
+    for (content, expected) in [
+        (json!({"data":{"stdout":format!("SEEDANCE_DELIVERY_RECEIPT={receipt}"),"exitCode":0}}),"saved"),
+        (json!({"stdout":format!("SEEDANCE_DELIVERY_RECEIPT={receipt}"),"exitCode":1}),"download_failed"),
+        (json!({"stdout":format!("SEEDANCE_DELIVERY_RECEIPT={receipt}"),"isError":true}),"download_failed"),
+        (json!(format!("SEEDANCE_DELIVERY_RECEIPT={receipt}\n[exit code: 1]")),"download_failed"),
+        (json!({"stdout":format!("SEEDANCE_DELIVERY_RECEIPT={receipt}"),"exitCode":0,"timedOut":true}),"download_failed"),
+        (json!({"stdout":format!("SEEDANCE_DELIVERY_RECEIPT={receipt}"),"exitCode":0,"sandbox":{"denied":true}}),"download_failed"),
+    ] {
+        let follow=json!({"model":"seedance","messages":[{"role":"tool","tool_call_id":call["id"],"content":content}]});
+        let result=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(principal.clone()),Bytes::from(follow.to_string())).await;
+        assert_eq!(result.status(),StatusCode::OK);
+        let value:Value=serde_json::from_slice(&axum::body::to_bytes(result.into_body(),65536).await.unwrap()).unwrap();
+        assert_eq!(value["video_delivery"]["status"],expected);
+    }
+    let block_result=json!({"model":"seedance","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":call["id"],"content":[{"type":"text","text":format!("SEEDANCE_DELIVERY_RECEIPT={receipt}")}]}]}]});
+    let result=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(principal.clone()),Bytes::from(block_result.to_string())).await;
+    assert_eq!(result.status(),StatusCode::OK,"structured client tool replies must be handled before video intent parsing");
+    let value:Value=serde_json::from_slice(&axum::body::to_bytes(result.into_body(),65536).await.unwrap()).unwrap();
+    assert_eq!(value["video_delivery"]["status"],"saved");
+    assert_eq!(bridge.sends.load(Ordering::SeqCst),before+2);
     let args:Value=serde_json::from_str(retried["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
     let command=args["command"].as_str().unwrap();
     let url=command.lines().find(|l|l.starts_with("$deliveryUrl = ")).unwrap().trim_start_matches("$deliveryUrl = '").trim_end_matches('\'');
@@ -368,6 +446,8 @@ async fn completed_video_stream_calls_client_download_tool_and_receipt_never_reg
         assert_eq!(r.status(),StatusCode::NOT_FOUND,"expired or wrong-Key ticket must be refused");
     }
     let foreign=store.issue_api_key_as_admin_with_max_concurrency("user","Other",BTreeSet::from(["videos:submit".into()]),1,&admin).unwrap();
+    let discovery_rejected=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(store.authenticate_api_key(&foreign.plaintext).unwrap()),Bytes::from(search_follow.to_string())).await;
+    assert_eq!(discovery_rejected.status(),StatusCode::BAD_REQUEST,"tool discovery retains the completed video's Key ownership");
     let rejected=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(store.authenticate_api_key(&foreign.plaintext).unwrap()),Bytes::from(rewritten.to_string())).await;
     assert_eq!(rejected.status(),StatusCode::BAD_REQUEST,"rewritten receipt must retain strict Key ownership");
     let r=router.clone().oneshot(axum::http::Request::builder().method("POST").uri(format!("/v1/videos/{request}/delivery"))
@@ -379,7 +459,7 @@ async fn completed_video_stream_calls_client_download_tool_and_receipt_never_reg
         let r=router.clone().oneshot(axum::http::Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap()).await.unwrap();
         assert_eq!(r.status(),StatusCode::NOT_FOUND,"current Key status/scope must win over a previously issued ticket");
     }
-    assert_eq!(bridge.sends.load(Ordering::SeqCst),before+1,"delivery/download/authorization failures have no new video dispatch");
+    assert_eq!(bridge.sends.load(Ordering::SeqCst),before+2,"delivery/download/authorization failures have no new video dispatch");
 }
 #[tokio::test]
 async fn model_add_probe_uses_bounded_helper_and_does_not_generate_a_video() {

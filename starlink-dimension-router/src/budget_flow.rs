@@ -274,7 +274,7 @@ pub(crate) async fn video_content(state:Arc<StarlinkRouterState>,principal:Princ
 
 pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Principal,headers:axum::http::HeaderMap,body:Value)->Response {
     use aiwork_core::{BeginRequest,BeginRequestInput};
-    if let Some(response)=crate::video_delivery::follow_up(&state,&principal,&body) {return response;}
+    if let Some(response)=crate::video_delivery::follow_up(&state,&principal,&body).await {return response;}
     if crate::user_routes::extract_seedance_prompt(&body).is_err() {return (StatusCode::BAD_REQUEST,Json(json!({"error":{"code":"seedance_prompt_missing"}}))).into_response();}
     let images=match inline_images(&body) {Ok(images)=>images,Err(code)=>return (StatusCode::BAD_REQUEST,Json(json!({"error":{"code":code}}))).into_response()};
     if !images.is_empty() && !principal.scopes.contains("assets:write") && !principal.scopes.contains("admin:*") {

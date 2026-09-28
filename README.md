@@ -124,11 +124,13 @@ schema 26 与新 v2 账本的恢复规则：一旦新 v2 账本已写入任何�
 
 ### Seedance 流式客户端
 
-#### 视频自动保存到客户端工作区（2026-09-28）
+#### 视频自动保存到客户端系统 Downloads（2026-09-28）
 
-当前 V2 Seedance Chat 完成后，若客户端声明 Trae Work 的 `RunCommand` / PowerShell 工具且未设置 `tool_choice=none`，Core 返回标准 `tool_calls`（SSE 带 `index`、`finish_reason=tool_calls` 和 `[DONE]`）。客户端执行短期授权下载命令，将 MP4 保存到系统上下文的 final workspace；没有该路径时使用客户端当前终端目录。工具结果返回后，Core 确认客户端报告的保存路径，不再调用文字模型或视频模型，不产生新生成费用。
+当前 V2 Seedance Chat 完成后，Core 使用 `glm-5.3-flash` 选择客户端声明的本地终端，返回标准 `tool_calls`（SSE 带 `index`、`finish_reason=tool_calls` 和 `[DONE]`）。适配 Trae Work `RunCommand`、DeepSeek Harness `pwsh` / `bash`，以及明确声明 PowerShell 或 Bash 的 `exec_command` / `run_terminal_command`。支持原生工具必填的 `description`，不会因终端排在工具列表第 32 项之后而丢弃它。客户端执行短期授权下载命令，将 MP4 保存到操作系统 Downloads（含 Windows 重定向目录），不需要安装我们的 MCP/Skill 脚本。保存成功只根据客户端回执报告，不伪称服务器能够检查远端文件。
 
-命令采用唯一临时文件、五分钟超时、最大 4 GiB、MP4 头检查、原子移动与不覆盖策略。失败只清理本次临时文件；客户端拒绝工具或没有适配工具时返回下载链接，不伪称已落地。仅核验了 Trae Work `RunCommand` 契约，其他 Agent 工具需独立适配；不能保证所有客户端都自动执行。
+命令采用唯一临时文件、五分钟超时、最大 4 GiB、MP4 头检查、原子移动与不覆盖策略。声明了 `timeoutMs` 的原生终端使用五分钟预算，但不超过工具 schema 的上限，不开启后台执行。失败只清理本次临时文件。Core 保留客户端声明的联网限制；若客户端提供 DSH `dev_tool_search`，可先搜索并解锁一个已发现的终端，待后续请求带上完整工具 schema 再校验并下载。每条交付链最多搜索一次、解锁一次，失败后停止，不调用视频模型、不重新生成。客户端拒绝执行或确实没有允许联网的终端时，返回明确的 `video_delivery.reason` 和短期下载链接。
+
+回传支持 `stdout` / `data` 等包装和结构化 `tool_result`；超时、非零退出码、取消、沙箱拒绝和 `isError` 不会被当成保存成功。不同 Key 的交付和发现流程仍执行任务归属检查。Seedance 入口不是通用终端 Agent：普通联网诊断命令请使用正常文字模型，而不是把它当作视频提示词提交。真实客户端完整自动下载仍需分别验收，不能用手动 PowerShell 的 HTTP 200 代替 Agent 工具执行结果。兼容范围与验证边界见 [`docs/seedance-client-tool-compatibility-20260928.md`](docs/seedance-client-tool-compatibility-20260928.md)。
 
 普通 Key 可用 `POST /v1/videos/{request_id}/delivery` 重试已完成视频的交付，请求体提供原客户端 `tools` / `messages` / `stream`，不重新生成。`GET /v1/videos/{request_id}/content` 仍保留 Bearer Key 鉴权。工具使用的 `GET /v1/videos/{request_id}/download?ticket=...` 采用 15 分钟、单任务、仅下载的加密授权，不携带永久 Key；访问时重新核验用户、Key、视频读取作用域和任务归属。
 

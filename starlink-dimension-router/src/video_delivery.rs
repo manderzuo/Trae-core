@@ -107,9 +107,28 @@ pub(crate) async fn completion(state:&Arc<StarlinkRouterState>,p:&Principal,requ
             value["choices"][0]["message"]=json!({"role":"assistant","content":"视频已生成，正在调用本机工具保存到系统 Downloads。", "tool_calls":[{
                 "id":format!("{CALL_PREFIX}{request}"),"type":"function","function":{"name":tool.name,"arguments":args.to_string()}}]});
             value["choices"][0]["finish_reason"]=json!("tool_calls");
+            value["video_delivery"]=json!({"status":"download_requested","tool":tool.name});
             value["video_task"]["delivery_model"]=json!(state.config.seedance_assistant_model);
             value["video_task"]["delivery_planner"]=json!(if selected.is_some(){"assistant"}else{"validated_adapter_fallback"});
+        } else {
+            if let Some(call)=crate::delivery_discovery::first_call(body,request) {
+                set_discovery_call(&mut value,call,"视频已生成，正在查找客户端可用的本地下载工具。","discovering_tools");
+                return Ok(value);
+            }
+            let reason=crate::delivery_assist::unavailable_reason(body);
+            value["video_delivery"]=json!({"status":"download_unavailable","reason":reason});
+            let explanation=match reason {
+                "client_network_restricted"=>"客户端声明终端工具不能联网，因此没有执行下载命令。",
+                "client_tools_disabled"=>"客户端本轮关闭了工具调用。",
+                "client_tools_not_provided"=>"客户端本轮没有提供本地工具。",
+                "client_terminal_not_supported"=>"客户端没有提供受支持的本地终端工具。",
+                _=>"客户端终端工具的参数格式暂不受支持。",
+            };
+            let text=value["choices"][0]["message"]["content"].as_str().unwrap_or("").to_owned();
+            value["choices"][0]["message"]["content"]=json!(format!("{explanation}\n{text}"));
         }
+    } else {
+        value["video_delivery"]=json!({"status":"download_unavailable","reason":"public_base_url_unconfigured"});
     }
     Ok(value)
 }
@@ -127,19 +146,44 @@ fn response(value: Value, stream: bool) -> Response {
     Response::builder().header("content-type","text/event-stream; charset=utf-8").header("cache-control","no-cache, no-transform").header("x-accel-buffering","no")
         .body(axum::body::Body::from(sse_completion(&value))).unwrap()
 }
-pub(crate) fn follow_up(state: &StarlinkRouterState, p: &Principal, body: &Value) -> Option<Response> {
+fn set_discovery_call(value:&mut Value,call:Value,text:&str,status:&str) {
+    value["choices"][0]["message"]=json!({"role":"assistant","content":text,"tool_calls":[call]});
+    value["choices"][0]["finish_reason"]=json!("tool_calls");
+    value["video_delivery"]=json!({"status":status});
+}
+pub(crate) async fn follow_up(state: &Arc<StarlinkRouterState>, p: &Principal, body: &Value) -> Option<Response> {
     let messages=body["messages"].as_array()?;
-    let tool=messages.last()?;
-    if tool["role"]!="tool" {return None;}
+    let last=messages.last()?;
+    let tool=if last["role"]=="tool" {last} else if last["role"]=="user" {
+        let mut results=last["content"].as_array()?.iter().filter(|v|v["type"]=="tool_result");
+        let tool=results.next()?;
+        if results.next().is_some() {return Some(error(StatusCode::BAD_REQUEST,"invalid_delivery_tool_result"));}
+        tool
+    } else {return None;};
     // Seedance has no general-purpose paid tool loop. Unknown/denied tool
     // results must fail closed rather than rediscover an old video prompt.
+    let call_id=tool["tool_call_id"].as_str().or_else(||tool["tool_use_id"].as_str());
+    if let Some((stage,request))=call_id.and_then(crate::delivery_discovery::request) {
+        if !owned_completed(state,p,request) {return Some(error(StatusCode::BAD_REQUEST,"invalid_delivery_tool_result"));}
+        if stage==crate::delivery_discovery::Stage::Find && !tool_failed(tool,0) && crate::delivery_assist::tools(body).is_empty() {
+            if let Some(call)=crate::delivery_discovery::unlock_call(body,request,&tool["content"]) {
+                let mut value=match fallback(state,p,request) {Ok(v)=>v,Err(_)=>return Some(error(StatusCode::SERVICE_UNAVAILABLE,"delivery_unavailable"))};
+                set_discovery_call(&mut value,call,"正在启用客户端发现的本地终端工具。","unlocking_tools");
+                return Some(response(value,body["stream"].as_bool().unwrap_or(false)));
+            }
+        }
+        return Some(match completion(state,p,request,body).await {
+            Ok(value)=>response(value,body["stream"].as_bool().unwrap_or(false)),
+            Err(_)=>error(StatusCode::SERVICE_UNAVAILABLE,"delivery_unavailable"),
+        });
+    }
     let receipt=receipt(&tool["content"],0);
-    let call_request=tool["tool_call_id"].as_str().and_then(|id|id.strip_prefix(CALL_PREFIX));
+    let call_request=call_id.and_then(|id|id.strip_prefix(CALL_PREFIX));
     let receipt_request=receipt.as_ref().and_then(|r|r["request_id"].as_str());
     if call_request.is_some() && receipt_request.is_some() && call_request!=receipt_request {return Some(error(StatusCode::BAD_REQUEST,"invalid_delivery_tool_result"));}
     let Some(request)=receipt_request.or(call_request) else {return Some(error(StatusCode::BAD_REQUEST,"invalid_delivery_tool_result"));};
     if !owned_completed(state,p,request) {return Some(error(StatusCode::BAD_REQUEST,"invalid_delivery_tool_result"));}
-    let mut value=if let Some(r)=receipt.as_ref().filter(|r|r["status"]=="saved" && r["bytes"].as_u64().is_some_and(|n|(12..=4*1024*1024*1024).contains(&n))
+    let mut value=if let Some(r)=receipt.as_ref().filter(|r|!tool_failed(tool,0) && r["status"]=="saved" && r["bytes"].as_u64().is_some_and(|n|(12..=4*1024*1024*1024).contains(&n))
         && r["path"].as_str().is_some_and(|s|s.len()<=4096 && !s.chars().any(char::is_control) && s.to_ascii_lowercase().ends_with(".mp4"))) {
         let mut v=chat(request,&format!("视频已保存到本机 Downloads：{}\n文件大小：{} 字节。",r["path"].as_str().unwrap(),r["bytes"]));
         v["video_delivery"]=json!({"status":"saved","path":r["path"],"bytes":r["bytes"],"source":"client_tool_receipt"});v
@@ -154,6 +198,23 @@ pub(crate) fn follow_up(state: &StarlinkRouterState, p: &Principal, body: &Value
     value["video_task"]=json!({"id":request,"status":"completed","content_url":format!("{}/v1/videos/{request}/content",state.config.public_base_url.trim_end_matches('/'))});
     Some(response(value,body["stream"].as_bool().unwrap_or(false)))
 }
+fn tool_failed(value:&Value,depth:usize)->bool {
+    if depth>6 {return true;}
+    if value["isError"]==true || value["is_error"]==true || value["timedOut"]==true || value["aborted"]==true
+        || value.pointer("/sandbox/denied")==Some(&json!(true)) || value.pointer("/sandbox/runnerFailed")==Some(&json!(true))
+        || value.get("signal").is_some_and(|v|!v.is_null())
+        || ["exitCode","exit_code"].iter().any(|key|value.get(*key).is_some_and(|code|code.as_i64()!=Some(0))) {return true;}
+    if let Some(text)=value.as_str().filter(|s|s.len()<=64*1024) {
+        if text.lines().any(|line| {
+            let line=line.trim();
+            line.strip_prefix("[exit code: ").and_then(|s|s.strip_suffix(']')).is_some_and(|code|code.parse::<i64>()!=Ok(0))
+                || line.starts_with("[timed out after ") || line.starts_with("[killed by signal: ") || line.starts_with("[sandbox:")
+        }) {return true;}
+        if let Ok(parsed)=serde_json::from_str::<Value>(text) {return tool_failed(&parsed,depth+1);}
+    }
+    if let Some(values)=value.as_array() {return values.iter().take(32).any(|v|tool_failed(v,depth+1));}
+    ["content","output","result","data","message","stdout","stderr","text"].iter().any(|key|value.get(*key).is_some_and(|v|tool_failed(v,depth+1)))
+}
 fn receipt(value:&Value,depth:usize)->Option<Value> {
     if depth>6 {return None;}
     if value["seedance_delivery"]==1 {return Some(value.clone());}
@@ -166,7 +227,7 @@ fn receipt(value:&Value,depth:usize)->Option<Value> {
         if let Ok(v)=serde_json::from_str::<Value>(text) {return receipt(&v,depth+1);}
     }
     if let Some(values)=value.as_array() {return values.iter().take(32).find_map(|v|receipt(v,depth+1));}
-    for field in ["text","stdout","output","content","result"] {if let Some(v)=value.get(field) {if let Some(r)=receipt(v,depth+1) {return Some(r);}}}
+    for field in ["text","stdout","output","content","result","data","message"] {if let Some(v)=value.get(field) {if let Some(r)=receipt(v,depth+1) {return Some(r);}}}
     None
 }
 
@@ -190,6 +251,13 @@ pub async fn download(State(state): State<Arc<StarlinkRouterState>>, Path(reques
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn receipt_survives_native_terminal_data_wrapper() {
+        let value=json!({"data":{"stdout":"SEEDANCE_DELIVERY_RECEIPT={\"seedance_delivery\":1,\"request_id\":\"request_nested\",\"status\":\"saved\",\"bytes\":24,\"path\":\"D:\\\\Downloads\\\\video.mp4\"}","exitCode":0}});
+        let parsed=receipt(&value,0).expect("the native tool's data wrapper must not lose the receipt");
+        assert_eq!(parsed["request_id"],"request_nested");
+        assert_eq!(parsed["status"],"saved");
+    }
     #[test]
     fn adapter_declines_unknown_required_fields_or_disabled_tools() {
         let base=json!({"tools":[{"type":"function","function":{"name":"RunCommand","description":"powershell5","parameters":{"type":"object","required":["command","blocking","requires_approval"],"properties":{"command":{"type":"string"},"blocking":{"type":"boolean"},"requires_approval":{"type":"boolean"}}}}}]});
