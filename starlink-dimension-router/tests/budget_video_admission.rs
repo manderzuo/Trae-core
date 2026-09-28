@@ -56,6 +56,11 @@ impl BridgeTransport for Bridge {
             if c["step_kind"]=="chat" {
                 if url.contains("/execution?") {v["execution"]["task_ref"]=Value::Null;}
                 if url.contains("/result?") {v["result"]=json!({"id":format!("chatcmpl-{id}"),"object":"chat.completion","model":"text-model","created":1,"choices":[{"index":0,"message":{"role":"assistant","content":"hello world"},"finish_reason":"stop"}]});}
+                if url.contains("/result?") && c["body"]["tool_choice"]=="required" {
+                    let name=c["body"]["tools"][0]["function"]["name"].as_str().unwrap();
+                    let args:serde_json::Map<String,Value>=c["body"]["tools"][0]["function"]["parameters"]["properties"].as_object().unwrap().iter().map(|(k,v)|(k.clone(),v["enum"][0].clone())).collect();
+                    v["result"]=json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"helper-call","type":"function","function":{"name":name,"arguments":Value::Object(args).to_string()}}]},"finish_reason":"tool_calls"}]});
+                }
                 if c["body"]["messages"][0]["content"]=="force unknown" {
                     if url.contains("/execution?") {v["status"]=json!("unknown");v["execution"]["state"]=json!("unknown");v["execution"]["finished_at_ms"]=Value::Null;v["execution"]["result_available"]=json!(false);}
                     if url.contains("/result?") {v["status"]=json!("not_ready");v["result"]=Value::Null;}
@@ -267,7 +272,7 @@ async fn completed_video_stream_calls_client_download_tool_and_receipt_never_reg
     store.create_user(NewUser {id:"user".into(),name:"User".into(),role:UserRole::User},"admin").unwrap();
     let a=store.issue_api_key("admin","admin",BTreeSet::from(["admin:*".into()]),"bootstrap").unwrap();let admin=store.authenticate_api_key(&a.plaintext).unwrap();
     let k=store.issue_api_key_as_admin_with_max_concurrency("user","Key",BTreeSet::from(["videos:submit".into()]),1,&admin).unwrap();
-    store.key_quota_grant_as_admin(&admin,KeyQuotaGrant {api_key_id:k.id.clone(),resource_kind:"credits".into(),amount:100_000_000,actor_user_id:"admin".into(),reason:"test".into()}).unwrap();
+    store.key_quota_grant_as_admin(&admin,KeyQuotaGrant {api_key_id:k.id.clone(),resource_kind:"credits".into(),amount:200_000_000,actor_user_id:"admin".into(),reason:"test".into()}).unwrap();
     store.set_video_billing_control(aiwork_core::VideoBillingControlInput {mode:aiwork_core::VideoBillingMode::Active,reason:"test".into(),diagnostic_key_id:None,diagnostic_request_hash:None}).unwrap();
     let bridge=Arc::new(Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent:true,large_downloads:std::sync::atomic::AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0)),download_status:AtomicUsize::new(200)});
     let mut cfg=RouterConfig::defaults(dir.path().into());cfg.budget_billing_v2=true;cfg.public_base_url="https://api.example.test".into();
@@ -283,10 +288,12 @@ async fn completed_video_stream_calls_client_download_tool_and_receipt_never_reg
     let final_frame=frames.last().unwrap();let call=&final_frame["choices"][0]["delta"]["tool_calls"][0];
     assert_eq!(call["function"]["name"],"RunCommand","completed video must request a real client tool, not just a link");
     assert_eq!(call["index"],0);assert_eq!(final_frame["choices"][0]["finish_reason"],"tool_calls");
+    assert_eq!(final_frame["video_task"]["delivery_planner"],"assistant");
     let args:Value=serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
     assert_eq!(args["blocking"],true);assert_eq!(args["cwd"],"E:\\delivery test\\workspace");
     assert!(!args["command"].as_str().unwrap().contains(&k.plaintext));
-    let request=final_frame["request_id"].as_str().unwrap();let before=bridge.sends.load(Ordering::SeqCst);assert_eq!(before,2);
+    let request=final_frame["request_id"].as_str().unwrap();let before=bridge.sends.load(Ordering::SeqCst);assert_eq!(before,3,"intent, video, and bounded delivery planning each have their own billed identity");
+    assert!(bridge.claims.lock().unwrap().values().filter(|c|c["step_kind"]!="video").all(|c|c["model"]=="glm-5.3-flash"));
     let mut clean_call=call.clone();clean_call.as_object_mut().unwrap().remove("index");
     for (status,expected) in [("saved","已保存"),("failed","下载未完成")] {
         let follow=json!({"model":"seedance","stream":false,"tools":[delivery_tool()],"messages":[
@@ -300,6 +307,13 @@ async fn completed_video_stream_calls_client_download_tool_and_receipt_never_reg
         assert_eq!(bridge.sends.load(Ordering::SeqCst),before,"download receipt must never call helper/video again");
         assert_eq!(store.active_execution_count_for_key(&k.id).unwrap(),0);
     }
+    let receipt=json!({"seedance_delivery":1,"request_id":request,"status":"saved","path":"E:\\Downloads\\video.mp4","bytes":1234});
+    let rewritten=json!({"model":"seedance","messages":[{"role":"tool","tool_call_id":"client-rewritten-id","content":{"stdout":format!("SEEDANCE_DELIVERY_RECEIPT={receipt}")}}]});
+    let response=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(principal.clone()),Bytes::from(rewritten.to_string())).await;
+    assert_eq!(response.status(),StatusCode::OK,"owned receipt survives rewritten ID, omitted assistant metadata, and wrapped stdout");
+    let result:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+    assert_eq!(result["video_delivery"]["status"],"saved");
+    assert_eq!(bridge.sends.load(Ordering::SeqCst),before);
     let invalid=json!({"model":"seedance","messages":[
         {"role":"user","content":"生成5秒480p的猫视频"},
         {"role":"assistant","tool_calls":[clean_call]},
@@ -317,6 +331,14 @@ async fn completed_video_stream_calls_client_download_tool_and_receipt_never_reg
     assert_eq!(retry.status(),StatusCode::OK);
     let retried:Value=serde_json::from_slice(&axum::body::to_bytes(retry.into_body(),65536).await.unwrap()).unwrap();
     assert_eq!(retried["choices"][0]["finish_reason"],"tool_calls");
+    let bash_tool=json!({"type":"function","function":{"name":"Bash","description":"Execute commands in Bash","parameters":{"type":"object","required":["command"],"properties":{"command":{"type":"string"}}}}});
+    let bash_retry=router.clone().oneshot(axum::http::Request::builder().method("POST").uri(format!("/v1/videos/{request}/delivery"))
+        .header("authorization",format!("Bearer {}",k.plaintext)).header("content-type","application/json")
+        .body(axum::body::Body::from(json!({"tools":[bash_tool]}).to_string())).unwrap()).await.unwrap();
+    assert_eq!(bash_retry.status(),StatusCode::OK);
+    let bash_result:Value=serde_json::from_slice(&axum::body::to_bytes(bash_retry.into_body(),131072).await.unwrap()).unwrap();
+    assert_eq!(bash_result["choices"][0]["message"]["tool_calls"][0]["function"]["name"],"Bash");
+    assert_eq!(bridge.sends.load(Ordering::SeqCst),before+1,"same schema reuses its planner; a different tool schema has one bounded plan");
     let args:Value=serde_json::from_str(retried["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
     let command=args["command"].as_str().unwrap();
     let url=command.lines().find(|l|l.starts_with("$deliveryUrl = ")).unwrap().trim_start_matches("$deliveryUrl = '").trim_end_matches('\'');
@@ -341,6 +363,8 @@ async fn completed_video_stream_calls_client_download_tool_and_receipt_never_reg
         assert_eq!(r.status(),StatusCode::NOT_FOUND,"expired or wrong-Key ticket must be refused");
     }
     let foreign=store.issue_api_key_as_admin_with_max_concurrency("user","Other",BTreeSet::from(["videos:submit".into()]),1,&admin).unwrap();
+    let rejected=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(store.authenticate_api_key(&foreign.plaintext).unwrap()),Bytes::from(rewritten.to_string())).await;
+    assert_eq!(rejected.status(),StatusCode::BAD_REQUEST,"rewritten receipt must retain strict Key ownership");
     let r=router.clone().oneshot(axum::http::Request::builder().method("POST").uri(format!("/v1/videos/{request}/delivery"))
         .header("authorization",format!("Bearer {}",foreign.plaintext)).header("content-type","application/json")
         .body(axum::body::Body::from("{}")).unwrap()).await.unwrap();
@@ -350,7 +374,7 @@ async fn completed_video_stream_calls_client_download_tool_and_receipt_never_reg
         let r=router.clone().oneshot(axum::http::Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap()).await.unwrap();
         assert_eq!(r.status(),StatusCode::NOT_FOUND,"current Key status/scope must win over a previously issued ticket");
     }
-    assert_eq!(bridge.sends.load(Ordering::SeqCst),before,"delivery/download/authorization failures have no new paid dispatch");
+    assert_eq!(bridge.sends.load(Ordering::SeqCst),before+1,"delivery/download/authorization failures have no new video dispatch");
 }
 #[tokio::test]
 async fn model_add_probe_uses_bounded_helper_and_does_not_generate_a_video() {

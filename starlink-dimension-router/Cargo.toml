@@ -9,6 +9,7 @@ axum = "0.7"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 futures-core = "0.3"
+flate2 = "1"
 hex = "0.4"
 hmac = "0.12.1"
 pbkdf2 = "0.12.2"

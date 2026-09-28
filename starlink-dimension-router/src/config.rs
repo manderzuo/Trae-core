@@ -11,6 +11,8 @@ pub struct RouterConfig {
     pub display_name: String,
     #[serde(default = "default_model")]
     pub default_model: String,
+    #[serde(default = "seedance_assistant_model")]
+    pub seedance_assistant_model: String,
     /// Public URL prefix used in short-lived asset content links.
     /// An explicit STARLINK_ROUTER_PUBLIC_BASE_URL environment variable wins.
     #[serde(default)]
@@ -37,6 +39,7 @@ impl RouterConfig {
             port: Self::default_port(),
             display_name: "星链维度分流系统".to_string(),
             default_model: "deepseek-v4-flash".to_string(),
+            seedance_assistant_model: seedance_assistant_model(),
             public_base_url: String::new(),
             budget_billing_v2: false,
             bridge: None,
@@ -100,6 +103,9 @@ impl RouterConfig {
         if self.display_name.trim().is_empty() {
             return Err("路由器显示名称不能为空".to_string());
         }
+        if self.seedance_assistant_model.trim().is_empty() || self.seedance_assistant_model == "seedance" {
+            return Err("Seedance 辅助模型必须是有效的文字模型".into());
+        }
         if self.public_base_url.chars().any(char::is_whitespace) {
             return Err("公网素材地址不能包含空白字符".to_string());
         }
@@ -108,6 +114,7 @@ impl RouterConfig {
 }
 
 fn default_model() -> String { "deepseek-v4-flash".to_string() }
+fn seedance_assistant_model() -> String { "glm-5.3-flash".into() }
 
 #[cfg(test)]
 mod tests {

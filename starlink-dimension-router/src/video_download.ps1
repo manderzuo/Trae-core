@@ -1,5 +1,7 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
+$OutputEncoding = [Console]::OutputEncoding
 $deliveryRequest = __REQUEST__
 $deliveryUrl = __URL__
 $deliveryWorkspace = __WORKSPACE__
@@ -8,7 +10,13 @@ $deliveryHttp = $null
 $deliveryInput = $null
 $deliveryOutput = $null
 try {
-    if ([string]::IsNullOrWhiteSpace($deliveryWorkspace)) { $deliveryWorkspace = (Get-Location).ProviderPath }
+    if ([string]::IsNullOrWhiteSpace($deliveryWorkspace)) {
+        # Downloads is a known folder and may have been redirected to another drive.
+        $deliveryFolderId = '{374DE290-123F-4565-9164-39C4925E467B}'
+        $deliveryFolders = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -ErrorAction SilentlyContinue
+        $deliveryWorkspace = [Environment]::ExpandEnvironmentVariables([string]$deliveryFolders.$deliveryFolderId)
+        if ([string]::IsNullOrWhiteSpace($deliveryWorkspace)) { $deliveryWorkspace = [IO.Path]::Combine([Environment]::GetFolderPath('UserProfile'), 'Downloads') }
+    }
     $deliveryWorkspace = [IO.Path]::GetFullPath($deliveryWorkspace)
     if (-not [IO.Directory]::Exists($deliveryWorkspace)) { [IO.Directory]::CreateDirectory($deliveryWorkspace) | Out-Null }
     $deliveryName = 'seedance-' + $deliveryRequest + '.mp4'

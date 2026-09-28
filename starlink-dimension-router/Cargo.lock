@@ -1033,6 +1033,7 @@ dependencies = [
  "axum",
  "base64",
  "chrono",
+ "flate2",
  "futures-core",
  "hex",
  "hmac",

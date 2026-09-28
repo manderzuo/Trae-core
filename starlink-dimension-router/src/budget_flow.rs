@@ -169,12 +169,12 @@ async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Principal,reques
     if let Some(video)=operation.as_ref().and_then(|op|op.steps.iter().find(|s|s.kind==BudgetStepKind::Video)).cloned() {
         if dispatch_only {return Ok(json!({"request_id":request,"status":"already_dispatched"}));}
         let result=wait_result(state.clone(),video).await?;
-        return completed_video(&state,&principal,&request,&result,&original);
+        return completed_video(&state,&principal,&request,&result,&original).await;
     }
     let assist=if let Some(step)=operation.and_then(|op|op.steps.into_iter().find(|s|s.kind==BudgetStepKind::Assist)) {step} else {
         if !fresh {return Err("budget_preparation_requires_recovery".into());}
         let prompt=crate::user_routes::extract_seedance_prompt(&original).map_err(|_|"invalid_seedance_prompt")?;
-        let model=if state.config.default_model.is_empty() || state.config.default_model=="seedance" {"deepseek-v4-flash".into()} else {state.config.default_model.clone()};
+        let model=state.config.seedance_assistant_model.clone();
         let body=json!({"model":model,"stream":false,"max_tokens":1024,"temperature":0.2,"messages":[
             {"role":"system","content":"你是视频请求调度助手。只输出严格 JSON。用户明确要求生成、制作视频时输出 {\"intent\":\"video\",\"prompt\":\"视频提示词\"}；普通问候、连接测试、非视频问题输出 {\"intent\":\"text\",\"text\":\"简短回答\"}。不要把 hello 或测试连接转换成视频。不要虚构已经生成的视频。"},
             {"role":"user","content":prompt}]});
@@ -233,11 +233,11 @@ async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Principal,reques
     let step=tokio::task::spawn_blocking(move ||prepare_step(&s,&p,&rid,&rid,"seedance",body,BudgetStepKind::Video)).await.map_err(|_|"video worker failed")??;
     if dispatch_only {return Ok(json!({"request_id":request,"status":"dispatched"}));}
     let result=wait_result(state.clone(),step).await?;
-    completed_video(&state,&principal,&request,&result,&original)
+    completed_video(&state,&principal,&request,&result,&original).await
 }
-fn completed_video(state:&StarlinkRouterState,principal:&Principal,request:&str,result:&Value,body:&Value)->Result<Value,String> {
+async fn completed_video(state:&Arc<StarlinkRouterState>,principal:&Principal,request:&str,result:&Value,body:&Value)->Result<Value,String> {
     if result["status"]!="completed" {return Err("video_execution_failed".into());}
-    crate::video_delivery::completion(state,principal,request,body)
+    crate::video_delivery::completion(state,principal,request,body).await
 }
 
 pub(crate) async fn video_content(state:Arc<StarlinkRouterState>,principal:Principal,request:String)->Response {

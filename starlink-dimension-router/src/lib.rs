@@ -23,3 +23,4 @@ pub(crate) mod budget_continuation;
 pub(crate) mod budget_observer;
 pub(crate) mod budget_chat;
 pub mod video_delivery;
+pub(crate) mod delivery_assist;

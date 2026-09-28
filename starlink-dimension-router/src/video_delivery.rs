@@ -1,4 +1,4 @@
-//! Client-side delivery is a tool protocol, not another paid generation step.
+//! Delivery uses an idempotent billed text planner, never another video generation.
 use std::sync::Arc;
 use aiwork_core::{BudgetExecutionState, Principal};
 use axum::{extract::{Path, Query, State}, Extension, http::StatusCode, response::{IntoResponse, Response}, Json};
@@ -48,7 +48,7 @@ pub(crate) fn download_command(request: &str, url: &str, workspace: Option<&str>
         .replace("__URL__",&ps_string(url))
         .replace("__WORKSPACE__",&ps_string(workspace.unwrap_or("")))
 }
-fn workspace(body: &Value) -> Option<String> {
+pub(crate) fn workspace(body: &Value) -> Option<String> {
     // Only client system context, never a user/video prompt, selects this path.
     for message in body["messages"].as_array()?.iter().filter(|m|m["role"]=="system") {
         let text=message["content"].as_str()?;
@@ -64,49 +64,53 @@ fn workspace(body: &Value) -> Option<String> {
     }
     None
 }
-fn command_arguments(body: &Value) -> Option<Value> {
-    if body["tool_choice"]=="none" {return None;}
-    if body["tool_choice"].is_object() && body.pointer("/tool_choice/function/name").and_then(Value::as_str)!=Some("RunCommand") {return None;}
-    let function=&body["tools"].as_array()?.iter().find(|t|t["type"]=="function" && t["function"]["name"]=="RunCommand")?["function"];
-    let description=function["description"].as_str()?.to_ascii_lowercase();
-    if !description.contains("powershell") {return None;}
-    let schema=&function["parameters"];
-    if schema["type"]!="object" {return None;}
-    let props=schema["properties"].as_object()?;
-    for (name,ty) in [("command","string"),("blocking","boolean"),("requires_approval","boolean")] {
-        if props.get(name)?["type"]!=ty {return None;}
-    }
-    let mut args=json!({"command":"","blocking":true,"requires_approval":false});
-    if props.get("command_type").is_some_and(|v|v["type"]=="string" && v.get("enum").is_none_or(|e|e.as_array().is_some_and(|a|a.iter().any(|v|v=="short_running_process")))) {
-        args["command_type"]=json!("short_running_process");
-    }
-    if let Some(path)=workspace(body) {
-        if props.get("cwd").is_some_and(|v|v["type"]=="string") {args["cwd"]=json!(path);}
-    }
-    // Unknown required properties cannot be safely invented by this adapter.
-    if schema.get("required").is_some_and(|r|r.as_array().is_none_or(|a|a.iter().any(|v|v.as_str().is_none_or(|n|args.get(n).is_none())))) {return None;}
-    Some(args)
+#[cfg(test)]
+fn command_arguments(body: &Value) -> Option<Value> {crate::delivery_assist::tools(body).into_iter().find(|t|t.name=="RunCommand").map(|t|t.arguments)}
+fn bash_command(request: &str, url: &str, directory:Option<&str>) -> String {
+    use std::io::Write;
+    let ps=download_command(request,url,directory);
+    let mut gzip=flate2::write::GzEncoder::new(Vec::new(),flate2::Compression::default());
+    gzip.write_all(ps.as_bytes()).expect("memory compression");
+    let packed=base64::engine::general_purpose::STANDARD.encode(gzip.finish().expect("memory compression"));
+    let bootstrap=format!("$b=[Convert]::FromBase64String(\"{packed}\");$m=New-Object IO.MemoryStream(,$b);$g=New-Object IO.Compression.GZipStream($m,[IO.Compression.CompressionMode]::Decompress);$r=New-Object IO.StreamReader($g,[Text.Encoding]::UTF8);& ([scriptblock]::Create($r.ReadToEnd()))");
+    let unix=include_str!("video_download.sh").replace("__REQUEST__",&sh_string(request)).replace("__URL__",&sh_string(url)).replace("__DIRECTORY__",&sh_string(directory.unwrap_or("")));
+    format!("case \"$(uname -s)\" in\n  MINGW*|MSYS*|CYGWIN*) powershell.exe -NoProfile -NonInteractive -Command {} ;;\n  *)\n{unix}\n;;\nesac",sh_string(&bootstrap))
 }
+fn sh_string(text:&str)->String {format!("'{}'",text.replace('\'',"'\"'\"'"))}
 fn chat(request: &str, text: &str) -> Value {
     json!({"id":format!("chatcmpl-{request}"),"object":"chat.completion","model":"seedance","created":chrono::Utc::now().timestamp(),"request_id":request,
         "choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}]})
 }
-pub(crate) fn completion(state: &StarlinkRouterState, p: &Principal, request: &str, body: &Value) -> Result<Value,String> {
+fn fallback(state:&StarlinkRouterState,p:&Principal,request:&str)->Result<Value,String> {
     if !owned_completed(state,p,request) {return Err("delivery_not_authorized".into());}
     let base=state.config.public_base_url.trim_end_matches('/');
     let content_url=format!("{base}/v1/videos/{request}/content");
     let usable=base.starts_with("https://") || base.starts_with("http://");
     let download_url=if usable {format!("{base}/v1/videos/{request}/download?ticket={}",issue_ticket(state,p,request,chrono::Utc::now().timestamp_millis())?)} else {content_url.clone()};
-    let mut value=chat(request,&format!("视频已生成。当前客户端未提供可用的本地下载工具，请下载到工作区：{download_url}\n短期下载链接有效期 15 分钟；过期后可使用原 Key 访问内容接口。"));
+    let mut value=chat(request,&format!("视频已生成，但当前无法自动保存到本机 Downloads。下载地址：{download_url}\n链接有效期 15 分钟；过期后可使用原 Key 访问内容接口。"));
+    value["video_task"]=json!({"id":request,"status":"completed","content_url":content_url,"download_url":download_url});
+    Ok(value)
+}
+pub(crate) async fn completion(state:&Arc<StarlinkRouterState>,p:&Principal,request:&str,body:&Value)->Result<Value,String> {
+    let mut value=fallback(state,p,request)?;
+    let download_url=value["video_task"]["download_url"].as_str().unwrap().to_owned();
+    let usable=state.config.public_base_url.starts_with("https://") || state.config.public_base_url.starts_with("http://");
     if usable {
-        if let Some(mut args)=command_arguments(body) {
-            args["command"]=json!(download_command(request,&download_url,workspace(body).as_deref()));
-            value["choices"][0]["message"]=json!({"role":"assistant","content":"视频已生成，正在调用本地工具保存到工作区。", "tool_calls":[{
-                "id":format!("{CALL_PREFIX}{request}"),"type":"function","function":{"name":"RunCommand","arguments":args.to_string()}}]});
+        let tools=crate::delivery_assist::tools(body);
+        let selected=crate::delivery_assist::select(state,p,request,&tools).await;
+        if let Some(tool)=selected.as_deref().and_then(|name|tools.iter().find(|t|t.name==name)).or_else(||tools.first()) {
+            let mut args=tool.arguments.clone();
+            args[tool.command_key]=json!(if tool.bash {bash_command(request,&download_url,None)} else {download_command(request,&download_url,None)});
+            if let Some(path)=workspace(body) {
+                if body["tools"].as_array().into_iter().flatten().any(|t|t["function"]["name"]==tool.name && t.pointer("/function/parameters/properties/cwd/type").is_some_and(|v|v=="string")) {args["cwd"]=json!(path);}
+            }
+            value["choices"][0]["message"]=json!({"role":"assistant","content":"视频已生成，正在调用本机工具保存到系统 Downloads。", "tool_calls":[{
+                "id":format!("{CALL_PREFIX}{request}"),"type":"function","function":{"name":tool.name,"arguments":args.to_string()}}]});
             value["choices"][0]["finish_reason"]=json!("tool_calls");
+            value["video_task"]["delivery_model"]=json!(state.config.seedance_assistant_model);
+            value["video_task"]["delivery_planner"]=json!(if selected.is_some(){"assistant"}else{"validated_adapter_fallback"});
         }
     }
-    value["video_task"]=json!({"id":request,"status":"completed","content_url":content_url});
     Ok(value)
 }
 pub(crate) fn sse_completion(value: &Value) -> Vec<u8> {
@@ -128,21 +132,19 @@ pub(crate) fn follow_up(state: &StarlinkRouterState, p: &Principal, body: &Value
     if tool["role"]!="tool" {return None;}
     // Seedance has no general-purpose paid tool loop. Unknown/denied tool
     // results must fail closed rather than rediscover an old video prompt.
-    let Some(id)=tool["tool_call_id"].as_str() else {return Some(error(StatusCode::BAD_REQUEST,"invalid_delivery_tool_result"));};
-    let Some(request)=id.strip_prefix(CALL_PREFIX) else {return Some(error(StatusCode::BAD_REQUEST,"invalid_delivery_tool_result"));};
-    let matching=messages.iter().rev().skip(1).find(|m|m["role"]=="assistant")
-        .and_then(|m|m["tool_calls"].as_array()).is_some_and(|calls|calls.iter().any(|c|c["id"]==id && c["function"]["name"]=="RunCommand"));
-    if !matching || !owned_completed(state,p,request) {return Some(error(StatusCode::BAD_REQUEST,"invalid_delivery_tool_result"));}
-    let text=tool["content"].as_str().filter(|s|s.len()<=64*1024).unwrap_or("");
-    let receipt=text.lines().find_map(|line|line.find(RECEIPT_PREFIX).and_then(|i|serde_json::from_str::<Value>(&line[i+RECEIPT_PREFIX.len()..]).ok()))
-        .filter(|r|r["seedance_delivery"]==1 && r["request_id"]==request);
-    let mut value=if let Some(r)=receipt.filter(|r|r["status"]=="saved" && r["bytes"].as_u64().is_some_and(|n|(12..=4*1024*1024*1024).contains(&n))
+    let receipt=receipt(&tool["content"],0);
+    let call_request=tool["tool_call_id"].as_str().and_then(|id|id.strip_prefix(CALL_PREFIX));
+    let receipt_request=receipt.as_ref().and_then(|r|r["request_id"].as_str());
+    if call_request.is_some() && receipt_request.is_some() && call_request!=receipt_request {return Some(error(StatusCode::BAD_REQUEST,"invalid_delivery_tool_result"));}
+    let Some(request)=receipt_request.or(call_request) else {return Some(error(StatusCode::BAD_REQUEST,"invalid_delivery_tool_result"));};
+    if !owned_completed(state,p,request) {return Some(error(StatusCode::BAD_REQUEST,"invalid_delivery_tool_result"));}
+    let mut value=if let Some(r)=receipt.as_ref().filter(|r|r["status"]=="saved" && r["bytes"].as_u64().is_some_and(|n|(12..=4*1024*1024*1024).contains(&n))
         && r["path"].as_str().is_some_and(|s|s.len()<=4096 && !s.chars().any(char::is_control) && s.to_ascii_lowercase().ends_with(".mp4"))) {
-        let mut v=chat(request,&format!("视频已保存到当前工作区：{}\n文件大小：{} 字节。",r["path"].as_str().unwrap(),r["bytes"]));
+        let mut v=chat(request,&format!("视频已保存到本机 Downloads：{}\n文件大小：{} 字节。",r["path"].as_str().unwrap(),r["bytes"]));
         v["video_delivery"]=json!({"status":"saved","path":r["path"],"bytes":r["bytes"],"source":"client_tool_receipt"});v
     } else {
         // Never automatically resubmit a video or retry a denied local tool.
-        let fallback=match completion(state,p,request,&json!({"tool_choice":"none"})) {
+        let fallback=match fallback(state,p,request) {
             Ok(value)=>value,Err(_)=>return Some(error(StatusCode::SERVICE_UNAVAILABLE,"delivery_unavailable")),
         };
         let mut v=chat(request,&format!("视频已生成，但本地下载未完成。{}",fallback["choices"][0]["message"]["content"].as_str().unwrap()));
@@ -151,10 +153,25 @@ pub(crate) fn follow_up(state: &StarlinkRouterState, p: &Principal, body: &Value
     value["video_task"]=json!({"id":request,"status":"completed","content_url":format!("{}/v1/videos/{request}/content",state.config.public_base_url.trim_end_matches('/'))});
     Some(response(value,body["stream"].as_bool().unwrap_or(false)))
 }
+fn receipt(value:&Value,depth:usize)->Option<Value> {
+    if depth>6 {return None;}
+    if value["seedance_delivery"]==1 {return Some(value.clone());}
+    if let Some(text)=value.as_str().filter(|s|s.len()<=64*1024) {
+        for line in text.lines() {
+            if let Some(i)=line.find(RECEIPT_PREFIX) {
+                if let Some(Ok(v))=serde_json::Deserializer::from_str(&line[i+RECEIPT_PREFIX.len()..]).into_iter::<Value>().next() {if v["seedance_delivery"]==1 {return Some(v);}}
+            }
+        }
+        if let Ok(v)=serde_json::from_str::<Value>(text) {return receipt(&v,depth+1);}
+    }
+    if let Some(values)=value.as_array() {return values.iter().take(32).find_map(|v|receipt(v,depth+1));}
+    for field in ["text","stdout","output","content","result"] {if let Some(v)=value.get(field) {if let Some(r)=receipt(v,depth+1) {return Some(r);}}}
+    None
+}
 
-/// Retry delivery of an existing completed video, without generation or fees.
+/// Retry delivery of an existing video; the identical text plan is reused.
 pub async fn delivery(State(state): State<Arc<StarlinkRouterState>>, Extension(p): Extension<Principal>, Path(request): Path<String>, Json(body): Json<Value>) -> Response {
-    match completion(&state,&p,&request,&body) {
+    match completion(&state,&p,&request,&body).await {
         Ok(value)=>response(value,body["stream"].as_bool().unwrap_or(false)),
         Err(_)=>error(StatusCode::NOT_FOUND,"video_delivery_unavailable"),
     }
@@ -220,6 +237,44 @@ mod tests {
             let entries:Vec<_>=std::fs::read_dir(&dir.0).unwrap().map(|e|e.unwrap().path()).collect();
             assert_eq!(entries.len(),if index==0 {1} else {2},"failed temporary artifacts must be cleaned");
             for path in entries {assert_eq!(std::fs::read(path).unwrap(),bytes);}
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn redirected_downloads_and_git_bash_save_without_installed_skill() {
+        use std::{io::{Read,Write},net::TcpListener,process::Command};
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {fn drop(&mut self){let _=std::fs::remove_dir_all(&self.0);}}
+        let root=Directory(std::env::temp_dir().join(format!("core-downloads-{:032x}",rand::random::<u128>())));
+        let destination=root.0.join("redirected owner's 中文 Downloads");
+        let bytes=b"\0\0\0\x18ftypisom\0\0\0\0isommp42";
+        for shell in ["redirected","git-bash"] {
+            let listener=TcpListener::bind("127.0.0.1:0").unwrap();let addr=listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server=std::thread::spawn(move || {
+                let start=std::time::Instant::now();
+                let mut stream=loop {match listener.accept() {Ok((s,_))=>break s,Err(e) if e.kind()==std::io::ErrorKind::WouldBlock && start.elapsed().as_secs()<10=>std::thread::sleep(std::time::Duration::from_millis(20)),_=>return}};
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+                let mut request=[0u8;4096];let _=stream.read(&mut request).unwrap();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",bytes.len()).unwrap();stream.write_all(bytes).unwrap();
+            });
+            let id=format!("request_{shell}");let url=format!("http://{addr}/video");
+            let output=if shell=="redirected" {
+                let override_registry=format!("function Get-ItemProperty {{ [pscustomobject]@{{ '{{374DE290-123F-4565-9164-39C4925E467B}}' = {} }} }}\n",ps_string(destination.to_str().unwrap()));
+                let script=override_registry+&download_command(&id,&url,None);
+                let encoded=base64::engine::general_purpose::STANDARD.encode(script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>());
+                Command::new("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe").args(["-NoProfile","-NonInteractive","-EncodedCommand",&encoded]).output().unwrap()
+            } else {
+                let path=destination.to_str().unwrap();
+                let script=bash_command(&id,&url,Some(path));
+                assert!(script.len()<8192,"Windows shell command remains below conservative argument limit");
+                Command::new("C:/Program Files/Git/bin/bash.exe").args(["-c",&script]).output().unwrap()
+            };
+            server.join().unwrap();
+            assert!(output.status.success(),"{shell}: {}; {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            assert_eq!(std::fs::read(destination.join(format!("seedance-{id}.mp4"))).unwrap(),bytes);
+            let parsed=receipt(&json!(String::from_utf8_lossy(&output.stdout)),0).unwrap();assert_eq!(parsed["status"],"saved");assert_eq!(parsed["bytes"],bytes.len());
+            assert_eq!(parsed["path"].as_str(),destination.join(format!("seedance-{id}.mp4")).to_str(),"UTF-8 receipt must preserve the real local path");
         }
     }
 }
