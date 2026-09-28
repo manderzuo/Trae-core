@@ -30,3 +30,17 @@
 执行命令为 `cargo test --offline --manifest-path starlink-dimension-router/Cargo.toml --jobs 2` 和 `cargo test --offline --manifest-path src-core/Cargo.toml --jobs 2`。测试使用 D 盘临时目录和现有 D 盘编译缓存，未读取生产数据库。
 
 两台远端 Agent 的 UI 端到端验收尚未执行，不能声称所有客户端已经自动下载成功。生产部署与 Git 推送不包含在本次本地修改中。
+
+## 后续发布（2026-09-28，用户授权推送与部署）
+
+上述“未发布”描述是本地修改完成时的状态。后续已将功能提交 `039c893` 推送到 `manderzuo/Trae-core` 的 `fix/seedance-billing-20260925` 分支，未合并 main；MCP 和 AI Work 仓库无本轮修改。
+
+- 发布前复跑 Router 与 Core 完整测试，均退出 0；既有私有生产备份测试仍跳过。Linux release 离线锁定构建成功。
+- 公网 Core 实际运行 `/opt/gemstory/starlink-dimension-router/releases/20260928-client-tools-039c893/starlink-dimension-router`，部署后 PID `1760113`。SHA-256 为 `ae3f28bbf0e74140251111a93a3bf8edab4b38429d398d6e4d6bbe1206e329ac`，与本地构建一致。
+- 新增排序更后的版本化 systemd drop-in，保留原 unit、drop-in、配置及数据库。发布前确认没有新的在途执行；一致性 SQLite 快照和旧服务配置备份位于 `/var/lib/starlink-dimension-router/backups/release-20260928-client-tools-039c893`。旧未知请求的 10 积分占用未修改。
+- 原 router 配置哈希未改变，辅助模型保持 `glm-5.3-flash`。Nginx 短暂发布保护已撤除并恢复原配置，`nginx -t` 通过。
+- 公网 `/health`、`/admin` 返回 200，本机经隧道到 AI Work 的健康检查正常；匿名模型查询返回 401，已有普通 Key 查询 `/v1/models` 返回 200 且含 `seedance`。
+- 复用既有已完成视频，验证 DSH 契约的 `dev_tool_search` 发现调用和 SSE 结束标记，并验证仅提供禁止联网 Bash 时明确降级、不发下载命令。验证前后请求及预算步骤数量不变，新增视频与付费步骤均为 0。本轮没有下载测试媒体。
+- 本机 AI Work 保持最新本地 release `E:\AIWORK\releases\20260928-model-policy\ai-work-assistant.exe`，PID `49268`，监听 `127.0.0.1:7864`。已通过程序启动入口打开助手窗口；桌面状态捕获/激活工具出现窗口标识及前台进程错误，因此未确认其前台截图，也没有强制重启正常网关。
+
+公网 Base URL 仍是 `https://api.gemstory.cn/v1`，客户端无需改地址、Key 或模型。两台实际远端 Agent 原生 UI 的“生成→发现/解锁→本机 Downloads 保存”验收留给用户下一轮测试，不将上述协议检查视为原生 UI 已通过。
