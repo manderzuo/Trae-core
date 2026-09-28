@@ -560,6 +560,12 @@ async fn image_preprocessing_returns_explicit_reference_for_later_video_without_
     let rejected=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(principal.clone()),Bytes::from(missing.to_string())).await;
     assert_eq!(rejected.status(),StatusCode::BAD_REQUEST,"explicit missing reference must not become paid text-to-video");
     assert_eq!(video_bridge.sends.load(Ordering::SeqCst),0);
+    let rejected_body=axum::body::to_bytes(rejected.into_body(),65536).await.unwrap();
+    let diagnostic:Value=serde_json::from_slice(&rejected_body).unwrap();
+    assert!(diagnostic["error"]["diagnostic_id"].as_str().is_some_and(|id|id.starts_with("refdiag-")),"reference rejection must have a correlatable diagnostic ID");
+    assert_eq!(diagnostic["error"]["input_summary"]["messages_total"],1);
+    assert_eq!(diagnostic["error"]["input_summary"]["messages"][0]["content_kind"],"string");
+    assert!(!diagnostic.to_string().contains("480p猫视频"),"diagnostic must not echo private prompt content");
     let input=json!({"model":"seedance","messages":[{"role":"user","content":format!("参考图说明：{marker}\n生成5秒480p猫视频")} ]});
     let response=user_routes::chat_completions(State(state),HeaderMap::new(),Extension(principal),Bytes::from(input.to_string())).await;
     assert_eq!(response.status(),StatusCode::OK);

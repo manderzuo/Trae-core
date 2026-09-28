@@ -279,11 +279,12 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
     use aiwork_core::{BeginRequest,BeginRequestInput};
     if let Some(response)=crate::video_delivery::follow_up(&state,&principal,&body).await {return response;}
     let s=state.clone();let p=principal.clone();
-    body=match tokio::task::spawn_blocking(move ||->Result<Value,&'static str> {
-        crate::reference_context::recover(&s,&p,&mut body)?;Ok(body)
+    body=match tokio::task::spawn_blocking(move ||->Result<Value,(&'static str,Value)> {
+        crate::reference_context::recover(&s,&p,&mut body)
+            .map_err(|code|(code,crate::reference_diagnostics::summarize(&body)))?;Ok(body)
     }).await {
         Ok(Ok(recovered))=>recovered,
-        Ok(Err(code))=>return (StatusCode::BAD_REQUEST,Json(json!({"error":{"code":code,"message":if code=="reference_image_missing" {"本次请求没有携带参考图片或有效素材标记，请重新附加参考图；未提交视频"} else {"参考素材上下文无效或已过期，请重新附加参考图"}}}))).into_response(),
+        Ok(Err((code,summary)))=>return (StatusCode::BAD_REQUEST,Json(crate::reference_diagnostics::rejection(code,summary))).into_response(),
         Err(_)=>return fail("reference_worker_unavailable"),
     };
     if crate::user_routes::extract_seedance_prompt(&body).is_err() {return (StatusCode::BAD_REQUEST,Json(json!({"error":{"code":"seedance_prompt_missing"}}))).into_response();}
