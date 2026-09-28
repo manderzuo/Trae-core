@@ -2,10 +2,11 @@
 use std::{collections::HashMap,sync::{Arc,Mutex}};
 use serde_json::Value;
 use tokio::sync::{watch,OwnedSemaphorePermit,Semaphore};
+use crate::seedance_feedback::{Progress,Stage};
 
 type Outcome=Result<Value,String>;
 type SharedOutcome=Option<Arc<Outcome>>;
-struct Entry {receiver:watch::Receiver<SharedOutcome>,slots:Arc<Semaphore>}
+struct Entry {receiver:watch::Receiver<SharedOutcome>,progress:watch::Sender<Progress>}
 pub(crate) struct SeedanceResults {
     // Serialize durable identity/checkpoint creation with registration. An
     // immediate duplicate cannot become leader before the fresh caller does.
@@ -18,8 +19,8 @@ impl Default for SeedanceResults {
 }
 pub(crate) struct Subscription {
     receiver:watch::Receiver<SharedOutcome>,
+    progress:watch::Receiver<Progress>,
     _global:OwnedSemaphorePermit,
-    _request:OwnedSemaphorePermit,
 }
 pub(crate) struct Publisher {registry:Arc<SeedanceResults>,request:String,sender:watch::Sender<SharedOutcome>}
 impl SeedanceResults {
@@ -27,17 +28,26 @@ impl SeedanceResults {
         let global=self.slots.clone().try_acquire_owned().map_err(|_|"stream_observer_limit")?;
         let mut entries=self.entries.lock().unwrap_or_else(|e|e.into_inner());
         if let Some(entry)=entries.get(request) {
-            let permit=entry.slots.clone().try_acquire_owned().map_err(|_|"stream_observer_limit")?;
-            return Ok((Subscription {receiver:entry.receiver.clone(),_global:global,_request:permit},None));
+            return Ok((Subscription {receiver:entry.receiver.clone(),progress:entry.progress.subscribe(),_global:global},None));
         }
         if entries.len()>=128 {return Err("budget_preparation_busy");}
         let (sender,receiver)=watch::channel(None);
-        let slots=Arc::new(Semaphore::new(16));let permit=slots.clone().try_acquire_owned().unwrap();
-        entries.insert(request.into(),Entry {receiver:receiver.clone(),slots});
-        Ok((Subscription {receiver,_global:global,_request:permit},Some(Publisher {registry:self.clone(),request:request.into(),sender})))
+        let (progress,progress_receiver)=watch::channel(Progress::default());
+        entries.insert(request.into(),Entry {receiver:receiver.clone(),progress});
+        Ok((Subscription {receiver,progress:progress_receiver,_global:global},Some(Publisher {registry:self.clone(),request:request.into(),sender})))
+    }
+    pub(crate) fn progress(&self,request:&str,stage:Stage) {
+        if let Some(entry)=self.entries.lock().unwrap_or_else(|e|e.into_inner()).get(request) {
+            entry.progress.send_if_modified(|current| {
+                let changed=current.stage!=stage;current.stage=stage;
+                if stage!=Stage::QueryDelayed {current.last_confirmed_at_ms=Some(chrono::Utc::now().timestamp_millis());}
+                changed
+            });
+        }
     }
 }
 impl Subscription {
+    pub(crate) fn progress_receiver(&self)->watch::Receiver<Progress> {self.progress.clone()}
     pub(crate) async fn result(mut self)->Outcome {
         loop {
             if let Some(result)=self.receiver.borrow().clone() {return (*result).clone();}
@@ -81,7 +91,7 @@ mod tests {
     async fn subscriber_limits_release_on_disconnect_without_cancelling_worker() {
         let registry=Arc::new(SeedanceResults::default());
         let (first,owner)=registry.subscribe("one").unwrap();let mut waiters=vec![first];
-        for _ in 1..16 {waiters.push(registry.subscribe("one").unwrap().0);}
+        for _ in 1..256 {waiters.push(registry.subscribe("one").unwrap().0);}
         assert!(matches!(registry.subscribe("one"),Err("stream_observer_limit")));
         drop(waiters.pop());let (replacement,duplicate_owner)=registry.subscribe("one").unwrap();assert!(duplicate_owner.is_none());
         drop(waiters);owner.unwrap().complete(Ok(json!({"request_id":"one","status":"completed"})));

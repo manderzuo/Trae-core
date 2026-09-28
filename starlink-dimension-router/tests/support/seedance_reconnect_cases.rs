@@ -2,20 +2,29 @@
 use super::*;
 use std::{sync::atomic::AtomicBool,time::Duration};
 
-struct DelayedBridge {inner:Bridge,kind:&'static str,open:AtomicBool,seen:AtomicUsize,fail:bool}
+struct DelayedBridge {inner:Bridge,kind:&'static str,open:AtomicBool,seen:AtomicUsize,fail:bool,query_outage:AtomicBool,query_unknown:AtomicBool,missing_task_ref:AtomicBool,failure_reason:Mutex<String>,result_task_id:Mutex<String>}
 impl BridgeTransport for DelayedBridge {
     fn send(&self,method:&str,url:&str,headers:&BTreeMap<String,String>,body:&[u8])->Result<BridgeResponse,String> {
         let mut response=self.inner.send(method,url,headers,body)?;
         let gated=self.inner.claims.lock().unwrap().iter().any(|(id,c)|url.contains(&format!("/requests/{id}/")) && c["step_kind"]==self.kind);
         if gated && (url.contains("/execution?") || url.contains("/result?")) {
+            if self.query_outage.load(Ordering::SeqCst) {
+                return Ok(BridgeResponse {status:503,headers:BTreeMap::new(),body:serde_json::to_vec(&json!({"error":{"code":"bridge_state_unavailable"}})).unwrap()});
+            }
             let mut value:Value=serde_json::from_slice(&response.body).unwrap();
             if !self.open.load(Ordering::SeqCst) {
                 if url.contains("/result?") {self.seen.fetch_add(1,Ordering::SeqCst);value["status"]=json!("not_ready");value["result"]=Value::Null;}
                 else {value["status"]=json!("running");value["execution"]["state"]=json!("running");value["execution"]["finished_at_ms"]=Value::Null;value["execution"]["result_available"]=json!(false);}
             } else if self.fail {
-                if url.contains("/result?") {value["result"]=json!({"id":"native-video","status":"failed"});}
+                if url.contains("/result?") {value["result"]=json!({"id":"native-video","status":"failed","error":self.failure_reason.lock().unwrap().clone()});}
                 else {value["status"]=json!("failed");value["execution"]["state"]=json!("failed");}
             }
+            if self.query_unknown.load(Ordering::SeqCst) && url.contains("/execution?") {
+                value["status"]=json!("unknown");value["execution"]["state"]=json!("unknown");
+                value["execution"]["finished_at_ms"]=Value::Null;value["execution"]["result_available"]=json!(false);
+            }
+            if self.missing_task_ref.load(Ordering::SeqCst) && url.contains("/execution?") {value["execution"]["task_ref"]=Value::Null;}
+            if self.kind=="video" && url.contains("/result?") && value["status"]=="ready" {value["result"]["id"]=json!(self.result_task_id.lock().unwrap().clone());}
             response.body=serde_json::to_vec(&value).unwrap();
         }
         Ok(response)
@@ -32,7 +41,7 @@ impl Fixture {
         let k=store.issue_api_key_as_admin_with_max_concurrency("user","Key",BTreeSet::from(["videos:submit".into(),"assets:write".into()]),1,&admin).unwrap();
         store.key_quota_grant_as_admin(&admin,KeyQuotaGrant {api_key_id:k.id.clone(),resource_kind:"credits".into(),amount:500_000_000,actor_user_id:"admin".into(),reason:"isolated".into()}).unwrap();
         store.set_video_billing_control(aiwork_core::VideoBillingControlInput {mode:aiwork_core::VideoBillingMode::Active,reason:"fixture".into(),diagnostic_key_id:None,diagnostic_request_hash:None}).unwrap();
-        let bridge=Arc::new(DelayedBridge {inner:Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent:true,large_downloads:AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0)),download_status:AtomicUsize::new(200)},kind,open:AtomicBool::new(false),seen:AtomicUsize::new(0),fail});
+        let bridge=Arc::new(DelayedBridge {inner:Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent:true,large_downloads:AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0)),download_status:AtomicUsize::new(200)},kind,open:AtomicBool::new(false),seen:AtomicUsize::new(0),fail,query_outage:AtomicBool::new(false),query_unknown:AtomicBool::new(false),missing_task_ref:AtomicBool::new(false),failure_reason:Mutex::new(String::new()),result_task_id:Mutex::new("native-video".into())});
         let principal=store.authenticate_api_key(&k.plaintext).unwrap();
         let mut cfg=RouterConfig::defaults(dir.path().into());cfg.budget_billing_v2=true;cfg.public_base_url="https://core.example".into();
         let state=StarlinkRouterState::for_test(store,BridgeClient::from_transport("http://bridge","bridge-only",bridge.clone()),cfg);
@@ -166,4 +175,125 @@ async fn seedance_reconnect_during_delivery_planner_replays_same_download_tool()
     let (a,b)=tokio::join!(read_stream(first),read_stream(second));
     assert_eq!(a,b);assert_eq!(a["choices"][0]["finish_reason"],"tool_calls");
     assert_eq!(f.bridge.inner.sends.load(Ordering::SeqCst),3);
+}
+
+// These exercise observable wire behavior: clients must see useful progress,
+// retries must not create paid tasks, and known failures must retain their cause.
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn seedance_feedback_starts_with_visible_text_while_helper_is_running() {
+    use http_body_util::BodyExt;
+    let f=Fixture::new("assist",false);let response=f.request(f.body(true,false),true).await;
+    f.waiting().await;
+    let mut body=response.into_body();
+    let frame=tokio::time::timeout(Duration::from_secs(1),body.frame()).await.unwrap().unwrap().unwrap().into_data().unwrap();
+    let chunk:Value=serde_json::from_str(std::str::from_utf8(&frame).unwrap().trim().strip_prefix("data: ").unwrap()).unwrap();
+    assert!(!chunk["choices"][0]["delta"]["content"].as_str().unwrap().is_empty(),"comments and empty deltas cannot keep clients informed");
+    assert!(chunk["request_id"].as_str().unwrap().starts_with("request_"));
+    assert!(chunk["choices"][0]["finish_reason"].is_null(),"progress cannot finish the model turn");
+    f.bridge.open.store(true,Ordering::SeqCst);drop(body);
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn seedance_feedback_thirty_two_connections_observe_one_paid_task() {
+    let f=Fixture::new("video",false);let body=f.body(true,false);let mut replies=Vec::new();
+    for _ in 0..32 {let response=f.request(body.clone(),true).await;assert_eq!(response.status(),StatusCode::OK,"normal reconnects must not hit a per-task 16-connection trap");replies.push(response);}
+    f.waiting().await;f.bridge.open.store(true,Ordering::SeqCst);
+    let first=read_stream(replies.remove(0)).await;
+    for reply in replies {assert_eq!(read_stream(reply).await,first);}
+    assert_eq!(f.bridge.inner.sends.load(Ordering::SeqCst),2);
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn seedance_feedback_safety_failure_is_readable_for_stream_and_nonstream() {
+    let f=Fixture::new("video",true);*f.bridge.failure_reason.lock().unwrap()="video security check failed".into();
+    let first=f.request(f.body(true,false),true).await;f.waiting().await;f.bridge.open.store(true,Ordering::SeqCst);
+    let result=read_stream(first).await;
+    assert_eq!(result["error"]["code"],"video_safety_check_failed");
+    assert!(result["choices"][0]["delta"]["content"].as_str().unwrap().contains("安全检查未通过"));
+    assert!(!result["choices"][0]["delta"]["content"].as_str().unwrap().contains("未扣费"),"execution failure alone proves no refund");
+    let response=f.request(f.body(false,false),false).await;
+    assert_eq!(response.status(),StatusCode::BAD_REQUEST,"a confirmed safety refusal must not look like a transient HTTP 503");
+    let value:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+    assert_eq!(value["error"]["code"],"video_safety_check_failed");
+    assert!(value["error"]["message"].as_str().unwrap().contains("安全检查未通过"));
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn seedance_feedback_temporary_query_failure_keeps_original_task_running() {
+    use http_body_util::BodyExt;
+    let f=Fixture::new("video",false);let response=f.request(f.body(true,false),true).await;f.waiting().await;
+    f.bridge.query_outage.store(true,Ordering::SeqCst);let mut body=response.into_body();
+    tokio::time::timeout(Duration::from_secs(7),async {
+        loop {let frame=body.frame().await.expect("query failure must not end the stream").unwrap().into_data().unwrap();
+            for line in std::str::from_utf8(&frame).unwrap().lines().filter_map(|l|l.strip_prefix("data: ")) {
+                if let Ok(v)=serde_json::from_str::<Value>(line) {if v["task_progress"]["stage"]=="status_query_delayed" {
+                    assert!(v["choices"][0]["finish_reason"].is_null());return;
+                }}
+            }
+        }
+    }).await.expect("client must be told the status query is temporarily unavailable");
+    f.bridge.query_outage.store(false,Ordering::SeqCst);f.bridge.open.store(true,Ordering::SeqCst);
+    let rest=axum::body::to_bytes(body,65536).await.unwrap();let wire=std::str::from_utf8(&rest).unwrap();
+    assert!(wire.contains("\"status\":\"completed\""));assert!(wire.ends_with("data: [DONE]\n\n"));
+    assert_eq!(f.bridge.inner.sends.load(Ordering::SeqCst),2,"observation failures must never repeat dispatch");
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn seedance_feedback_unknown_execution_is_not_claimed_to_be_running() {
+    use http_body_util::BodyExt;
+    let f=Fixture::new("video",false);let response=f.request(f.body(true,false),true).await;f.waiting().await;
+    f.bridge.query_unknown.store(true,Ordering::SeqCst);let mut body=response.into_body();
+    tokio::time::timeout(Duration::from_secs(7),async {
+        loop {let frame=body.frame().await.unwrap().unwrap().into_data().unwrap();
+            for line in std::str::from_utf8(&frame).unwrap().lines().filter_map(|l|l.strip_prefix("data: ")) {
+                if let Ok(v)=serde_json::from_str::<Value>(line) {if v["task_progress"]["stage"]=="status_query_delayed" {return;}}
+            }
+        }
+    }).await.expect("unknown upstream execution must be visible instead of saying generation is healthy");
+    f.bridge.query_unknown.store(false,Ordering::SeqCst);f.bridge.open.store(true,Ordering::SeqCst);drop(body);
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn seedance_feedback_mismatched_video_identity_cannot_supply_a_failure_reason() {
+    let f=Fixture::new("video",true);*f.bridge.failure_reason.lock().unwrap()="video security check failed".into();
+    *f.bridge.result_task_id.lock().unwrap()="some-other-video".into();
+    let response=f.request(f.body(true,false),true).await;f.waiting().await;f.bridge.open.store(true,Ordering::SeqCst);
+    let result=read_stream(response).await;
+    assert_eq!(result["error"]["code"],"seedance_budget_execution_failed");
+    assert!(!result["choices"][0]["delta"]["content"].as_str().unwrap().contains("安全检查未通过"));
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn seedance_feedback_long_wait_emits_visible_progress_without_dispatching_again() {
+    use http_body_util::BodyExt;
+    let f=Fixture::new("video",false);let response=f.request(f.body(true,false),true).await;f.waiting().await;let mut body=response.into_body();
+    tokio::time::timeout(Duration::from_secs(24),async {
+        loop {let frame=body.frame().await.unwrap().unwrap().into_data().unwrap();
+            for line in std::str::from_utf8(&frame).unwrap().lines().filter_map(|l|l.strip_prefix("data: ")) {
+                if let Ok(v)=serde_json::from_str::<Value>(line) {if v["task_progress"]["connection_wait_seconds"].as_u64().is_some_and(|n|n>=20) {
+                    assert!(v["choices"][0]["delta"]["content"].as_str().unwrap().contains("等待"));
+                    assert!(v["choices"][0]["finish_reason"].is_null());return;
+                }}
+            }
+        }
+    }).await.expect("a long-running video needs a visible waiting update");
+    f.bridge.open.store(true,Ordering::SeqCst);drop(body);assert_eq!(f.bridge.inner.sends.load(Ordering::SeqCst),2);
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn seedance_feedback_without_upstream_task_id_does_not_claim_video_submitted() {
+    use http_body_util::BodyExt;
+    let f=Fixture::new("video",false);f.bridge.missing_task_ref.store(true,Ordering::SeqCst);
+    let response=f.request(f.body(true,false),true).await;f.waiting().await;let mut body=response.into_body();
+    let observed=tokio::time::timeout(Duration::from_secs(3),async {
+        loop {let frame=body.frame().await.unwrap().unwrap().into_data().unwrap();
+            for line in std::str::from_utf8(&frame).unwrap().lines().filter_map(|l|l.strip_prefix("data: ")) {
+                if let Ok(v)=serde_json::from_str::<Value>(line) {
+                    assert_ne!(v["task_progress"]["stage"],"processing","a running bridge worker is not proof of native video submission");
+                }
+            }
+        }
+    }).await;
+    assert!(observed.is_err(),"the probe observes the entire pending interval");
+    f.bridge.missing_task_ref.store(false,Ordering::SeqCst);f.bridge.open.store(true,Ordering::SeqCst);drop(body);
 }
