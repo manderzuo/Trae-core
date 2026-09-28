@@ -99,6 +99,8 @@ pub struct VideoWorkVersion {
     pub tail_frame_media_id: Option<String>,
     pub frame_state: String,
     pub frame_error: Option<String>,
+    #[serde(skip_serializing)]
+    pub sealed_frame: Option<EncryptedWorkSnapshot>,
     pub delivery_state: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -147,6 +149,9 @@ pub fn work_handle_context(owner: &str, work: &str, version: Option<&str>) -> St
         "work-handle:{owner}:{work}:{}",
         version.unwrap_or("pending")
     )
+}
+pub fn work_frame_context(owner: &str, work: &str, version: &str) -> String {
+    format!("work-frame:{owner}:{work}:{version}")
 }
 
 fn invalid(reason: &str) -> CoreError {
@@ -200,9 +205,17 @@ fn read_version(r: &rusqlite::Row<'_>) -> rusqlite::Result<VideoWorkVersion> {
         created_at_ms: r.get(15)?,
         updated_at_ms: r.get(16)?,
         deleted_at_ms: r.get(17)?,
+        sealed_frame: match r.get::<_, Option<u32>>(18)? {
+            Some(key_version) => Some(EncryptedWorkSnapshot {
+                key_version,
+                ciphertext: r.get(19)?,
+                snapshot_sha256: r.get(20)?,
+            }),
+            None => None,
+        },
     })
 }
-const VERSION_COLUMNS:&str="v.version_id,v.work_id,v.parent_version_id,v.operation_request_id,v.ordinal,v.action,v.state,v.key_version,v.encrypted_snapshot,v.snapshot_sha256,v.context_handle_sha256,v.tail_frame_media_id,v.frame_state,v.frame_error,v.delivery_state,v.created_at_ms,v.updated_at_ms,v.deleted_at_ms";
+const VERSION_COLUMNS:&str="v.version_id,v.work_id,v.parent_version_id,v.operation_request_id,v.ordinal,v.action,v.state,v.key_version,v.encrypted_snapshot,v.snapshot_sha256,v.context_handle_sha256,v.tail_frame_media_id,v.frame_state,v.frame_error,v.delivery_state,v.created_at_ms,v.updated_at_ms,v.deleted_at_ms,v.frame_key_version,v.encrypted_frame_metadata,v.frame_metadata_sha256";
 fn version_by(
     con: &Connection,
     p: &Principal,
@@ -308,9 +321,13 @@ impl CoreStore {
         owned_work(&con, p, id)
     }
 
-    pub fn owned_work_for_conversation(&self,p:&Principal,association:&str)->Result<Option<VideoWork>,CoreError> {
-        let con=self.connection.lock().expect("core store mutex poisoned");
-        validate_owner(&con,p)?;
+    pub fn owned_work_for_conversation(
+        &self,
+        p: &Principal,
+        association: &str,
+    ) -> Result<Option<VideoWork>, CoreError> {
+        let con = self.connection.lock().expect("core store mutex poisoned");
+        validate_owner(&con, p)?;
         Ok(con.query_row("SELECT work_id,owner_key_id,owner_user_id,conversation_ref,created_at_ms,updated_at_ms,deleted_at_ms FROM video_works WHERE owner_key_id=?1 AND owner_user_id=?2 AND conversation_ref=?3 AND deleted_at_ms IS NULL",params![p.key_id,p.user_id,association],read_work).optional()?)
     }
 
@@ -414,6 +431,80 @@ impl CoreStore {
         // media. Revocation only removes this version as an eligible context.
         tx.commit()?;
         Ok(())
+    }
+    pub fn set_work_frame(
+        &self,
+        p: &Principal,
+        version: &str,
+        state: &str,
+        media: Option<&str>,
+        sealed: Option<&EncryptedWorkSnapshot>,
+        error: Option<&str>,
+    ) -> Result<(), CoreError> {
+        if !matches!(state, "running" | "ready" | "failed")
+            || error.is_some_and(|s| {
+                s.len() > 128 || !s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            })
+        {
+            return Err(invalid("invalid frame state"));
+        }
+        let mut con = self.connection.lock().expect("core store mutex poisoned");
+        let tx = con.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_owner(&tx, p)?;
+        let v = version_by(&tx, p, "version_id", version)?
+            .ok_or_else(|| invalid("version is unavailable"))?;
+        if v.state != WorkVersionState::Completed {
+            return Err(invalid("source version is incomplete"));
+        }
+        if state == "ready" {
+            let id = media.ok_or_else(|| invalid("frame media missing"))?;
+            let proof = sealed.ok_or_else(|| invalid("frame evidence missing"))?;
+            if !valid_sealed(proof.key_version, &proof.ciphertext)
+                || proof.snapshot_sha256.len() != 64
+                || !proof.snapshot_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(invalid("frame evidence invalid"));
+            }
+            let m = owned_media(&tx, p, id)?
+                .filter(|m| m.work_id == v.work_id && m.kind == "tail_frame")
+                .ok_or_else(|| invalid("frame media unavailable"))?;
+            if v.frame_state == "ready" {
+                if v.tail_frame_media_id.as_deref() != Some(id)
+                    || v.sealed_frame
+                        .as_ref()
+                        .is_none_or(|s| s.snapshot_sha256 != proof.snapshot_sha256)
+                {
+                    return Err(CoreError::IdempotencyConflict);
+                }
+                return Ok(());
+            }
+            tx.execute("UPDATE video_work_versions SET frame_state='ready',frame_error=NULL,tail_frame_media_id=?2,frame_key_version=?3,encrypted_frame_metadata=?4,frame_metadata_sha256=?5,updated_at_ms=?6 WHERE version_id=?1",params![version,m.media_id,proof.key_version,proof.ciphertext,proof.snapshot_sha256,chrono::Utc::now().timestamp_millis()])?;
+        } else if v.frame_state != "ready" {
+            tx.execute("UPDATE video_work_versions SET frame_state=?2,frame_error=?3,updated_at_ms=?4 WHERE version_id=?1",params![version,state,error,chrono::Utc::now().timestamp_millis()])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn work_versions_needing_frames(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(Principal, VideoWorkVersion)>, CoreError> {
+        let con = self.connection.lock().expect("core store mutex poisoned");
+        let mut s=con.prepare(&format!("SELECT {VERSION_COLUMNS},w.owner_user_id,w.owner_key_id,k.scopes_json FROM video_work_versions v JOIN video_works w ON w.work_id=v.work_id JOIN api_keys k ON k.id=w.owner_key_id JOIN users u ON u.id=w.owner_user_id WHERE (v.state='completed' OR (v.state IN ('preparing','running','unknown') AND EXISTS(SELECT 1 FROM budget_steps b WHERE b.request_id=v.operation_request_id AND b.core_key_id=w.owner_key_id AND b.kind='video' AND b.execution_state='succeeded' AND b.task_ref IS NOT NULL))) AND v.frame_state IN ('pending','running') AND w.deleted_at_ms IS NULL AND v.deleted_at_ms IS NULL AND k.status='active' AND u.status='active' ORDER BY v.updated_at_ms LIMIT ?1"))?;
+        let rows = s
+            .query_map([limit.min(32) as i64], |r| {
+                Ok((
+                    Principal {
+                        user_id: r.get(21)?,
+                        key_id: r.get(22)?,
+                        scopes: serde_json::from_str(&r.get::<_, String>(23)?)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    },
+                    read_version(r)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
     pub fn work_versions(
         &self,
@@ -766,6 +857,23 @@ impl CoreStore {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         out.extend(rows);
+        let mut s=con.prepare("SELECT v.version_id,w.owner_key_id,v.work_id,v.frame_key_version,v.encrypted_frame_metadata FROM video_work_versions v JOIN video_works w ON w.work_id=v.work_id WHERE v.frame_key_version IS NOT NULL")?;
+        out.extend(
+            s.query_map([], |r| {
+                Ok(WorkSecretRef {
+                    kind: "frame".into(),
+                    id: r.get(0)?,
+                    context: work_frame_context(
+                        &r.get::<_, String>(1)?,
+                        &r.get::<_, String>(2)?,
+                        &r.get::<_, String>(0)?,
+                    ),
+                    key_version: r.get(3)?,
+                    ciphertext: r.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?,
+        );
         Ok(out)
     }
     pub fn replace_work_secret_crypto(
@@ -777,7 +885,7 @@ impl CoreStore {
         if !valid_sealed(version, cipher) {
             return Err(invalid("invalid work crypto replacement"));
         }
-        let sql=match old.kind.as_str() {"snapshot"=>"UPDATE video_work_versions SET key_version=?4,encrypted_snapshot=?5 WHERE version_id=?1 AND key_version=?2 AND encrypted_snapshot=?3","handle"=>"UPDATE video_work_contexts SET key_version=?4,encrypted_handle=?5 WHERE context_handle_sha256=?1 AND key_version=?2 AND encrypted_handle=?3",_=>return Err(invalid("unknown work secret kind"))};
+        let sql=match old.kind.as_str() {"snapshot"=>"UPDATE video_work_versions SET key_version=?4,encrypted_snapshot=?5 WHERE version_id=?1 AND key_version=?2 AND encrypted_snapshot=?3","frame"=>"UPDATE video_work_versions SET frame_key_version=?4,encrypted_frame_metadata=?5 WHERE version_id=?1 AND frame_key_version=?2 AND encrypted_frame_metadata=?3","handle"=>"UPDATE video_work_contexts SET key_version=?4,encrypted_handle=?5 WHERE context_handle_sha256=?1 AND key_version=?2 AND encrypted_handle=?3",_=>return Err(invalid("unknown work secret kind"))};
         let con = self.connection.lock().expect("core store mutex poisoned");
         Ok(con.execute(
             sql,

@@ -24,6 +24,10 @@ pub(crate) struct Bridge {
     pub(crate) video_sends: AtomicUsize,
     pub(crate) assist_sends: AtomicUsize,
     pub(crate) unknown: std::sync::atomic::AtomicBool,
+    pub(crate) tail_capability: std::sync::atomic::AtomicBool,
+    pub(crate) frame_failure: std::sync::atomic::AtomicBool,
+    pub(crate) frame_reads: AtomicUsize,
+    pub(crate) billing_final: std::sync::atomic::AtomicBool,
 }
 impl BridgeTransport for Bridge {
     fn send(
@@ -38,7 +42,50 @@ impl BridgeTransport for Bridge {
             Some("Bearer bridge-only")
         );
         let input: Value = serde_json::from_slice(raw).unwrap_or(Value::Null);
-        let value = if url.ends_with("/key-registry") {
+        if url.contains("/last-frame?") {
+            if self.frame_failure.load(Ordering::SeqCst) {
+                return Err("frame unavailable".into());
+            }
+            self.frame_reads.fetch_add(1, Ordering::SeqCst);
+            let claims = self.claims.lock().unwrap();
+            let (id, c) = claims
+                .iter()
+                .find(|(id, _)| url.contains(&format!("/requests/{id}/")))
+                .ok_or("missing video claim")?;
+            use base64::Engine;
+            use sha2::{Digest, Sha256};
+            let body=base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aVl8AAAAASUVORK5CYII=").unwrap();
+            return Ok(BridgeResponse {
+                status: 200,
+                headers: BTreeMap::from([
+                    ("content-type".into(), "image/png".into()),
+                    ("content-length".into(), body.len().to_string()),
+                    ("x-aiwork-frame-width".into(), "1".into()),
+                    ("x-aiwork-frame-height".into(), "1".into()),
+                    ("x-aiwork-frame-timestamp-ms".into(), "875".into()),
+                    (
+                        "x-aiwork-source-sha256".into(),
+                        format!("{:x}", Sha256::digest(format!("source-{id}"))),
+                    ),
+                    (
+                        "x-aiwork-frame-sha256".into(),
+                        format!("{:x}", Sha256::digest(&body)),
+                    ),
+                    ("x-aiwork-request-id".into(), id.clone()),
+                    ("x-aiwork-budget-id".into(), format!("b-{id}")),
+                    (
+                        "x-aiwork-core-key-id".into(),
+                        c["core_key_id"].as_str().unwrap().into(),
+                    ),
+                    ("x-aiwork-account-ref".into(), "exclusive-account".into()),
+                    ("x-aiwork-bridge-instance-id".into(), "fixture".into()),
+                ]),
+                body,
+            });
+        }
+        let value = if url.ends_with("/video-capabilities") {
+            json!({"tail_reference":self.tail_capability.load(Ordering::SeqCst),"native_first_frame":false,"native_video_extend":false,"contract_version":"tail-reference-v1","evidence_digest":"ab".repeat(32)})
+        } else if url.ends_with("/key-registry") {
             json!({"applied":true})
         } else if url.ends_with("/v1/assets") {
             json!({"id":"bridge-owned-image"})
@@ -95,14 +142,21 @@ impl BridgeTransport for Bridge {
                     let decision = if payload.is_null() {
                         json!({"intent":"video","prompt":prompt})
                     } else {
-                        json!({"action":if parent&&!create{"revise"}else{"create"},"effective_prompt":prompt,"spec_patch":{},"reference_policy":"inherit","clarification":null})
+                        json!({"action":if payload["requested_action"]=="continue"{"continue"}else if parent&&!create{"revise"}else{"create"},"effective_prompt":prompt,"spec_patch":{},"reference_policy":"inherit","clarification":null})
                     };
                     json!({"choices":[{"message":{"content":decision.to_string()},"finish_reason":"stop"}]})
                 };
             } else if url.contains("/billing?") {
-                v["status"] = json!("pending");
-                v["event"] = Value::Null;
-                v["receipt"] = Value::Null;
+                if self.billing_final.load(Ordering::SeqCst) {
+                    let receipt = json!({"request_id":id,"status":"final","actual_credits":"1.250000","unit":"credits","source_ref":format!("fixture-final-{id}"),"task_ref":if c["step_kind"]=="video"{json!(format!("video-{id}"))}else{Value::Null},"observed_at_ms":chrono::Utc::now().timestamp_millis()});
+                    v["status"] = json!("final");
+                    v["receipt"] = receipt.clone();
+                    v["event"] = json!({"wire_version":2,"generation":"fixture","sequence":1,"event_id":format!("event-{id}"),"request_id":id,"core_key_id":c["core_key_id"],"budget_id":format!("b-{id}"),"account_ref":"exclusive-account","bridge_instance_id":"fixture","kind":"final","receipt":receipt,"conflict":null,"confirmation_policy":"post-terminal-session-observation-v1","evidence_hash":format!("hash-{id}")});
+                } else {
+                    v["status"] = json!("pending");
+                    v["event"] = Value::Null;
+                    v["receipt"] = Value::Null;
+                }
             } else {
                 return Err("unexpected route".into());
             }
@@ -125,6 +179,9 @@ pub(crate) struct Fixture {
 }
 impl Fixture {
     pub(crate) fn new() -> Self {
+        Self::with_continuation(false)
+    }
+    pub(crate) fn with_continuation(enabled: bool) -> Self {
         let dir = std::env::temp_dir().join(format!("work-execution-{}", rand::random::<u64>()));
         let store = Arc::new(CoreStore::open(&dir).unwrap());
         store.migrate().unwrap();
@@ -172,10 +229,15 @@ impl Fixture {
             video_sends: AtomicUsize::new(0),
             assist_sends: AtomicUsize::new(0),
             unknown: std::sync::atomic::AtomicBool::new(false),
+            tail_capability: std::sync::atomic::AtomicBool::new(true),
+            frame_failure: std::sync::atomic::AtomicBool::new(false),
+            frame_reads: AtomicUsize::new(0),
+            billing_final: std::sync::atomic::AtomicBool::new(false),
         });
         let mut config = RouterConfig::defaults(dir.clone());
         config.budget_billing_v2 = true;
         config.work_context_enabled = true;
+        config.continuation_enabled = enabled;
         config.seedance_assistant_model = "glm-5.3-flash".into();
         config.public_base_url = "https://api.example.test".into();
         let state = StarlinkRouterState::for_test(
@@ -193,7 +255,12 @@ impl Fixture {
             dir,
         }
     }
-    pub(crate) async fn response(&self, key: &str, id: &str, body: &Value) -> axum::response::Response {
+    pub(crate) async fn response(
+        &self,
+        key: &str,
+        id: &str,
+        body: &Value,
+    ) -> axum::response::Response {
         self.app
             .clone()
             .oneshot(

@@ -24,6 +24,11 @@ pub struct RouterConfig {
     pub work_context_enabled: bool,
     #[serde(default)]
     pub continuation_enabled: bool,
+    /// Short-lived, explicit test-Key exception for pending tail_reference acceptance only.
+    #[serde(default)]
+    pub continuation_test_key_ids: Vec<String>,
+    #[serde(default)]
+    pub continuation_test_expires_at_ms: i64,
     #[serde(default = "work_retention_ms")]
     pub work_media_retention_ms: i64,
     #[serde(default = "work_key_limit")]
@@ -54,6 +59,8 @@ impl RouterConfig {
             budget_billing_v2: false,
             work_context_enabled: false,
             continuation_enabled: false,
+            continuation_test_key_ids: Vec::new(),
+            continuation_test_expires_at_ms: 0,
             work_media_retention_ms: work_retention_ms(),
             work_media_key_limit_bytes: work_key_limit(),
             work_media_global_limit_bytes: work_global_limit(),

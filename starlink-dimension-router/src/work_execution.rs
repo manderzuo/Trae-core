@@ -149,12 +149,7 @@ fn finish_read_only(
     }
     let mut reply = crate::budget_flow::completion(request, text);
     if let Some(v) = version {
-        let h = work_context::issue_handle(state, p, &v.work_id, Some(&v.version_id))?;
-        work_context::decorate_reply(
-            &mut reply,
-            &h,
-            &json!({"work_id":v.work_id,"base_version_id":v.version_id,"request_id":v.operation_request_id}),
-        );
+        work_context::decorate_owned_request(state, p, &v.operation_request_id, &mut reply)?;
     }
     Ok(reply)
 }
@@ -293,6 +288,7 @@ fn pin_and_bind(
     base: Option<&VideoWorkSnapshot>,
     d: &WorkDecision,
     mut original: Value,
+    continuation: Option<&VideoWorkSnapshot>,
 ) -> Result<VideoWorkVersion, String> {
     let work = if d.action != WorkIntent::Create || binding.base_version_id.is_none() {
         binding
@@ -362,6 +358,10 @@ fn pin_and_bind(
     }
     original["work_user_media_ids"] = json!(media_ids);
     let mut snapshot = work_planner::merge_snapshot(base, d, &original)?;
+    if let Some(c) = continuation {
+        snapshot.tail_frame_media_id = c.tail_frame_media_id.clone();
+        snapshot.reference_mode = c.reference_mode.clone();
+    }
     snapshot.parent_version_id = if d.action == WorkIntent::Create {
         None
     } else {
@@ -371,7 +371,15 @@ fn pin_and_bind(
     let mut wire = json!({"model":"seedance","prompt":snapshot.effective_prompt,"duration":snapshot.duration,"resolution":snapshot.resolution,"ratio":snapshot.ratio,"watermark":snapshot.watermark});
     let mut image_assets = Vec::new();
     let mut video_assets = Vec::new();
-    for id in &snapshot.user_media_ids {
+    let references = snapshot
+        .user_media_ids
+        .iter()
+        .chain(snapshot.tail_frame_media_id.iter())
+        .collect::<Vec<_>>();
+    if references.len() > 10 {
+        return Err("reference_image_limit".into());
+    }
+    for id in references {
         let media = state
             .store
             .owned_work_media(p, id)
@@ -556,9 +564,21 @@ pub(crate) async fn execute(
                 return Err("work_decision_invalid".into());
             }
         }
-        if decision.action == WorkIntent::Continue {
-            return Err("continuation_mode_unsupported".into());
-        }
+        let continuation = if decision.action == WorkIntent::Continue {
+            let mut input = normalized.clone();
+            input["prompt"] = json!(decision.effective_prompt);
+            Some(
+                crate::work_continuation::prepare_continuation(
+                    state.clone(),
+                    p.clone(),
+                    parent.as_ref().ok_or("work_parent_required")?.clone(),
+                    input,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         if decision.action == WorkIntent::Create && base.is_some() {
             // Discard hydrated parent assets, not this turn's explicitly supplied
             // images. Independent creation cannot resurrect old reference markers.
@@ -595,6 +615,7 @@ pub(crate) async fn execute(
                 base.as_ref(),
                 &decision,
                 normalized,
+                continuation.as_ref(),
             )
         })
         .await
@@ -645,7 +666,7 @@ pub(crate) async fn execute(
     crate::video_delivery::completion(&state, &p, &request, &original).await
 }
 pub(crate) fn complete_version(
-    state: &StarlinkRouterState,
+    state: &Arc<StarlinkRouterState>,
     p: &Principal,
     request: &str,
 ) -> Result<(), String> {
@@ -668,6 +689,7 @@ pub(crate) fn complete_version(
             .store
             .release_work_media_leases(p, request)
             .map_err(|_| "work_media_unavailable")?;
+        crate::work_continuation::schedule(state, p, &v);
     }
     Ok(())
 }

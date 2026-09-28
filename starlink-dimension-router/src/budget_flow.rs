@@ -12,9 +12,9 @@ struct Prepared {
 }
 pub(crate) fn fail(code:&str)->Response {
     let status=match code {
-        "key_concurrency_exceeded"|"video_download_busy"|"budget_preparation_busy"|"bridge_workers_busy"|"reference_upload_limited"|"stream_observer_limit"=>StatusCode::TOO_MANY_REQUESTS,
+        "frame_extractor_busy"|"key_concurrency_exceeded"|"video_download_busy"|"budget_preparation_busy"|"bridge_workers_busy"|"reference_upload_limited"|"stream_observer_limit"=>StatusCode::TOO_MANY_REQUESTS,
         "quota_insufficient"=>StatusCode::PAYMENT_REQUIRED,
-        "video_not_ready"|"budget_identity_conflict"=>StatusCode::CONFLICT,
+        "work_parent_unavailable"|"frame_result_not_ready"|"video_not_ready"|"budget_identity_conflict"=>StatusCode::CONFLICT,
         "invalid_budget_business_request"|"invalid_chat_image"|"reference_video_metadata_invalid"|
         "reference_video_format_unsupported"|"reference_asset_type_mismatch"|
         "reference_asset_unavailable"|"reference_video_budget_metadata_required"|

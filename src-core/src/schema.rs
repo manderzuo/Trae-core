@@ -922,10 +922,15 @@ CREATE TABLE video_work_versions (
  context_handle_sha256 TEXT,
  tail_frame_media_id TEXT REFERENCES video_work_media(media_id),
  frame_state TEXT NOT NULL DEFAULT 'pending' CHECK(frame_state IN ('pending','running','ready','failed')),
- frame_error TEXT,
+  frame_error TEXT,
+  frame_key_version INTEGER CHECK(frame_key_version IS NULL OR frame_key_version>0),
+  encrypted_frame_metadata BLOB CHECK(encrypted_frame_metadata IS NULL OR length(encrypted_frame_metadata)>28),
+  frame_metadata_sha256 TEXT CHECK(frame_metadata_sha256 IS NULL OR length(frame_metadata_sha256)=64),
  delivery_state TEXT NOT NULL DEFAULT 'pending',
  created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, deleted_at_ms INTEGER,
- UNIQUE(work_id,ordinal)
+ UNIQUE(work_id,ordinal),
+ CHECK((frame_key_version IS NULL AND encrypted_frame_metadata IS NULL AND frame_metadata_sha256 IS NULL) OR (frame_key_version IS NOT NULL AND encrypted_frame_metadata IS NOT NULL AND frame_metadata_sha256 IS NOT NULL)),
+ CHECK(frame_state<>'ready' OR (tail_frame_media_id IS NOT NULL AND frame_key_version IS NOT NULL))
 );
 CREATE TABLE video_work_contexts (
  context_handle_sha256 TEXT PRIMARY KEY CHECK(length(context_handle_sha256)=64),

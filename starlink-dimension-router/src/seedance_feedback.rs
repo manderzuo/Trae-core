@@ -59,6 +59,13 @@ pub(crate) fn video_failure(result:&Value)->&'static str {
     }
 }
 pub(crate) fn message(code:&str)->&'static str {match code {
+    "continuation_disabled"=>"续写功能尚未启用；本次未提交新的视频片段。",
+    "continuation_mode_unsupported"=>"上游尚未验证所选续写模式；本次未提交新的视频片段。",
+    "work_parent_unavailable"=>"指定的父视频版本不可用，不能续写；请检查版本编号与权限。",
+    "frame_result_not_ready"=>"父视频尚未确认完成，暂不能提取尾帧；本次未提交新片段。",
+    "frame_extractor_busy"=>"尾帧处理资源暂忙，请稍后继续同一请求；不会重新生成父视频。",
+    "frame_extraction_unavailable"|"frame_output_invalid"|"frame_identity_invalid"=>"未取得来源可核验的尾帧，已停止续写；原视频和原任务结算不受影响。",
+    "continuation_capabilities_unavailable"=>"暂时无法读取上游续写能力，未提交新的视频片段。",
     "video_safety_check_failed"=>"上游返回：视频安全检查未通过，本次生成失败。",
     "reference_safety_check_failed"=>"上游返回：参考图片安全检查未通过，本次生成失败。",
     "prompt_safety_check_failed"=>"上游返回：提示词安全检查未通过，本次生成失败。",

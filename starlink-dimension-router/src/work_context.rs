@@ -301,10 +301,19 @@ pub fn decorate_owned_request(
         .map_err(|_| unavailable())?
     {
         let h = issue_handle(state, p, &v.work_id, Some(&v.version_id))?;
+        let snapshot=read_snapshot(state,p,&v)?;
+        if snapshot.reference_mode=="tail_reference" {
+            if let Some(choices)=reply["choices"].as_array_mut(){for choice in choices {
+                if let Some(text)=choice["message"]["content"].as_str().map(str::to_owned) {
+                    let notice="本段使用上一版本尾帧作近似参考，生成独立新片段；不是原生视频延长或严格首帧锁定。";
+                    if !text.contains(notice){choice["message"]["content"]=json!(format!("{text}\n\n{notice}"));}
+                }
+            }}
+        }
         decorate_reply(
             reply,
             &h,
-            &json!({"work_id":v.work_id,"base_version_id":v.version_id,"request_id":request}),
+            &json!({"work_id":v.work_id,"base_version_id":v.version_id,"request_id":request,"parent_version_id":v.parent_version_id,"reference_mode":snapshot.reference_mode}),
         );
     }
     Ok(())
