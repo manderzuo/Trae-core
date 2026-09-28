@@ -28,4 +28,14 @@
 
 向实际公网地址用现有授权普通 Key 发送一个不存在上传会话的回执，工具编号模拟客户端改写。旧版本返回 `400 invalid_delivery_tool_result`，没有新增请求、计费操作或上传会话。切换后同类探针应返回上传处理器的 `reference_upload_invalid`，不能产生付费步骤。
 
-部署及切换后的实测结果在完成后补录。此次不自动恢复用户之前失败的上传会话，不替用户重新提交视频。远端 TRAE 的再次界面操作尚未验收。
+## 公网部署及切换后验证
+
+- 源码提交 `d5ff6a0` 已推送到 `manderzuo/Trae-core` 的 `fix/seedance-billing-20260925` 分支。
+- 公网运行文件为 `/opt/gemstory/starlink-dimension-router/releases/20260928-reference-upload-reply/starlink-dimension-router`；运行进程文件 SHA256 与本地 Linux release 一致。
+- 服务 active，`https://api.gemstory.cn/health` 返回 200/ok；schema 保持 29，切换前后现有 11 条 held 财务记录逐条一致。
+- 切换后同类公网探针返回 `400 reference_upload_invalid`，确认上传回执进入上传处理器，而非旧下载处理器。探针故意引用不存在的会话，400 是正确拒绝，不是成功生成验收；请求、计费操作、上传会话和素材新增数均为零。
+- 服务器两个临时部署文件已按哈希核对后删除；正式版本和 `/var/lib/starlink-dimension-router/backups/release-20260928-reference-upload-reply` 回滚备份保留。
+
+此次不自动恢复用户之前失败的上传会话，不替用户重新提交视频。远端 TRAE 的再次界面操作尚未验收；应重新附加参考图提交一次，旧报错不会自动消失。此前该客户端具体的原始工具回报仍未留存，不把协议回归或公网拒绝探针描述成真实客户端付费验收。
+
+本轮临时目录 `D:/gpt/reference-upload-reply-20260928/tmp` 已核对为单独测试目录、无重解析点，共 145 文件/66,825,057 字节（约 64 MiB）；删除被执行环境策略阻止，未换工具绕过。该目录仍保留，不声称本地临时内容已经清理。
