@@ -36,7 +36,7 @@
 - [x] Implement persistent handoff, short-lived upload authorization, literal-path scripts, original-request restoration before download follow-up handling.
 - [x] Extend tests for all review-focus cases and real generated command execution; expect original bytes and ownership isolation.
 - [x] Run router and core cargo test suites offline/locked; expect all passing.
-- [ ] Review diff and commit only scoped code/tests/design.
+- [x] Review diff and commit only scoped code/tests/design.
 
 ### Task 2: Public acceptance and release
 
@@ -44,7 +44,8 @@
 
 **Interfaces:** Task 1's public upload route and Chat tool-call protocol, existing deployment service and paid bridge.
 
-- [ ] Self-audit authorization, idempotency, bounded retention, original prompt/parameters and no secrets in output.
-- [ ] Build Linux binary; inspect active work before atomic release; verify health/hash.
-- [ ] Run one real public API reference test through generated terminal command; check asset hash, actual upstream image reference, completed video and billing.
-- [ ] Push verified Core changes to its existing GitHub branch; document evidence and limits; clean task-owned temporary artifacts.
+- [x] Self-audit authorization, idempotency, bounded retention, original prompt/parameters and no secrets in output.
+- [x] Build Linux binary; inspect active work before atomic release; verify health/hash.
+- [x] Run one real public API reference test through generated terminal command; check asset hash, actual upstream image reference, completed video and billing.
+- [x] Push verified Core changes to its existing GitHub branch; document evidence and limits.
+- [ ] Clean local task-owned temporary artifacts: attempted cleanup was blocked by the execution environment; files retained, not retried through a bypass. Remote temporary deployment script removed; acceptance video, evidence and rollback backups retained.
