@@ -304,6 +304,12 @@ impl CoreStore {
         owned_work(&con, p, id)
     }
 
+    pub fn owned_work_for_conversation(&self,p:&Principal,association:&str)->Result<Option<VideoWork>,CoreError> {
+        let con=self.connection.lock().expect("core store mutex poisoned");
+        validate_owner(&con,p)?;
+        Ok(con.query_row("SELECT work_id,owner_key_id,owner_user_id,conversation_ref,created_at_ms,updated_at_ms,deleted_at_ms FROM video_works WHERE owner_key_id=?1 AND owner_user_id=?2 AND conversation_ref=?3 AND deleted_at_ms IS NULL",params![p.key_id,p.user_id,association],read_work).optional()?)
+    }
+
     pub fn bind_work_version(
         &self,
         p: &Principal,

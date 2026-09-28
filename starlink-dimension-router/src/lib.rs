@@ -15,6 +15,8 @@ pub mod bridge_config;
 pub mod migration;
 pub mod assets;
 pub mod work_media;
+pub mod work_context;
+pub mod work_planner;
 pub mod video_billing;
 pub mod video_reconciler;
 pub(crate) mod budget_reconciler;

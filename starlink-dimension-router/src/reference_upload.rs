@@ -228,6 +228,12 @@ pub(crate) async fn before_chat(state:&Arc<StarlinkRouterState>,p:&Principal,hea
         let mut original:Value=match serde_json::from_str(&text) {Ok(v)=>v,Err(_)=>return Some(bad("reference_upload_invalid"))};
         remove_attachment_markup(&mut original);
         original["image_asset_ids"]=json!(record.asset_ids);
+        if state.config.work_context_enabled {
+            match state.store.owned_work_for_conversation(p,&format!("upload:{id}")) {
+                Ok(Some(w))=>original["work_context"]=json!({"work_id":w.work_id}),
+                Ok(None)=>{},Err(_)=>return Some(bad("work_context_unavailable")),
+            }
+        }
         // Tool output and changed prompts/tools are not the paid request.
         original["stream"]=json!(body["stream"].as_bool().unwrap_or(false));
         headers.insert("idempotency-key",format!("reference-upload:{id}").parse().unwrap());
@@ -260,8 +266,18 @@ pub(crate) async fn before_chat(state:&Arc<StarlinkRouterState>,p:&Principal,hea
     let mut args=tool.arguments;
     args[tool.command_key]=json!(command(&config,tool.bash));
     if args.get("description").is_some() {args["description"]=json!("Upload the user-attached reference images before generating video");}
-    let value=json!({"id":format!("chatcmpl-ref-{id}"),"object":"chat.completion","model":"seedance","created":chrono::Utc::now().timestamp(),
+    let mut value=json!({"id":format!("chatcmpl-ref-{id}"),"object":"chat.completion","model":"seedance","created":chrono::Utc::now().timestamp(),
         "choices":[{"index":0,"message":{"role":"assistant","content":"正在通过本机工具上传本次参考图片，上传完成后开始生成视频。此步骤尚未提交视频、未扣视频积分。","tool_calls":[{"id":format!("{PREFIX}{id}"),"type":"function","function":{"name":tool.name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]});
+    if state.config.work_context_enabled {
+        let resolved=match crate::work_context::resolve(state,p,headers,body) {Ok(r)=>r,Err(_)=>return Some(bad("work_context_unavailable"))};
+        let (work,version)=match resolved {
+            crate::work_context::WorkResolution::Existing{work,base_version}=>(work,base_version),
+            crate::work_context::WorkResolution::New=>match state.store.create_video_work(p,&format!("upload:{id}")) {Ok(w)=>(w,None),Err(_)=>return Some(bad("work_context_unavailable"))},
+            crate::work_context::WorkResolution::Clarify{text}=>{value["choices"][0]["message"]=json!({"role":"assistant","content":text});value["choices"][0]["finish_reason"]=json!("stop");return Some(response(value,body["stream"].as_bool().unwrap_or(false)));},
+        };
+        let h=match crate::work_context::issue_handle(state,p,&work.work_id,version.as_ref().map(|v|v.version_id.as_str())) {Ok(h)=>h,Err(_)=>return Some(bad("work_context_unavailable"))};
+        crate::work_context::decorate_reply(&mut value,&h,&json!({"work_id":work.work_id,"base_version_id":version.map(|v|v.version_id)}));
+    }
     Some(response(value,body["stream"].as_bool().unwrap_or(false)))
 }
 

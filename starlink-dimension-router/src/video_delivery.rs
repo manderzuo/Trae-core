@@ -89,6 +89,7 @@ fn fallback(state:&StarlinkRouterState,p:&Principal,request:&str)->Result<Value,
     let download_url=if usable {format!("{base}/v1/videos/{request}/download?ticket={}",issue_ticket(state,p,request,chrono::Utc::now().timestamp_millis())?)} else {content_url.clone()};
     let mut value=chat(request,&format!("视频已生成，但当前无法自动保存到本机 Downloads。下载地址：{download_url}\n链接有效期 15 分钟；过期后可使用原 Key 访问内容接口。"));
     value["video_task"]=json!({"id":request,"status":"completed","content_url":content_url,"download_url":download_url});
+    crate::work_context::decorate_owned_request(state,p,request,&mut value)?;
     Ok(value)
 }
 pub(crate) async fn completion(state:&Arc<StarlinkRouterState>,p:&Principal,request:&str,body:&Value)->Result<Value,String> {
@@ -113,6 +114,7 @@ pub(crate) async fn completion(state:&Arc<StarlinkRouterState>,p:&Principal,requ
         } else {
             if let Some(call)=crate::delivery_discovery::first_call(body,request) {
                 set_discovery_call(&mut value,call,"视频已生成，正在查找客户端可用的本地下载工具。","discovering_tools");
+                crate::work_context::decorate_owned_request(state,p,request,&mut value)?;
                 return Ok(value);
             }
             let reason=crate::delivery_assist::unavailable_reason(body);
@@ -130,15 +132,17 @@ pub(crate) async fn completion(state:&Arc<StarlinkRouterState>,p:&Principal,requ
     } else {
         value["video_delivery"]=json!({"status":"download_unavailable","reason":"public_base_url_unconfigured"});
     }
+    crate::work_context::decorate_owned_request(state,p,request,&mut value)?;
     Ok(value)
 }
-pub(crate) fn sse_completion(value: &Value) -> Vec<u8> {
+pub fn sse_completion(value: &Value) -> Vec<u8> {
     let mut delta=value["choices"][0]["message"].clone();
     if let Some(calls)=delta["tool_calls"].as_array_mut() {for (i,call) in calls.iter_mut().enumerate() {call["index"]=json!(i);}}
     let mut chunk=json!({"id":value["id"],"object":"chat.completion.chunk","model":value["model"],"created":value["created"],"request_id":value["request_id"],
         "choices":[{"index":0,"delta":delta,"finish_reason":value["choices"][0]["finish_reason"]}]});
     if !value["video_task"].is_null() {chunk["video_task"]=value["video_task"].clone();}
     if !value["video_delivery"].is_null() {chunk["video_delivery"]=value["video_delivery"].clone();}
+    if !value["work_context"].is_null() {chunk["work_context"]=value["work_context"].clone();}
     format!("data: {chunk}\n\ndata: [DONE]\n\n").into_bytes()
 }
 fn response(value: Value, stream: bool) -> Response {
@@ -169,6 +173,7 @@ pub(crate) async fn follow_up(state: &Arc<StarlinkRouterState>, p: &Principal, b
             if let Some(call)=crate::delivery_discovery::unlock_call(body,request,&tool["content"]) {
                 let mut value=match fallback(state,p,request) {Ok(v)=>v,Err(_)=>return Some(error(StatusCode::SERVICE_UNAVAILABLE,"delivery_unavailable"))};
                 set_discovery_call(&mut value,call,"正在启用客户端发现的本地终端工具。","unlocking_tools");
+                if crate::work_context::decorate_owned_request(state,p,request,&mut value).is_err() {return Some(error(StatusCode::SERVICE_UNAVAILABLE,"work_context_unavailable"));}
                 return Some(response(value,body["stream"].as_bool().unwrap_or(false)));
             }
         }
@@ -196,6 +201,7 @@ pub(crate) async fn follow_up(state: &Arc<StarlinkRouterState>, p: &Principal, b
         v["video_delivery"]=json!({"status":"download_failed"});v
     };
     value["video_task"]=json!({"id":request,"status":"completed","content_url":format!("{}/v1/videos/{request}/content",state.config.public_base_url.trim_end_matches('/'))});
+    if crate::work_context::decorate_owned_request(state,p,request,&mut value).is_err() {return Some(error(StatusCode::SERVICE_UNAVAILABLE,"work_context_unavailable"));}
     Some(response(value,body["stream"].as_bool().unwrap_or(false)))
 }
 pub(crate) fn tool_failed(value:&Value,depth:usize)->bool {

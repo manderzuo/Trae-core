@@ -10,6 +10,9 @@ struct Fixture {
     principal:aiwork_core::Principal, dir:Directory,
 }
 fn fixture(base:&str)->Fixture {
+    fixture_features(base,false)
+}
+fn fixture_features(base:&str,context:bool)->Fixture {
     let dir=Directory(std::env::temp_dir().join(format!("ref-upload-{:032x}",rand::random::<u128>())));
     let store=Arc::new(CoreStore::open(dir.path()).unwrap());store.migrate().unwrap();
     store.create_user(NewUser {id:"admin".into(),name:"Admin".into(),role:UserRole::Admin},"bootstrap").unwrap();
@@ -18,10 +21,48 @@ fn fixture(base:&str)->Fixture {
     store.key_quota_grant_as_admin(&principal,KeyQuotaGrant {api_key_id:key.id,resource_kind:"credits".into(),amount:500_000_000,actor_user_id:"admin".into(),reason:"test".into()}).unwrap();
     store.set_video_billing_control(aiwork_core::VideoBillingControlInput {mode:aiwork_core::VideoBillingMode::Active,reason:"fixture".into(),diagnostic_key_id:None,diagnostic_request_hash:None}).unwrap();
     let bridge=Arc::new(Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent:true,large_downloads:std::sync::atomic::AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0)),download_status:AtomicUsize::new(200)});
-    let mut cfg=RouterConfig::defaults(dir.path().into());cfg.budget_billing_v2=true;cfg.public_base_url=base.into();
+    let mut cfg=RouterConfig::defaults(dir.path().into());cfg.budget_billing_v2=true;cfg.public_base_url=base.into();cfg.work_context_enabled=context;
     let state=StarlinkRouterState::for_test(store,BridgeClient::from_transport("http://bridge","bridge-only",bridge.clone()),cfg);
     let app=starlink_dimension_router::server::build_router(state.clone());
     Fixture {app,state,bridge,key:key.plaintext,principal,dir}
+}
+
+#[tokio::test]
+async fn pending_reference_upload_returns_stable_owned_work_without_paid_version() {
+    let f=fixture_features("https://api.example.test",true);
+    let b=input(&["C:\\a.png"],false);
+    let (reply,_)=pending(&f,b.clone()).await;
+    let id=reply["work_context"]["work_id"].as_str().expect("upload must return pending work");
+    assert!(f.state.store.owned_video_work(&f.principal,id).unwrap().is_some());
+    assert!(f.state.store.work_versions(&f.principal,id).unwrap().is_empty());
+    let (replayed,_)=pending(&f,b).await;
+    assert_eq!(replayed["work_context"],reply["work_context"]);
+    assert_eq!(replayed["choices"][0]["message"]["content"],reply["choices"][0]["message"]["content"]);
+    assert!(reply["choices"][0]["message"]["content"].as_str().unwrap().contains("[AIWORK_WORK:"));
+    assert_eq!(f.bridge.sends.load(Ordering::SeqCst),0);
+}
+
+#[tokio::test]
+async fn delivery_and_failed_download_receipt_keep_exact_version_without_new_dispatch() {
+    let f=fixture_features("https://api.example.test",true);
+    let result=json_response(chat(&f,&f.key,json!({"model":"seedance","messages":[{"role":"user","content":"生成橘猫散步视频，5秒480P"}]})).await).await;
+    let request=result["request_id"].as_str().expect("video completes");
+    let w=f.state.store.create_video_work(&f.principal,"delivery-fixture").unwrap();
+    let snapshot=aiwork_core::VideoWorkSnapshot {effective_prompt:"橘猫散步".into(),duration:5,resolution:"480p".into(),ratio:"16:9".into(),watermark:false,user_media_ids:vec![],tail_frame_media_id:None,parent_version_id:None,source_request_id:None,reference_mode:"none".into(),summary:String::new()};
+    let raw=serde_json::to_string(&snapshot).unwrap();
+    let sealed=f.state.key_vault.encrypt(&aiwork_core::work_snapshot_context(&f.principal.key_id,&w.work_id,request),&raw).unwrap();
+    let version=f.state.store.bind_work_version(&f.principal,&w.work_id,None,request,aiwork_core::WorkAction::Create,&aiwork_core::EncryptedWorkSnapshot {key_version:sealed.key_version,ciphertext:sealed.ciphertext,snapshot_sha256:hex::encode(sha2::Sha256::digest(raw.as_bytes()))}).unwrap().version;
+    let sends=f.bridge.sends.load(Ordering::SeqCst);
+    let delivery=f.app.clone().oneshot(Request::post(format!("/v1/videos/{request}/delivery")).header("authorization",format!("Bearer {}",f.key)).header("content-type","application/json").body(Body::from("{}")).unwrap()).await.unwrap();
+    assert_eq!(delivery.status(),StatusCode::OK);
+    let fallback=json_response(delivery).await;
+    assert_eq!(fallback["work_context"]["base_version_id"],version.version_id);
+    let body=json!({"model":"seedance","messages":[{"role":"tool","tool_call_id":format!("call_seedance_save_{request}"),"content":{"exitCode":1,"stderr":"permission denied"}}]});
+    let followup=json_response(chat(&f,&f.key,body).await).await;
+    assert_eq!(followup["work_context"],fallback["work_context"]);
+    assert!(followup["choices"][0]["message"]["content"].as_str().unwrap().contains("[AIWORK_WORK:"));
+    assert_eq!(f.bridge.sends.load(Ordering::SeqCst),sends);
+    assert_eq!(f.state.store.work_versions(&f.principal,&w.work_id).unwrap().len(),1);
 }
 fn input(paths:&[&str],stream:bool)->Value {
     let attached=paths.iter().map(|p|format!("<file_path>{p}</file_path>")).collect::<Vec<_>>().join("\n");
