@@ -48,9 +48,9 @@ Files: acceptance report and narrowly scoped deployment/acceptance scripts outsi
 Interfaces: publish verified Core binary/config; existing public Base URL unchanged.
 
 - [x] 当前代理自审安全与重试路径（未使用独立审查代理）；Linux release 构建。
-- [ ] 推送 Trae-core 修复分支；带一致性快照/回滚发布 Core，不部署 AI Work 到云。
-- [ ] 普通 Key 复用已有视频跑 GLM + 本机工具 + SSE + 回执；核对仅新增文字计费、没有新增视频。
-- [ ] 清理本轮测试临时视频/目录；报告实际验证和未验证客户端边界。
+- [x] 推送 Trae-core 修复分支；带一致性快照/回滚发布 Core，不部署 AI Work 到云。
+- [x] 普通 Key 复用已有视频跑 GLM + 本机工具 + SSE + 回执；核对仅新增文字计费、没有新增视频。
+- [x] 验收临时视频自动清理；记录策略阻止清理的微小失败 fixture，报告未验证客户端边界。
 
 ## Execution Ledger
 
@@ -63,3 +63,6 @@ Interfaces: publish verified Core binary/config; existing public Base URL unchan
 - Linux release SHA-256: 2f081f987c693a5849a6737162df47e8c3a7558a3bf64ac3e9c935fe5e1db660. Deployment and existing-video acceptance pending at implementation commit.
 - Initial deployment 44de515 succeeded, health 200; existing-video public GLM planner settled 0.014800 credits (preflight 0.011600). Actual Bash file transfer and hash passed, with no new video. Public acceptance then found the SSE envelope dropped structured video_delivery metadata while retaining the saved display text. Added a failing integration assertion, reproduced 19 passed / 1 failed, and now preserve that metadata in SSE; full revalidation and follow-up release are in progress.
 - SSE metadata fix full Router revalidation: 187 passed / 0 failed, exit 0. Follow-up Linux build succeeded; SHA-256 e59e23785b984595711a9d8163da20b6ebfe951a17b76f90a324771d769a5368.
+- Final deployed code d744b38, release 20260928-glm-downloads-v2, live executable hash matches; persisted assistant glm-5.3-flash, ordinary default still deepseek-v4-flash. Local/public health 200 and local AI Work remains PID 49268.
+- Final public acceptance exit 0: real existing-video GLM plan reused, actual Bash download 3,708,392 bytes and expected hash, SSE tool_calls/[DONE], rewritten tool-only receipt acknowledged with structured saved metadata. Retry added 0 video steps and 0 billed text plans; unknown 10-credit hold unchanged. Total two real helper calls settled 0.026400 credits.
+- Acceptance temporary directories remaining: 0. Explicit cleanup of one earlier failed 24-byte local shell fixture was rejected by execution policy; left untouched rather than bypassing policy. Small uploaded release copies and rollback backups retained. No user media or accounts removed.
