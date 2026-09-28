@@ -183,6 +183,13 @@ impl Drop for AssetPermit {
     }
 }
 
+pub(crate) fn parse_reference_image(bytes: Vec<u8>) -> Result<ParsedAssetUpload, AssetError> {
+    if bytes.len() > MAX_ASSET_BYTES { return Err(AssetError::Invalid("素材超过 32 MiB 限制".into())); }
+    let (mime,ext) = detect_format(&bytes).filter(|(mime,_)|mime.starts_with("image/"))
+        .ok_or_else(||AssetError::Invalid("参考图必须是 PNG/JPEG/GIF/WebP 图片".into()))?;
+    Ok(ParsedAssetUpload { filename:format!("reference.{ext}"),declared_mime:Some(mime.into()),bytes })
+}
+
 pub fn parse_upload(body: &[u8]) -> Result<ParsedAssetUpload, AssetError> {
     let input: AssetUploadRequest = serde_json::from_slice(body)
         .map_err(|error| AssetError::Invalid(format!("请求体必须是有效 JSON: {error}")))?;
@@ -288,6 +295,7 @@ pub fn persist_asset(store: &CoreStore, principal: &Principal, stored: &StoredAs
 /// Marks timed-out assets inaccessible and removes only files that still
 /// match their own Core record. Expired records remain for audit and retries.
 pub fn cleanup_expired_assets_once(store: &CoreStore, data_dir: &Path, now_ms: i64) -> Result<usize, AssetError> {
+    store.prune_reference_uploads(now_ms).map_err(|error| AssetError::Storage(error.to_string()))?;
     store.expire_assets(now_ms).map_err(|error| AssetError::Storage(error.to_string()))?;
     let candidates = store.expired_assets_for_cleanup(now_ms)
         .map_err(|error| AssetError::Storage(error.to_string()))?;

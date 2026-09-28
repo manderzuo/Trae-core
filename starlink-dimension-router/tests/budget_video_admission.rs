@@ -4,6 +4,9 @@ use axum::{extract::{State,Path},Extension,http::{HeaderMap,StatusCode},body::By
 use serde_json::{json,Value};
 use starlink_dimension_router::{bridge_client::{BridgeClient,BridgeTransport,BridgeResponse},config::RouterConfig,state::StarlinkRouterState,user_routes};
 
+#[path="support/reference_upload_cases.rs"]
+mod reference_upload_cases;
+
 struct Bridge {claims:Mutex<BTreeMap<String,Value>>,sends:AtomicUsize,video_intent:bool,
     large_downloads:std::sync::atomic::AtomicBool,active_downloads:Arc<AtomicUsize>,download_status:AtomicUsize}
 struct DownloadReader {active:Arc<AtomicUsize>}
@@ -503,6 +506,30 @@ async fn background_discards_aged_completed_input_without_changing_pending_billi
 }
 #[tokio::test]
 async fn chat_inline_reference_is_uploaded_and_bound_to_video_preparation() {run_case_with_reference(true,false,true,true).await;}
+#[tokio::test]
+async fn local_reference_attachment_requests_upload_before_any_paid_work() {
+    let dir=Directory(std::env::temp_dir().join(format!("core-local-reference-{:032x}",rand::random::<u128>())));
+    let store=Arc::new(CoreStore::open(dir.path()).unwrap());store.migrate().unwrap();
+    store.create_user(NewUser {id:"admin".into(),name:"Admin".into(),role:UserRole::Admin},"bootstrap").unwrap();
+    let key=store.issue_api_key("admin","test",BTreeSet::from(["admin:*".into()]),"bootstrap").unwrap();
+    let principal=store.authenticate_api_key(&key.plaintext).unwrap();
+    let bridge=Arc::new(Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent:true,large_downloads:std::sync::atomic::AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0)),download_status:AtomicUsize::new(200)});
+    let mut cfg=RouterConfig::defaults(dir.path().into());cfg.budget_billing_v2=true;cfg.public_base_url="https://api.example.test".into();
+    let state=StarlinkRouterState::for_test(store.clone(),BridgeClient::from_transport("http://bridge","bridge-only",bridge.clone()),cfg);
+    let input=json!({"model":"seedance","messages":[{"role":"user","content":[
+        {"type":"text","text":"<uploaded_files>Files uploaded by user:\n<file_path>C:\\Users\\Test\\参考图.png</file_path>\n</uploaded_files>"},
+        {"type":"text","text":"<user_input>这是参考图，生成5秒720P 9：16视频</user_input>"}]}],
+        "tools":[{"type":"function","function":{"name":"RunCommand","description":"Execute a PowerShell command. NEVER use bash syntax.","parameters":{"type":"object","required":["command","blocking","requires_approval"],"properties":{"command":{"type":"string"},"blocking":{"type":"boolean"},"requires_approval":{"type":"boolean"}}}}}]});
+    let response=user_routes::chat_completions(State(state),HeaderMap::new(),Extension(principal),Bytes::from(input.to_string())).await;
+    assert_eq!(response.status(),StatusCode::OK,"path-only reference must request client upload, not fail as missing or generate without the image");
+    let result:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+    assert_eq!(result["choices"][0]["finish_reason"],"tool_calls");
+    assert_eq!(result["choices"][0]["message"]["tool_calls"][0]["function"]["name"],"RunCommand");
+    assert!(!result.to_string().contains(&key.plaintext),"never give the client terminal a long-lived Key");
+    assert_eq!(bridge.sends.load(Ordering::SeqCst),0);
+    assert!(bridge.claims.lock().unwrap().is_empty());
+    assert_eq!(store.active_execution_count_for_key(&key.id).unwrap(),0);
+}
 #[tokio::test]
 async fn image_preprocessing_returns_explicit_reference_for_later_video_without_key_global_cache() {
     let dir=Directory(std::env::temp_dir().join(format!("core-reference-caption-{:032x}",rand::random::<u128>())));

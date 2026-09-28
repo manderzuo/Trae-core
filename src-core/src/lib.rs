@@ -8,6 +8,8 @@ mod admin_summary;
 mod admin_credentials;
 mod error;
 mod identity;
+mod reference_upload;
+pub use reference_upload::ReferenceUpload;
 mod jobs;
 mod legacy_execution;
 mod models;

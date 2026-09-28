@@ -1,0 +1,199 @@
+//! Client-local attachments require a tool round trip before any paid work.
+use std::sync::Arc;
+use aiwork_core::{Principal, ReferenceUpload};
+use axum::{extract::{Path, Request, State}, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, Json};
+use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine as _};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use crate::state::StarlinkRouterState;
+
+const PREFIX: &str = "call_ref_upload_";
+const TTL: i64 = 30*60*1000;
+fn context(id: &str) -> String { format!("reference-upload-v1:{id}") }
+fn valid_id(id: &str) -> bool { id.len()==32 && id.bytes().all(|b|b.is_ascii_hexdigit()) }
+fn error(status: StatusCode, code: &str) -> Response {
+    let message = match code {
+        "reference_upload_tool_unavailable" => "图片仅提供了本机路径，但客户端本轮没有可用的联网终端工具。请允许终端工具或直接发送图片数据；未提交视频、未扣费。",
+        "reference_upload_incomplete" => "参考图片尚未完整上传，未提交视频、未扣费。请重新附加原图并允许客户端上传。",
+        "reference_upload_failed" => "客户端图片上传工具执行失败，未提交视频、未扣费。",
+        "reference_upload_invalid_path" => "附件不是支持的本机图片路径；未提交视频、未扣费。",
+        _ => "参考图片上传会话无效或已过期，请重新附加原图；未提交视频、未扣费。",
+    };
+    (status,Json(json!({"error":{"type":"invalid_request_error","code":code,"message":message}}))).into_response()
+}
+fn bad(code: &str) -> Response { error(StatusCode::BAD_REQUEST,code) }
+fn user_text(message: &Value) -> Vec<&str> {
+    match &message["content"] {
+        Value::String(s)=>vec![s.as_str()],
+        Value::Array(parts)=>parts.iter().filter(|p|p["type"]=="text").filter_map(|p|p["text"].as_str()).collect(),
+        _=>Vec::new(),
+    }
+}
+fn valid_path(path: &str) -> bool {
+    let windows=path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && path.as_bytes().get(1)==Some(&b':') && path.as_bytes().get(2).is_some_and(|b|*b==b'\\'||*b==b'/');
+    let unix=path.starts_with('/') && !path.starts_with("//");
+    let ext=path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    path.len()<=4096 && (windows||unix) && !path.chars().any(char::is_control)
+        && !path.split(['/', '\\']).any(|part|part=="..")
+        && !path[if windows {2} else {0}..].contains(':')
+        && matches!(ext.as_str(),"png"|"jpg"|"jpeg"|"gif"|"webp")
+}
+fn paths(body: &Value) -> Result<Vec<String>, &'static str> {
+    let Some(last)=body["messages"].as_array().and_then(|m|m.last()).filter(|m|m["role"]=="user") else {return Ok(vec![])};
+    let mut found=Vec::new();
+    for text in user_text(last) {
+        let mut rest=text;
+        while let Some((_,block))=rest.split_once("<uploaded_files>") {
+            let (block,after)=block.split_once("</uploaded_files>").ok_or("reference_upload_invalid_path")?;
+            rest=after;
+            let mut entries=block;
+            while let Some((_,entry))=entries.split_once("<file_path>") {
+                let (path,after)=entry.split_once("</file_path>").ok_or("reference_upload_invalid_path")?;
+                entries=after;
+                let path=path.trim();
+                if !valid_path(path) {return Err("reference_upload_invalid_path");}
+                if !found.iter().any(|p|p==path) {found.push(path.to_owned());}
+                if found.len()>10 {return Err("reference_upload_invalid_path");}
+            }
+        }
+    }
+    Ok(found)
+}
+fn has_media(body: &Value) -> bool {
+    ["image_asset_ids","video_asset_ids","image_urls","video_urls"].iter().any(|k|body[*k].as_array().is_some_and(|a|!a.is_empty()))
+        || body["messages"].as_array().and_then(|a|a.iter().rev().find(|m|m["role"]=="user"))
+            .is_some_and(|m|m["content"].as_array().is_some_and(|a|a.iter().any(|p|p["type"]=="image_url")))
+}
+fn remove_attachment_markup(body: &mut Value) {
+    fn strip(text: &str) -> String {
+        let mut out=String::new();let mut rest=text;
+        while let Some((before,block))=rest.split_once("<uploaded_files>") {
+            out.push_str(before);
+            let Some((_,after))=block.split_once("</uploaded_files>") else {break};rest=after;
+        }
+        out.push_str(rest);out
+    }
+    if let Some(last)=body["messages"].as_array_mut().and_then(|a|a.last_mut()) {
+        match &mut last["content"] {
+            Value::String(s)=>*s=strip(s),
+            Value::Array(parts)=>for p in parts {if p["type"]=="text" {if let Some(t)=p["text"].as_str() {p["text"]=json!(strip(t));}}},
+            _=>{},
+        }
+    }
+}
+fn response(value: Value, stream: bool) -> Response {
+    if !stream {return Json(value).into_response();}
+    Response::builder().header("content-type","text/event-stream; charset=utf-8").header("cache-control","no-cache, no-transform").header("x-accel-buffering","no")
+        .body(axum::body::Body::from(crate::video_delivery::sse_completion(&value))).unwrap()
+}
+fn active(state: &StarlinkRouterState, record: &ReferenceUpload) -> Option<Principal> {
+    let p=state.store.active_principal_for_key(&record.key_id).ok()??;
+    aiwork_core::require_scope(&p,"assets:write").ok()?;
+    Some(p)
+}
+fn capability(state: &StarlinkRouterState, id: &str, key: &str) -> Result<String,Response> {
+    let sealed=state.key_vault.encrypt(&format!("{}:upload-only",context(id)),key).map_err(|_|bad("reference_upload_unavailable"))?;
+    Ok(format!("{}.{}",sealed.key_version,URL_SAFE_NO_PAD.encode(sealed.ciphertext)))
+}
+fn verify(state: &StarlinkRouterState,id: &str,token: &str,record: &ReferenceUpload) -> bool {
+    if token.len()>1024 {return false;}
+    let Some((version,cipher))=token.split_once('.') else {return false};
+    let (Ok(version),Ok(cipher))=(version.parse(),URL_SAFE_NO_PAD.decode(cipher)) else {return false};
+    state.key_vault.decrypt(&format!("{}:upload-only",context(id)),version,&cipher).is_ok_and(|key|key==record.key_id)
+}
+pub(crate) fn command(config: &Value, bash: bool) -> String {
+    let encoded=STANDARD.encode(config.to_string());
+    let ps=include_str!("reference_upload.ps1").replace("__CONFIG_BASE64__",&encoded);
+    if !bash {return ps;}
+    let encoded_ps=STANDARD.encode(ps.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
+    let unix=include_str!("reference_upload.sh").replace("__CONFIG_BASE64__",&encoded);
+    format!("case \"$(uname -s)\" in\nMINGW*|MSYS*|CYGWIN*) powershell.exe -NoProfile -NonInteractive -EncodedCommand {encoded_ps} ;;\n*)\n{unix}\n;;\nesac")
+}
+
+/// Returns early for an upload tool call/error; successful follow-up restores
+/// the encrypted original request and pins its generation idempotency key.
+pub(crate) async fn before_chat(state:&Arc<StarlinkRouterState>,p:&Principal,headers:&mut HeaderMap,body:&mut Value)->Option<Response> {
+    let last=body["messages"].as_array()?.last()?;
+    let tool=if last["role"]=="tool" {Some(last)} else if last["role"]=="user" {
+        last["content"].as_array().and_then(|a|a.iter().find(|p|p["type"]=="tool_result"))
+    } else {None};
+    if let Some(tool)=tool {
+        let call=tool["tool_call_id"].as_str().or_else(||tool["tool_use_id"].as_str())?;
+        let id=call.strip_prefix(PREFIX)?;
+        if !valid_id(id) {return Some(bad("reference_upload_invalid"));}
+        let record=match state.store.reference_upload(id) {Ok(Some(r))=>r,_=>return Some(bad("reference_upload_invalid"))};
+        if record.key_id!=p.key_id || active(state,&record).is_none() {return Some(bad("reference_upload_invalid"));}
+        if crate::video_delivery::tool_failed(tool,0) {return Some(bad("reference_upload_failed"));}
+        if record.asset_ids.iter().any(Option::is_none) {return Some(bad("reference_upload_incomplete"));}
+        let text=match state.key_vault.decrypt(&context(id),record.key_version,&record.ciphertext) {Ok(t)=>t,_=>return Some(bad("reference_upload_invalid"))};
+        let mut original:Value=match serde_json::from_str(&text) {Ok(v)=>v,Err(_)=>return Some(bad("reference_upload_invalid"))};
+        remove_attachment_markup(&mut original);
+        original["image_asset_ids"]=json!(record.asset_ids);
+        // Tool output and changed prompts/tools are not the paid request.
+        original["stream"]=json!(body["stream"].as_bool().unwrap_or(false));
+        headers.insert("idempotency-key",format!("reference-upload:{id}").parse().unwrap());
+        *body=original;
+        return None;
+    }
+    if has_media(body) {return None;}
+    let paths=match paths(body) {Ok(v) if v.is_empty()=>return None,Ok(v)=>v,Err(code)=>return Some(bad(code))};
+    for field in ["image_asset_ids","video_asset_ids"] {
+        if body.get(field).is_some_and(|v|v.as_array().is_none_or(|ids|ids.len()>10 || ids.iter().any(|id|id.as_str().is_none_or(|s|s.trim().is_empty() || s.len()>128 || s.chars().any(char::is_control))))) {
+            return Some(bad("invalid_reference_context"));
+        }
+    }
+    if aiwork_core::require_scope(p,"assets:write").is_err() {return Some(error(StatusCode::FORBIDDEN,"insufficient_scope"));}
+    let Some(tool)=crate::delivery_assist::tools(body).into_iter().next() else {return Some(bad("reference_upload_tool_unavailable"))};
+    let base=state.config.public_base_url.trim_end_matches('/');
+    // Configuration, never client text, chooses the upload destination.
+    if !(base.starts_with("https://") || base.starts_with("http://127.0.0.1:") || base.starts_with("http://localhost:")) {return Some(bad("reference_upload_unavailable"));}
+    let id=format!("{:032x}",rand::random::<u128>());
+    let sealed=match state.key_vault.encrypt(&context(&id),&body.to_string()) {Ok(v)=>v,Err(_)=>return Some(bad("reference_upload_unavailable"))};
+    let explicit=headers.get("idempotency-key").and_then(|h|h.to_str().ok()).filter(|s|!s.trim().is_empty());
+    let fingerprint=aiwork_core::canonical_json_hash(body);
+    let dedupe=aiwork_core::canonical_json_hash(&match explicit {Some(key)=>json!({"explicit":key}),None=>json!({"implicit":hex::encode(fingerprint)})});
+    let id=match state.store.save_reference_upload(p,&id,paths.len(),chrono::Utc::now().timestamp_millis()+TTL,sealed.key_version,&sealed.ciphertext,&dedupe,&fingerprint,explicit.is_some()) {
+        Ok(Some(id))=>id,Ok(None)=>return Some(error(StatusCode::CONFLICT,"idempotency_conflict")),
+        Err(_)=>return Some(error(StatusCode::TOO_MANY_REQUESTS,"reference_upload_unavailable")),
+    };
+    let ticket=match capability(state,&id,&p.key_id) {Ok(t)=>t,Err(r)=>return Some(r)};
+    let config=json!({"id":id,"base":format!("{base}/v1/reference-uploads/{id}"),"authorization":ticket,"paths":paths});
+    let mut args=tool.arguments;
+    args[tool.command_key]=json!(command(&config,tool.bash));
+    if args.get("description").is_some() {args["description"]=json!("Upload the user-attached reference images before generating video");}
+    let value=json!({"id":format!("chatcmpl-ref-{id}"),"object":"chat.completion","model":"seedance","created":chrono::Utc::now().timestamp(),
+        "choices":[{"index":0,"message":{"role":"assistant","content":"正在通过本机工具上传本次参考图片，上传完成后开始生成视频。此步骤尚未提交视频、未扣视频积分。","tool_calls":[{"id":format!("{PREFIX}{id}"),"type":"function","function":{"name":tool.name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]});
+    Some(response(value,body["stream"].as_bool().unwrap_or(false)))
+}
+
+/// This capability permits only one immutable image per predeclared slot. It
+/// cannot generate videos, inspect balances, download outputs or act as a Key.
+pub(crate) async fn upload(State(state):State<Arc<StarlinkRouterState>>,Path((id,index)):Path<(String,usize)>,request:Request)->Response {
+    if !valid_id(&id) {return error(StatusCode::UNAUTHORIZED,"reference_upload_invalid");}
+    let record=match state.store.reference_upload(&id) {Ok(Some(r))=>r,_=>return error(StatusCode::UNAUTHORIZED,"reference_upload_invalid")};
+    let token=request.headers().get("x-seedance-upload").and_then(|h|h.to_str().ok()).unwrap_or("");
+    if !verify(&state,&id,token,&record) || index>=record.asset_ids.len() {return error(StatusCode::UNAUTHORIZED,"reference_upload_invalid");}
+    let Some(p)=active(&state,&record) else {return error(StatusCode::UNAUTHORIZED,"reference_upload_invalid")};
+    let bytes=match axum::body::to_bytes(request.into_body(),crate::assets::MAX_ASSET_BYTES).await {
+        Ok(v)=>v,Err(_)=>return error(StatusCode::PAYLOAD_TOO_LARGE,"reference_upload_invalid_image"),
+    };
+    let result=tokio::task::spawn_blocking(move ||->Response {
+        let parsed=match crate::assets::parse_reference_image(bytes.to_vec()) {Ok(v)=>v,Err(e)=>return crate::assets::response(e)};
+        let _permit=match state.asset_limiter.acquire(&p.key_id,parsed.bytes.len()) {Ok(p)=>p,Err(e)=>return crate::assets::response(e)};
+        let sha=hex::encode(Sha256::digest(&parsed.bytes));
+        if let Some(existing)=&record.asset_ids[index] {
+            return match crate::assets::read_owned(&state.store,&state.config.data_dir,&p,existing) {
+                Ok(a) if a.record.sha256==sha=>Json(json!({"id":existing,"sha256":sha,"bytes":a.record.size})).into_response(),
+                _=>error(StatusCode::CONFLICT,"reference_upload_slot_conflict"),
+            };
+        }
+        let stored=match crate::assets::write_asset(&state.config.data_dir,&p,parsed) {Ok(v)=>v,Err(e)=>return crate::assets::response(e)};
+        let asset=match crate::assets::persist_asset(&state.store,&p,&stored) {Ok(v)=>v,Err(e)=>return crate::assets::response(e)};
+        match state.store.bind_reference_upload_asset(&p,&id,index,&asset.id) {
+            Ok(winner)=>Json(json!({"id":winner,"sha256":sha,"bytes":asset.size})).into_response(),
+            Err(_)=>error(StatusCode::CONFLICT,"reference_upload_slot_conflict"),
+        }
+    }).await;
+    result.unwrap_or_else(|_|error(StatusCode::SERVICE_UNAVAILABLE,"reference_upload_unavailable"))
+}

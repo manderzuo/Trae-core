@@ -198,7 +198,7 @@ pub(crate) async fn follow_up(state: &Arc<StarlinkRouterState>, p: &Principal, b
     value["video_task"]=json!({"id":request,"status":"completed","content_url":format!("{}/v1/videos/{request}/content",state.config.public_base_url.trim_end_matches('/'))});
     Some(response(value,body["stream"].as_bool().unwrap_or(false)))
 }
-fn tool_failed(value:&Value,depth:usize)->bool {
+pub(crate) fn tool_failed(value:&Value,depth:usize)->bool {
     if depth>6 {return true;}
     if value["isError"]==true || value["is_error"]==true || value["timedOut"]==true || value["aborted"]==true
         || value.pointer("/sandbox/denied")==Some(&json!(true)) || value.pointer("/sandbox/runnerFailed")==Some(&json!(true))

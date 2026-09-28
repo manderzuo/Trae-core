@@ -22,6 +22,7 @@ pub fn build_router(state: Arc<StarlinkRouterState>) -> Router {
     let admin = admin_routes::router()
         .layer(from_fn_with_state(state.clone(), admin_auth::require_admin));
     let public_admin = admin_routes::public_router()
+        .route("/v1/reference-uploads/:id/:index", post(crate::reference_upload::upload))
         .route("/v1/assets/:asset_id/content", get(user_routes::assets_content))
         .route("/v1/videos/:task_id/download", get(crate::video_delivery::download));
     Router::new()

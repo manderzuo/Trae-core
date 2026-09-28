@@ -275,8 +275,9 @@ pub(crate) async fn video_content(state:Arc<StarlinkRouterState>,principal:Princ
         .body(axum::body::Body::from_stream(crate::user_routes::BridgeBodyStream(receive))).unwrap_or_else(|_|fail("download_response_failed"))
 }
 
-pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Principal,headers:axum::http::HeaderMap,mut body:Value)->Response {
+pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Principal,mut headers:axum::http::HeaderMap,mut body:Value)->Response {
     use aiwork_core::{BeginRequest,BeginRequestInput};
+    if let Some(response)=crate::reference_upload::before_chat(&state,&principal,&mut headers,&mut body).await {return response;}
     if let Some(response)=crate::video_delivery::follow_up(&state,&principal,&body).await {return response;}
     let s=state.clone();let p=principal.clone();
     body=match tokio::task::spawn_blocking(move ||->Result<Value,(&'static str,Value)> {

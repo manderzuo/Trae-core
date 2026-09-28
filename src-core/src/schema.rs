@@ -867,3 +867,20 @@ CREATE TABLE IF NOT EXISTS budget_continuations (
   created_at_ms INTEGER NOT NULL CHECK(created_at_ms>0)
 );
 "#;
+
+pub(crate) const SCHEMA_V29: &str = r#"
+CREATE TABLE IF NOT EXISTS reference_uploads (
+  id TEXT PRIMARY KEY,
+  api_key_id TEXT NOT NULL REFERENCES api_keys(id),
+  key_version INTEGER NOT NULL CHECK(key_version>0),
+  ciphertext BLOB NOT NULL CHECK(length(ciphertext) BETWEEN 28 AND 8392704),
+  expires_at_ms INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  dedupe_hash BLOB NOT NULL CHECK(length(dedupe_hash)=32),
+  request_hash BLOB NOT NULL CHECK(length(request_hash)=32),
+  asset_ids_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS reference_uploads_key_expiry ON reference_uploads(api_key_id,expires_at_ms);
+CREATE INDEX IF NOT EXISTS reference_uploads_expiry ON reference_uploads(expires_at_ms);
+CREATE INDEX IF NOT EXISTS reference_uploads_retry ON reference_uploads(api_key_id,dedupe_hash,created_at_ms);
+"#;
