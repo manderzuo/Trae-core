@@ -313,6 +313,11 @@ async fn completed_video_stream_calls_client_download_tool_and_receipt_never_reg
     assert_eq!(response.status(),StatusCode::OK,"owned receipt survives rewritten ID, omitted assistant metadata, and wrapped stdout");
     let result:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
     assert_eq!(result["video_delivery"]["status"],"saved");
+    let mut streamed_receipt=rewritten.clone();streamed_receipt["stream"]=json!(true);
+    let response=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(principal.clone()),Bytes::from(streamed_receipt.to_string())).await;
+    assert_eq!(response.status(),StatusCode::OK);
+    let streamed=String::from_utf8(axum::body::to_bytes(response.into_body(),1024*1024).await.unwrap().to_vec()).unwrap();
+    assert!(streamed.contains("\"video_delivery\":{\"bytes\":1234,\"path\":") && streamed.contains("\"status\":\"saved\"") && streamed.contains("data: [DONE]"),"SSE must retain the client's structured saved receipt, not only its display text: {streamed}");
     assert_eq!(bridge.sends.load(Ordering::SeqCst),before);
     let invalid=json!({"model":"seedance","messages":[
         {"role":"user","content":"生成5秒480p的猫视频"},

@@ -119,6 +119,7 @@ pub(crate) fn sse_completion(value: &Value) -> Vec<u8> {
     let mut chunk=json!({"id":value["id"],"object":"chat.completion.chunk","model":value["model"],"created":value["created"],"request_id":value["request_id"],
         "choices":[{"index":0,"delta":delta,"finish_reason":value["choices"][0]["finish_reason"]}]});
     if !value["video_task"].is_null() {chunk["video_task"]=value["video_task"].clone();}
+    if !value["video_delivery"].is_null() {chunk["video_delivery"]=value["video_delivery"].clone();}
     format!("data: {chunk}\n\ndata: [DONE]\n\n").into_bytes()
 }
 fn response(value: Value, stream: bool) -> Response {
