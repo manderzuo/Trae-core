@@ -98,9 +98,18 @@ pub(crate) fn extract_seedance_prompt(body: &Value) -> Result<String, Response> 
     Ok(prompt)
 }
 
+pub(crate) fn normalize_video_spec_text(text: &str) -> String {
+    // Correct typography only; never infer a different duration or resolution.
+    text.chars().map(|ch| match ch {
+        '\u{ff01}'..='\u{ff5e}' => char::from_u32(ch as u32 - 0xfee0).unwrap(),
+        '\u{3000}' => ' ',
+        _ => ch,
+    }).collect()
+}
+
 pub(crate) fn infer_video_parameters_from_prompt(body: &mut Value) {
     let Ok(prompt) = extract_seedance_prompt(body) else { return; };
-    let normalized = prompt.to_ascii_lowercase();
+    let normalized = normalize_video_spec_text(&prompt).to_ascii_lowercase();
     let chars: Vec<char> = normalized.chars().collect();
     let duration = chars.iter().enumerate().find_map(|(start, ch)| {
         if !ch.is_ascii_digit() || (start > 0 && chars[start - 1].is_ascii_digit()) {
@@ -120,7 +129,8 @@ pub(crate) fn infer_video_parameters_from_prompt(body: &mut Value) {
         }
     });
     let resolution = ["1080p", "720p", "480p", "4k"].into_iter().find(|item| normalized.contains(item));
-    let ratio = ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"].into_iter().find(|item| normalized.contains(item));
+    let compact: String = normalized.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let ratio = ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"].into_iter().find(|item| compact.contains(item));
     let Some(parameters) = body.as_object_mut() else { return; };
     if let Some(value) = duration {
         parameters.entry("duration").or_insert_with(|| Value::from(value));
@@ -134,6 +144,7 @@ pub(crate) fn infer_video_parameters_from_prompt(body: &mut Value) {
 }
 
 fn seedance_assist_chat_body(model: &str, original: &Value, prompt: &str) -> Value {
+    let prompt = normalize_video_spec_text(prompt);
     let mut parameters = serde_json::Map::new();
     for field in ["duration", "resolution", "ratio"] {
         if let Some(value) = original.get(field) {
@@ -163,7 +174,7 @@ fn extract_assisted_prompt(response: &[u8]) -> Result<String, &'static str> {
     if prompt.len() > MAX_SEEDANCE_ASSIST_PROMPT_BYTES {
         return Err("assistant_prompt_too_large");
     }
-    Ok(prompt.to_string())
+    Ok(normalize_video_spec_text(prompt))
 }
 
 fn apply_assisted_prompt(body: &mut Value, prompt: &str) -> Result<(), &'static str> {
@@ -2751,6 +2762,20 @@ fn proxy(status: u16, headers: BTreeMap<String, String>, body: Vec<u8>) -> Respo
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fullwidth_video_specs_are_inferred_without_overriding_explicit_fields() {
+        let mut body=serde_json::json!({"messages":[{"role":"user","content":"生成５Ｓ、７２０Ｐ、９：１６的视频"}]});
+        super::infer_video_parameters_from_prompt(&mut body);
+        assert_eq!(body["duration"],5);
+        assert_eq!(body["resolution"],"720p");
+        assert_eq!(body["ratio"],"9:16");
+        let mut spaced=serde_json::json!({"ratio":"4:3","messages":[{"role":"user","content":"生成5秒720P，9 ： 16的视频"}]});
+        super::infer_video_parameters_from_prompt(&mut spaced);
+        assert_eq!(spaced["ratio"],"4:3");
+        spaced.as_object_mut().unwrap().remove("ratio");
+        super::infer_video_parameters_from_prompt(&mut spaced);
+        assert_eq!(spaced["ratio"],"9:16");
+    }
     use super::{apply_assisted_prompt, authorize_scope, extract_assisted_prompt, extract_seedance_prompt, seedance_assist_chat_body, validate_controlled_video_input, video_forward_headers};
     use axum::http::HeaderMap;
     use aiwork_core::Principal;

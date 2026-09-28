@@ -503,6 +503,74 @@ async fn background_discards_aged_completed_input_without_changing_pending_billi
 }
 #[tokio::test]
 async fn chat_inline_reference_is_uploaded_and_bound_to_video_preparation() {run_case_with_reference(true,false,true,true).await;}
+#[tokio::test]
+async fn image_preprocessing_returns_explicit_reference_for_later_video_without_key_global_cache() {
+    let dir=Directory(std::env::temp_dir().join(format!("core-reference-caption-{:032x}",rand::random::<u128>())));
+    let store=Arc::new(CoreStore::open(dir.path()).unwrap());store.migrate().unwrap();
+    store.create_user(NewUser {id:"admin".into(),name:"Admin".into(),role:UserRole::Admin},"bootstrap").unwrap();
+    let k=store.issue_api_key("admin","caption",BTreeSet::from(["admin:*".into()]),"bootstrap").unwrap();
+    store.key_quota_grant_as_admin(&store.authenticate_api_key(&k.plaintext).unwrap(),KeyQuotaGrant {api_key_id:k.id.clone(),resource_kind:"credits".into(),amount:100_000_000,actor_user_id:"admin".into(),reason:"fixture".into()}).unwrap();
+    store.set_video_billing_control(aiwork_core::VideoBillingControlInput {mode:aiwork_core::VideoBillingMode::Active,reason:"fixture".into(),diagnostic_key_id:None,diagnostic_request_hash:None}).unwrap();
+    let caption_bridge=Arc::new(Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent:false,large_downloads:std::sync::atomic::AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0)),download_status:AtomicUsize::new(200)});
+    let mut cfg=RouterConfig::defaults(dir.path().into());cfg.budget_billing_v2=true;
+    let state=StarlinkRouterState::for_test(store.clone(),BridgeClient::from_transport("http://bridge","bridge-only",caption_bridge),cfg.clone());
+    let principal=store.authenticate_api_key(&k.plaintext).unwrap();
+    let caption=json!({"model":"seedance","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jN1sAAAAASUVORK5CYII="}},{"type":"text","text":"请描述这张图片"}]}]});
+    let response=user_routes::chat_completions(State(state),HeaderMap::new(),Extension(principal.clone()),Bytes::from(caption.to_string())).await;
+    assert_eq!(response.status(),StatusCode::OK);
+    let body=axum::body::to_bytes(response.into_body(),65536).await.unwrap();let reply:Value=serde_json::from_slice(&body).unwrap();
+    let marker=reply["choices"][0]["message"]["content"].as_str().unwrap();
+    assert!(marker.contains("[AIWORK_REFERENCE:"),"caption must carry authenticated asset reference to the next request");
+    let video_bridge=Arc::new(Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent:true,large_downloads:std::sync::atomic::AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0)),download_status:AtomicUsize::new(200)});
+    let state=StarlinkRouterState::for_test(store.clone(),BridgeClient::from_transport("http://bridge","bridge-only",video_bridge.clone()),cfg);
+    let other=store.issue_api_key("admin","other",BTreeSet::from(["admin:*".into()]),"bootstrap").unwrap();
+    let other_principal=store.authenticate_api_key(&other.plaintext).unwrap();
+    let foreign=json!({"model":"seedance","messages":[{"role":"user","content":format!("参考图说明：{marker}\n生成5秒480p猫视频")}]});
+    let rejected=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(other_principal),Bytes::from(foreign.to_string())).await;
+    assert_eq!(rejected.status(),StatusCode::BAD_REQUEST,"even another Key of the same user cannot borrow the caption token");
+    assert_eq!(video_bridge.sends.load(Ordering::SeqCst),0);
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD,Engine as _};
+    let raw_token=marker.split("[AIWORK_REFERENCE:").nth(1).unwrap().split(']').next().unwrap();
+    let (version,cipher)=raw_token.split_once('.').unwrap();
+    let ctx=format!("seedance-reference-v1:{}",principal.key_id);
+    let decoded=state.key_vault.decrypt(&ctx,version.parse().unwrap(),&URL_SAFE_NO_PAD.decode(cipher).unwrap()).unwrap();
+    let reference:Value=serde_json::from_str(&decoded).unwrap();
+    let db=rusqlite::Connection::open(dir.path().join("data").join(aiwork_core::CORE_DB_FILE)).unwrap();
+    db.execute("UPDATE assets SET state='expired' WHERE id=?1",[reference["asset_ids"][0].as_str().unwrap()]).unwrap();
+    let unavailable=json!({"model":"seedance","messages":[{"role":"user","content":format!("生成5秒视频 {marker}")}]});
+    let rejected=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(principal.clone()),Bytes::from(unavailable.to_string())).await;
+    assert_eq!(rejected.status(),StatusCode::BAD_REQUEST,"a valid marker cannot reactivate an expired stored image");
+    assert_eq!(video_bridge.sends.load(Ordering::SeqCst),0);
+    db.execute("UPDATE assets SET state='active' WHERE id=?1",[reference["asset_ids"][0].as_str().unwrap()]).unwrap();
+    let mut expired:Value=serde_json::from_str(&decoded).unwrap();expired["expires_at_ms"]=json!(0);
+    let sealed=state.key_vault.encrypt(&ctx,&expired.to_string()).unwrap();
+    let bad_marker=format!("[AIWORK_REFERENCE:{}.{}]",sealed.key_version,URL_SAFE_NO_PAD.encode(sealed.ciphertext));
+    let expired_input=json!({"model":"seedance","messages":[{"role":"user","content":format!("生成5秒视频 {bad_marker}")}]});
+    let rejected=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(principal.clone()),Bytes::from(expired_input.to_string())).await;
+    assert_eq!(rejected.status(),StatusCode::BAD_REQUEST);
+    assert_eq!(video_bridge.sends.load(Ordering::SeqCst),0,"expired references must be rejected before a paid helper");
+    let tampered=json!({"model":"seedance","messages":[{"role":"user","content":format!("生成5秒视频 [AIWORK_REFERENCE:{version}.AAAA]")}]});
+    let rejected=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(principal.clone()),Bytes::from(tampered.to_string())).await;
+    assert_eq!(rejected.status(),StatusCode::BAD_REQUEST,"tampered references must fail authentication");
+    let malformed=json!({"model":"seedance","image_asset_ids":"not-an-array","messages":[{"role":"user","content":format!("生成5秒视频 {marker}")}]});
+    let rejected=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(principal.clone()),Bytes::from(malformed.to_string())).await;
+    assert_eq!(rejected.status(),StatusCode::BAD_REQUEST,"a valid marker cannot erase malformed explicit references");
+    assert_eq!(video_bridge.sends.load(Ordering::SeqCst),0,"invalid references must fail before a paid helper");
+    let missing=json!({"model":"seedance","messages":[{"role":"user","content":"使用参考图生成5秒480p猫视频，这是人物参考图"}]});
+    let rejected=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(principal.clone()),Bytes::from(missing.to_string())).await;
+    assert_eq!(rejected.status(),StatusCode::BAD_REQUEST,"explicit missing reference must not become paid text-to-video");
+    assert_eq!(video_bridge.sends.load(Ordering::SeqCst),0);
+    let input=json!({"model":"seedance","messages":[{"role":"user","content":format!("参考图说明：{marker}\n生成5秒480p猫视频")} ]});
+    let response=user_routes::chat_completions(State(state),HeaderMap::new(),Extension(principal),Bytes::from(input.to_string())).await;
+    assert_eq!(response.status(),StatusCode::OK);
+    let claims=video_bridge.claims.lock().unwrap();let video=claims.values().find(|c|c["step_kind"]=="video").unwrap();
+    assert_eq!(video["body"]["image_asset_ids"],json!(["bridge-image"]));
+    assert!(!claims.values().any(|c|c.to_string().contains("AIWORK_REFERENCE")),"opaque attachment tokens are not language-model prompt content");
+}
+#[tokio::test]
+async fn explicitly_requested_history_image_is_bound_to_later_video() {
+    run_case_with_fault(true,false,true,true,false,false,BackgroundFault::ReferenceHistory).await;
+}
 async fn run_case(probe:bool,stream:bool,video_intent:bool) {
     run_case_with_reference(probe,stream,video_intent,false).await;
 }
@@ -513,7 +581,7 @@ async fn run_case_options(probe:bool,stream:bool,video_intent:bool,reference:boo
     run_case_with_fault(probe,stream,video_intent,reference,resume_helper,background_only,BackgroundFault::None).await;
 }
 #[derive(Clone,Copy,PartialEq,Eq)]
-enum BackgroundFault {None,CorruptNeighbor,RevokedKey,RemovedScope,HttpRace,Cleanup}
+enum BackgroundFault {None,CorruptNeighbor,RevokedKey,RemovedScope,HttpRace,Cleanup,ReferenceHistory}
 async fn run_case_with_fault(probe:bool,stream:bool,video_intent:bool,reference:bool,resume_helper:bool,background_only:bool,fault:BackgroundFault) {
     let corrupt_neighbor=fault==BackgroundFault::CorruptNeighbor;
     let dir=Directory(std::env::temp_dir().join(format!("core-public-budget-{:032x}",rand::random::<u128>())));
@@ -535,6 +603,10 @@ async fn run_case_with_fault(probe:bool,stream:bool,video_intent:bool,reference:
         {"type":"text","text":"以图片为参考生成5秒480p猫视频"},
         {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jN1sAAAAASUVORK5CYII="}}
     ]);}
+    if fault==BackgroundFault::ReferenceHistory {
+        input["messages"].as_array_mut().unwrap().push(json!({"role":"assistant","content":"已收到图片"}));
+        input["messages"].as_array_mut().unwrap().push(json!({"role":"user","content":"根据参考图生成5秒480p猫视频"}));
+    }
     let body=Bytes::from(input.to_string());
     if resume_helper {
         use aiwork_core::{BeginRequest,BeginRequestInput,BudgetAuthorization,BudgetStepInput,BudgetStepKind,CreditAmount};
@@ -626,7 +698,14 @@ async fn run_case_with_fault(probe:bool,stream:bool,video_intent:bool,reference:
             let op=store.budget_operation(value["request_id"].as_str().unwrap()).unwrap().unwrap();
             let saved=store.budget_continuation(value["request_id"].as_str().unwrap()).unwrap().expect("public admission persists recovery before helper dispatch");
             let restored=state.key_vault.decrypt(&saved.encryption_context(),saved.key_version,&saved.ciphertext).unwrap();
-            assert_eq!(serde_json::from_str::<Value>(&restored).unwrap(),input);
+            let mut expected_checkpoint=input.clone();
+            if fault==BackgroundFault::ReferenceHistory {
+                expected_checkpoint["messages"][2]["content"]=json!([
+                    {"type":"text","text":"根据参考图生成5秒480p猫视频"},
+                    input["messages"][0]["content"][1].clone()
+                ]);
+            }
+            assert_eq!(serde_json::from_str::<Value>(&restored).unwrap(),expected_checkpoint);
             assert_eq!(op.steps.len(),if video_intent {2} else {1});assert_eq!(op.steps.iter().map(|s|s.hold_credits.as_microcredits()).sum::<i64>(),if video_intent {42_000_000} else {2_000_000});
             assert_eq!(op.steps[0].financial_state,aiwork_core::BudgetFinancialState::Held);
             assert_eq!(store.active_execution_count_for_key(&k.id).unwrap(),0);

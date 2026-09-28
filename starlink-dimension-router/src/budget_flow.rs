@@ -173,10 +173,10 @@ async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Principal,reques
     }
     let assist=if let Some(step)=operation.and_then(|op|op.steps.into_iter().find(|s|s.kind==BudgetStepKind::Assist)) {step} else {
         if !fresh {return Err("budget_preparation_requires_recovery".into());}
-        let prompt=crate::user_routes::extract_seedance_prompt(&original).map_err(|_|"invalid_seedance_prompt")?;
+        let prompt=crate::user_routes::normalize_video_spec_text(&crate::user_routes::extract_seedance_prompt(&original).map_err(|_|"invalid_seedance_prompt")?);
         let model=state.config.seedance_assistant_model.clone();
         let body=json!({"model":model,"stream":false,"max_tokens":1024,"temperature":0.2,"messages":[
-            {"role":"system","content":"你是视频请求调度助手。只输出严格 JSON。用户明确要求生成、制作视频时输出 {\"intent\":\"video\",\"prompt\":\"视频提示词\"}；普通问候、连接测试、非视频问题输出 {\"intent\":\"text\",\"text\":\"简短回答\"}。不要把 hello 或测试连接转换成视频。不要虚构已经生成的视频。"},
+            {"role":"system","content":"你是视频请求调度和提示词整理助手。只输出严格 JSON。用户明确要求生成、制作视频时输出 {\"intent\":\"video\",\"prompt\":\"视频提示词\"}；普通问候、连接测试、非视频问题输出 {\"intent\":\"text\",\"text\":\"简短回答\"}。纠正规格中的全角数字、字母、冒号和多余空格，例如９：１６整理为9:16；保持用户指定的时长、分辨率、画幅、主体、动作和场景，不得擅自修改规格或新增剧情。不要把 hello 或测试连接转换成视频。不要虚构已经生成的视频。"},
             {"role":"user","content":prompt}]});
         let child=match state.store.begin_budget_assist_request(&request,BeginRequestInput {user_id:principal.user_id.clone(),api_key_id:principal.key_id.clone(),protocol:"openai".into(),endpoint:"chat".into(),model:model.clone(),idempotency_key:format!("budget-assist:{request}"),body:body.clone()}).map_err(|e|e.to_string())? {
             BeginRequest::Created(r)|BeginRequest::Existing(r)=>r.id,BeginRequest::Conflict=>return Err("assist_identity_conflict".into()),
@@ -192,8 +192,11 @@ async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Principal,reques
     let decision:Value=serde_json::from_str(content.trim()).map_err(|_|"assist_result_invalid")?;
     if decision["intent"]=="text" {
         let text=decision["text"].as_str().filter(|s|!s.trim().is_empty() && s.len()<=16*1024).ok_or("assist_result_invalid")?;
+        let s=state.clone();let p=principal.clone();let b=original.clone();
+        let marker=tokio::task::spawn_blocking(move ||crate::reference_context::caption_reference(&s,&p,&images,&b)).await.map_err(|_|"reference_materialization_failed")??;
+        let text=if let Some(marker)=marker {format!("{text}\n参考素材已接收，后续生成请求请保留此素材标记：{marker}")} else {text.to_string()};
         state.store.finish_budget_execution(&request,BudgetExecutionState::Succeeded).map_err(|e|e.to_string())?;
-        return Ok(completion(&request,text));
+        return Ok(completion(&request,&text));
     }
     if decision["intent"]!="video" {return Err("assist_result_invalid".into());}
     // This retry passed Core's Key-scoped original-body fingerprint check. The
@@ -205,7 +208,7 @@ async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Principal,reques
         .is_none_or(|op|matches!(op.execution_state,BudgetExecutionState::Failed|BudgetExecutionState::Canceled|BudgetExecutionState::Succeeded)) {
         return Err("video_continuation_not_active".into());
     }
-    let prompt=decision["prompt"].as_str().filter(|s|!s.trim().is_empty() && s.len()<=12*1024).ok_or("assist_result_invalid")?;
+    let prompt=crate::user_routes::normalize_video_spec_text(decision["prompt"].as_str().filter(|s|!s.trim().is_empty() && s.len()<=12*1024).ok_or("assist_result_invalid")?);
     crate::user_routes::require_video_admission(&state,&principal,"seedance",&original).map_err(|_|"video_billing_paused")?;
     crate::user_routes::infer_video_parameters_from_prompt(&mut original);
     let mut body=json!({"model":"seedance","prompt":prompt});
@@ -272,9 +275,17 @@ pub(crate) async fn video_content(state:Arc<StarlinkRouterState>,principal:Princ
         .body(axum::body::Body::from_stream(crate::user_routes::BridgeBodyStream(receive))).unwrap_or_else(|_|fail("download_response_failed"))
 }
 
-pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Principal,headers:axum::http::HeaderMap,body:Value)->Response {
+pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Principal,headers:axum::http::HeaderMap,mut body:Value)->Response {
     use aiwork_core::{BeginRequest,BeginRequestInput};
     if let Some(response)=crate::video_delivery::follow_up(&state,&principal,&body).await {return response;}
+    let s=state.clone();let p=principal.clone();
+    body=match tokio::task::spawn_blocking(move ||->Result<Value,&'static str> {
+        crate::reference_context::recover(&s,&p,&mut body)?;Ok(body)
+    }).await {
+        Ok(Ok(recovered))=>recovered,
+        Ok(Err(code))=>return (StatusCode::BAD_REQUEST,Json(json!({"error":{"code":code,"message":if code=="reference_image_missing" {"本次请求没有携带参考图片或有效素材标记，请重新附加参考图；未提交视频"} else {"参考素材上下文无效或已过期，请重新附加参考图"}}}))).into_response(),
+        Err(_)=>return fail("reference_worker_unavailable"),
+    };
     if crate::user_routes::extract_seedance_prompt(&body).is_err() {return (StatusCode::BAD_REQUEST,Json(json!({"error":{"code":"seedance_prompt_missing"}}))).into_response();}
     let images=match inline_images(&body) {Ok(images)=>images,Err(code)=>return (StatusCode::BAD_REQUEST,Json(json!({"error":{"code":code}}))).into_response()};
     if !images.is_empty() && !principal.scopes.contains("assets:write") && !principal.scopes.contains("admin:*") {
