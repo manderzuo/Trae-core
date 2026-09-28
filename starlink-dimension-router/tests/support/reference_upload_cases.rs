@@ -47,11 +47,7 @@ async fn delivery_and_failed_download_receipt_keep_exact_version_without_new_dis
     let f=fixture_features("https://api.example.test",true);
     let result=json_response(chat(&f,&f.key,json!({"model":"seedance","messages":[{"role":"user","content":"生成橘猫散步视频，5秒480P"}]})).await).await;
     let request=result["request_id"].as_str().expect("video completes");
-    let w=f.state.store.create_video_work(&f.principal,"delivery-fixture").unwrap();
-    let snapshot=aiwork_core::VideoWorkSnapshot {effective_prompt:"橘猫散步".into(),duration:5,resolution:"480p".into(),ratio:"16:9".into(),watermark:false,user_media_ids:vec![],tail_frame_media_id:None,parent_version_id:None,source_request_id:None,reference_mode:"none".into(),summary:String::new()};
-    let raw=serde_json::to_string(&snapshot).unwrap();
-    let sealed=f.state.key_vault.encrypt(&aiwork_core::work_snapshot_context(&f.principal.key_id,&w.work_id,request),&raw).unwrap();
-    let version=f.state.store.bind_work_version(&f.principal,&w.work_id,None,request,aiwork_core::WorkAction::Create,&aiwork_core::EncryptedWorkSnapshot {key_version:sealed.key_version,ciphertext:sealed.ciphertext,snapshot_sha256:hex::encode(sha2::Sha256::digest(raw.as_bytes()))}).unwrap().version;
+    let version=f.state.store.work_version_for_request(&f.principal,request).unwrap().expect("generation route binds its version");
     let sends=f.bridge.sends.load(Ordering::SeqCst);
     let delivery=f.app.clone().oneshot(Request::post(format!("/v1/videos/{request}/delivery")).header("authorization",format!("Bearer {}",f.key)).header("content-type","application/json").body(Body::from("{}")).unwrap()).await.unwrap();
     assert_eq!(delivery.status(),StatusCode::OK);
@@ -62,7 +58,7 @@ async fn delivery_and_failed_download_receipt_keep_exact_version_without_new_dis
     assert_eq!(followup["work_context"],fallback["work_context"]);
     assert!(followup["choices"][0]["message"]["content"].as_str().unwrap().contains("[AIWORK_WORK:"));
     assert_eq!(f.bridge.sends.load(Ordering::SeqCst),sends);
-    assert_eq!(f.state.store.work_versions(&f.principal,&w.work_id).unwrap().len(),1);
+    assert_eq!(f.state.store.work_versions(&f.principal,&version.work_id).unwrap().len(),1);
 }
 fn input(paths:&[&str],stream:bool)->Value {
     let attached=paths.iter().map(|p|format!("<file_path>{p}</file_path>")).collect::<Vec<_>>().join("\n");

@@ -254,11 +254,7 @@ pub fn resolve(
         .transpose()?
         .flatten();
     if let Some(work) = mapped {
-        if let Some(r) = explicit.as_ref().or(history.as_ref()) {
-            if identity(r).map(|(w, _)| w) != Some(work.work_id.as_str()) {
-                return Ok(clarify());
-            }
-        } else {
+        if explicit.is_none() && history.is_none() {
             let versions = state
                 .store
                 .work_versions(p, &work.work_id)

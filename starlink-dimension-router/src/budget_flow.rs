@@ -20,6 +20,9 @@ pub(crate) fn fail(code:&str)->Response {
         "reference_asset_unavailable"|"reference_video_budget_metadata_required"|
         "video_safety_check_failed"|"reference_safety_check_failed"|"prompt_safety_check_failed"=>StatusCode::BAD_REQUEST,
         "budget_chat_input_too_large"=>StatusCode::PAYLOAD_TOO_LARGE,
+        "work_context_input_too_large"=>StatusCode::PAYLOAD_TOO_LARGE,
+        "work_context_unavailable"|"work_decision_invalid"|"work_spec_unsupported"|"work_parent_required"|"reference_image_missing"|"invalid_reference_context"|"reference_image_limit"|"invalid_reference_image"|"reference_requires_inline_image_or_owned_asset"|"continuation_mode_unsupported"=>StatusCode::BAD_REQUEST,
+        "insufficient_scope"=>StatusCode::FORBIDDEN,
         _=>StatusCode::SERVICE_UNAVAILABLE,
     };
     let mut response=(status,Json(json!({"error":{"type":"billing_error","code":code,"message":code}}))).into_response();
@@ -129,7 +132,13 @@ pub(crate) fn read_result(state:&StarlinkRouterState,step:&BudgetStepView)->Resu
 }
 pub(crate) async fn video_status(state:Arc<StarlinkRouterState>,principal:Principal,request:String)->Response {
     let result=tokio::task::spawn_blocking(move ||->Result<Option<Value>,String> {
-        let Some(step)=owned_video_step(&state,&principal,&request)? else {return Ok(None)};
+        let Some(step)=owned_video_step(&state,&principal,&request)? else {
+            if state.config.work_context_enabled && state.store.active_principal_for_request(&request).map_err(|_|"work_context_unavailable")?.is_some_and(|p|p.key_id==principal.key_id&&p.user_id==principal.user_id) {
+                let failed=state.store.budget_operation(&request).map_err(|_|"work_context_unavailable")?.is_some_and(|op|matches!(op.execution_state,aiwork_core::BudgetExecutionState::Failed|aiwork_core::BudgetExecutionState::Canceled)) || state.store.request_state(&request).map_err(|_|"work_context_unavailable")?==aiwork_core::RequestState::Failed;
+                return Ok(Some(json!({"task":{"id":request,"status":if failed {"failed"}else{"queued"}},"request_id":request})));
+            }
+            return Ok(None);
+        };
         let result=read_result(&state,&step)?;
         let (status,content)=if result["status"]=="ready" {
             let status=result["result"]["status"].as_str().filter(|s|matches!(*s,"completed"|"failed")).ok_or("invalid video result")?;
@@ -141,6 +150,10 @@ pub(crate) async fn video_status(state:Arc<StarlinkRouterState>,principal:Princi
         if status=="failed" {
             let code=if result["status"]=="failed_no_charge" {"budget_not_sent"} else {crate::seedance_feedback::video_failure(&result["result"])};
             value["task"]["error"]=failure_feedback(&state,code,&request)["error"].clone();
+        }
+        if state.config.work_context_enabled {
+            if status=="completed" {crate::work_execution::complete_version(&state,&principal,&request)?;}
+            crate::work_context::decorate_owned_request(&state,&principal,&request,&mut value)?;
         }
         Ok(Some(value))
     }).await;
@@ -178,11 +191,11 @@ fn temporary_result_read_error(code:&str)->bool {
         || code.starts_with("桥接响应不是有效 JSON:")
         || matches!(code,"AI Work bridge 返回 HTTP 429"|"AI Work bridge 返回 HTTP 500"|"AI Work bridge 返回 HTTP 502"|"AI Work bridge 返回 HTTP 503"|"AI Work bridge 返回 HTTP 504")
 }
-fn completion(request:&str,text:&str)->Value {
+pub(crate) fn completion(request:&str,text:&str)->Value {
     json!({"id":format!("chatcmpl-{request}"),"object":"chat.completion","created":chrono::Utc::now().timestamp(),"model":"seedance","request_id":request,
         "choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}]})
 }
-fn inline_images(body:&Value)->Result<Vec<crate::assets::ParsedAssetUpload>,String> {
+pub(crate) fn inline_images(body:&Value)->Result<Vec<crate::assets::ParsedAssetUpload>,String> {
     let parts=body["messages"].as_array().and_then(|m|m.iter().rev().find(|v|v["role"]=="user"))
         .and_then(|m|m["content"].as_array());
     let mut images=Vec::new();let mut total=0usize;
@@ -200,7 +213,7 @@ fn inline_images(body:&Value)->Result<Vec<crate::assets::ParsedAssetUpload>,Stri
     }
     Ok(images)
 }
-async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Principal,request:String,mut original:Value,fresh:bool,images:Vec<crate::assets::ParsedAssetUpload>,dispatch_only:bool)->Result<Value,String> {
+pub(crate) async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Principal,request:String,mut original:Value,fresh:bool,images:Vec<crate::assets::ParsedAssetUpload>,dispatch_only:bool)->Result<Value,String> {
     use aiwork_core::{BeginRequest,BeginRequestInput,BudgetExecutionState};
     use crate::seedance_feedback::Stage;
     let operation=state.store.budget_operation(&request).map_err(|e|e.to_string())?;
@@ -209,6 +222,7 @@ async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Principal,reques
         let result=wait_result(state.clone(),video).await?;
         return completed_video(&state,&principal,&request,&result,&original).await;
     }
+    if state.config.work_context_enabled {return crate::work_execution::execute(state,principal,request,original,fresh,dispatch_only).await;}
     state.seedance_results.progress(&request,Stage::Assistant);
     let assist=if let Some(step)=operation.and_then(|op|op.steps.into_iter().find(|s|s.kind==BudgetStepKind::Assist)) {step} else {
         if !fresh {return Err("budget_preparation_requires_recovery".into());}
@@ -283,6 +297,7 @@ async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Principal,reques
 }
 async fn completed_video(state:&Arc<StarlinkRouterState>,principal:&Principal,request:&str,result:&Value,body:&Value)->Result<Value,String> {
     if result["status"]!="completed" {return Err(crate::seedance_feedback::video_failure(result).into());}
+    if state.config.work_context_enabled {crate::work_execution::complete_version(state,principal,request)?;}
     state.seedance_results.progress(request,crate::seedance_feedback::Stage::Delivery);
     crate::video_delivery::completion(state,principal,request,body).await
 }
@@ -324,14 +339,14 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
     if let Some(response)=crate::reference_upload::before_chat(&state,&principal,&mut headers,&mut body).await {return response;}
     if let Some(response)=crate::video_delivery::follow_up(&state,&principal,&body).await {return response;}
     let s=state.clone();let p=principal.clone();
-    body=match tokio::task::spawn_blocking(move ||->Result<Value,(&'static str,Value)> {
+    if !state.config.work_context_enabled {body=match tokio::task::spawn_blocking(move ||->Result<Value,(&'static str,Value)> {
         crate::reference_context::recover(&s,&p,&mut body)
             .map_err(|code|(code,crate::reference_diagnostics::summarize(&body)))?;Ok(body)
     }).await {
         Ok(Ok(recovered))=>recovered,
         Ok(Err((code,summary)))=>return (StatusCode::BAD_REQUEST,Json(crate::reference_diagnostics::rejection(code,summary))).into_response(),
         Err(_)=>return fail("reference_worker_unavailable"),
-    };
+    };}
     if crate::user_routes::extract_seedance_prompt(&body).is_err() {return (StatusCode::BAD_REQUEST,Json(json!({"error":{"code":"seedance_prompt_missing"}}))).into_response();}
     let images=match inline_images(&body) {Ok(images)=>images,Err(code)=>return (StatusCode::BAD_REQUEST,Json(json!({"error":{"code":code}}))).into_response()};
     if !images.is_empty() && !principal.scopes.contains("assets:write") && !principal.scopes.contains("admin:*") {
@@ -343,7 +358,7 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
         let _admission=state.seedance_results.admission.lock().unwrap_or_else(|e|e.into_inner());
         let begun=if supplied.is_some() {state.store.begin_billed_request(input)} else {state.store.begin_implicit_billed_video_request(input)};
         let (request,fresh)=match begun {Ok(BeginRequest::Created(r))=>(r.id,true),Ok(BeginRequest::Existing(r))=>(r.id,false),Ok(BeginRequest::Conflict)=>return StatusCode::CONFLICT.into_response(),Err(_)=>return fail("budget_request_rejected")};
-        if crate::budget_continuation::save(&state,&principal,&request,&body).is_err() {return fail("budget_checkpoint_unavailable");}
+        if let Err(code)=crate::budget_continuation::save_with_headers(&state,&principal,&request,&body,&headers) {if fresh {let _=state.store.finish_unadmitted_request(&request);}return fail(crate::budget_errors::public_code(&code).unwrap_or("budget_checkpoint_unavailable"));}
         let (subscription,publisher)=match state.seedance_results.subscribe(&request) {
             Ok(v)=>v,Err(code)=>{
                 if fresh {let _=state.store.finish_unadmitted_request(&request);}
@@ -376,6 +391,7 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
             };
             if let Err(code)=&outcome {
                 finish_definite_failure(&state,&rid,code);
+                if state.config.work_context_enabled {crate::work_execution::reflect_failure(&state,&rid,code);}
                 if fresh {let _=state.store.finish_unadmitted_request(&rid);}
             }
             publisher.complete(outcome);
@@ -461,7 +477,7 @@ pub(crate) async fn resume_checkpoint(state:Arc<StarlinkRouterState>,checkpoint:
     let principal=checkpoint.principal.ok_or("video_continuation_not_authorized")?;
     aiwork_core::require_scope(&principal,"videos:submit").map_err(|_|"video_continuation_not_authorized")?;
     let text=zeroize::Zeroizing::new(state.key_vault.decrypt(&context,checkpoint.key_version,&checkpoint.ciphertext).map_err(|_|"budget_checkpoint_invalid")?);
-    let body:Value=serde_json::from_str(&text).map_err(|_|"budget_checkpoint_invalid")?;
+    let (body,_)=crate::budget_continuation::decode_checkpoint(&text)?;
     // Re-check the original request hash and current user/Key status before any
     // paid continuation. This call cannot replace the immutable checkpoint.
     state.store.save_budget_continuation(&principal,&checkpoint.request_id,&body,checkpoint.key_version,&checkpoint.ciphertext).map_err(|_|"budget_checkpoint_invalid")?;

@@ -14,6 +14,7 @@ fn base() -> VideoWorkSnapshot {
         source_request_id: None,
         reference_mode: "user_reference".into(),
         summary: "雨夜街道".into(),
+        dispatch_body:None,
     }
 }
 fn decision(action: WorkIntent, policy: &str) -> WorkDecision {

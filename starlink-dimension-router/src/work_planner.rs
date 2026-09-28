@@ -364,6 +364,7 @@ pub fn merge_snapshot(
         source_request_id: None,
         reference_mode: "none".into(),
         summary: String::new(),
+        dispatch_body:None,
     });
     s.effective_prompt = crate::user_routes::normalize_video_spec_text(
         d.effective_prompt
@@ -440,5 +441,6 @@ pub fn merge_snapshot(
     .into();
     s.parent_version_id = None;
     s.source_request_id = None;
+    s.dispatch_body = None;
     Ok(s)
 }

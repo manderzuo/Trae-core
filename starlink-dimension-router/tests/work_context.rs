@@ -109,6 +109,7 @@ impl Fixture {
             source_request_id: None,
             reference_mode: "user_reference".into(),
             summary: String::new(),
+            dispatch_body:None,
         };
         let raw = serde_json::to_string(&snapshot).unwrap();
         let encrypted = self

@@ -79,6 +79,10 @@ pub struct VideoWorkSnapshot {
     pub source_request_id: Option<String>,
     pub reference_mode: String,
     pub summary: String,
+    /// Internal immutable, already-materialized upstream input. It is stored
+    /// only inside the authenticated encrypted version snapshot.
+    #[serde(default)]
+    pub dispatch_body: Option<serde_json::Value>,
 }
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct VideoWorkVersion {

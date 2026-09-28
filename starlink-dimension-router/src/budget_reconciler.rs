@@ -70,6 +70,11 @@ pub(crate) fn sync_execution(state: &StarlinkRouterState, client: &BridgeClient,
                 match decision {
                     Some(value) if value["intent"]=="text" && value["text"].as_str().is_some_and(|s|!s.trim().is_empty() && s.len()<=16*1024)=>Some(Execution::Succeeded),
                     Some(value) if value["intent"]=="video" && value["prompt"].as_str().is_some_and(|s|!s.trim().is_empty() && s.len()<=12*1024)=>None,
+                    Some(value) if state.config.work_context_enabled=>match crate::work_planner::parse_decision(&value.to_string()) {
+                        Ok(d) if d.paid_action().is_some()=>None,
+                        Ok(_)=>Some(Execution::Succeeded),
+                        Err(_)=>Some(Execution::Failed),
+                    },
                     _=>Some(Execution::Failed),
                 }
             };

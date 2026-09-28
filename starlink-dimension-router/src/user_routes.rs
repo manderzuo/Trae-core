@@ -2242,8 +2242,10 @@ pub async fn video_generations(State(state): State<Arc<StarlinkRouterState>>, he
         Ok(BeginRequest::Conflict) => return (StatusCode::CONFLICT, Json(json!({"error": {"type": "idempotency_conflict", "message": "Idempotency-Key 与历史请求内容不一致"}}))).into_response(),
         Ok(BeginRequest::Existing(request)) => {
             if state.config.budget_billing_v2 && state.store.budget_operation(&request.id).ok().flatten().is_some_and(|o|o.api_key_id==principal.key_id) {
+                if state.config.work_context_enabled {return crate::work_execution::submit_direct(state,principal,headers,request.id,value,false).await;}
                 return (StatusCode::ACCEPTED,Json(json!({"task":{"id":request.id,"status":"processing"},"core_replay":true}))).into_response();
             }
+            if state.config.budget_billing_v2 && state.config.work_context_enabled && state.store.budget_continuation(&request.id).ok().flatten().is_some() {return crate::work_execution::submit_direct(state,principal,headers,request.id,value,false).await;}
             let job = state.jobs.lock().unwrap().values().find(|job| job.request_id == request.id && job.user_id == principal.user_id).cloned();
             if let Some(job) = job.filter(|job| !job.reconcile_required && job.upstream_id.is_some()) {
                 return Json(json!({"task": {"id": job.id, "status": job.status}, "core_replay": true})).into_response();
@@ -2255,6 +2257,7 @@ pub async fn video_generations(State(state): State<Arc<StarlinkRouterState>>, he
     let request_id = request.id.clone();
     if state.config.budget_billing_v2 {
         let mut forwarded=value;
+        if state.config.work_context_enabled {return crate::work_execution::submit_direct(state,principal,headers,request_id,forwarded,true).await;}
         if let Err(response)=materialize_bridge_assets(&state,&principal,&mut forwarded,&request_id).await {return finish_failed_quote_request(&state,&request_id,response);}
         return crate::budget_flow::submit_video(state,principal,request_id,forwarded).await;
     }
@@ -2343,7 +2346,7 @@ pub async fn video_generations(State(state): State<Arc<StarlinkRouterState>>, he
 }
 
 pub async fn video_task(State(state): State<Arc<StarlinkRouterState>>, Path(task_id): Path<String>, headers: HeaderMap, Extension(principal): Extension<Principal>) -> Response {
-    if state.store.budget_operation(&task_id).ok().flatten().is_some() {
+    if state.store.budget_operation(&task_id).ok().flatten().is_some() || (state.config.work_context_enabled && state.store.budget_continuation(&task_id).ok().flatten().is_some()) {
         return crate::budget_flow::video_status(state,principal,task_id).await;
     }
     let job = match state.jobs.lock().unwrap().get(&task_id).cloned() { Some(job) if job.user_id == principal.user_id && job.api_key_id == principal.key_id => job, Some(_) => return StatusCode::NOT_FOUND.into_response(), None => return StatusCode::NOT_FOUND.into_response() };

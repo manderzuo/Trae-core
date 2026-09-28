@@ -2,13 +2,33 @@
 use std::sync::Arc;
 use crate::state::StarlinkRouterState;
 
-pub(crate) fn save(state:&StarlinkRouterState,principal:&aiwork_core::Principal,request:&str,body:&serde_json::Value)->Result<(),String> {
+pub(crate) fn save_with_headers(state:&StarlinkRouterState,principal:&aiwork_core::Principal,request:&str,body:&serde_json::Value,headers:&axum::http::HeaderMap)->Result<(),String> {
+    if let Some(saved)=state.store.budget_continuation(request).map_err(|_|"checkpoint persistence failed")? {
+        state.store.save_budget_continuation(principal,request,body,saved.key_version,&saved.ciphertext).map_err(|_|"checkpoint identity conflict")?;
+        return Ok(());
+    }
     let fingerprint=state.store.request_fingerprint_for_billing(request).map_err(|_|"checkpoint request missing")?;
     let context=format!("budget-continuation-v1:{request}:{}:{fingerprint}",principal.key_id);
-    let plaintext=zeroize::Zeroizing::new(serde_json::to_string(body).map_err(|_|"checkpoint encoding failed")?);
+    let stored=if state.config.work_context_enabled {
+        let mut binding=crate::work_execution::freeze_context(state,principal,headers,body)?;
+        if body.get("messages").is_none() && body["prompt"].as_str().is_some_and(|s|!s.trim().is_empty()) && binding.work_id.is_none() && binding.clarification.is_none() {
+            binding.work_id=Some(state.store.create_video_work(principal,&binding.association).map_err(|_|"work_context_unavailable")?.work_id);
+        }
+        serde_json::json!({"format":"aiwork-work-checkpoint-v1","body":body,"binding":binding})
+    }else{body.clone()};
+    let plaintext=zeroize::Zeroizing::new(serde_json::to_string(&stored).map_err(|_|"checkpoint encoding failed")?);
     let encrypted=state.key_vault.encrypt(&context,&plaintext).map_err(|_|"checkpoint encryption failed")?;
     state.store.save_budget_continuation(principal,request,body,encrypted.key_version,&encrypted.ciphertext).map_err(|_|"checkpoint persistence failed")?;
     Ok(())
+}
+
+pub(crate) fn decode_checkpoint(raw:&str)->Result<(serde_json::Value,Option<crate::work_execution::ContextBinding>),String> {
+    let v:serde_json::Value=serde_json::from_str(raw).map_err(|_|"budget_checkpoint_invalid")?;
+    if v["format"]=="aiwork-work-checkpoint-v1" {
+        let binding=serde_json::from_value(v["binding"].clone()).map_err(|_|"budget_checkpoint_invalid")?;
+        if !v["body"].is_object(){return Err("budget_checkpoint_invalid".into());}
+        Ok((v["body"].clone(),Some(binding)))
+    }else{Ok((v,None))}
 }
 pub(crate) fn spawn(state:&Arc<StarlinkRouterState>) {
     if !state.config.budget_billing_v2 {return;}
