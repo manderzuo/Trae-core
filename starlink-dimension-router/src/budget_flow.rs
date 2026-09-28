@@ -12,7 +12,7 @@ struct Prepared {
 }
 pub(crate) fn fail(code:&str)->Response {
     let status=match code {
-        "key_concurrency_exceeded"|"video_download_busy"|"budget_preparation_busy"|"bridge_workers_busy"|"reference_upload_limited"=>StatusCode::TOO_MANY_REQUESTS,
+        "key_concurrency_exceeded"|"video_download_busy"|"budget_preparation_busy"|"bridge_workers_busy"|"reference_upload_limited"|"stream_observer_limit"=>StatusCode::TOO_MANY_REQUESTS,
         "quota_insufficient"=>StatusCode::PAYMENT_REQUIRED,
         "video_not_ready"|"budget_identity_conflict"=>StatusCode::CONFLICT,
         "invalid_budget_business_request"|"invalid_chat_image"|"reference_video_metadata_invalid"|
@@ -295,30 +295,52 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
     }
     let supplied=headers.get("idempotency-key").and_then(|v|v.to_str().ok()).filter(|v|!v.trim().is_empty());
     let input=BeginRequestInput {user_id:principal.user_id.clone(),api_key_id:principal.key_id.clone(),protocol:"openai".into(),endpoint:"videos".into(),model:"seedance".into(),idempotency_key:supplied.unwrap_or_default().into(),body:body.clone()};
-    let begun=if supplied.is_some() {state.store.begin_billed_request(input)} else {state.store.begin_implicit_billed_video_request(input)};
-    let (request,fresh)=match begun {Ok(BeginRequest::Created(r))=>(r.id,true),Ok(BeginRequest::Existing(r))=>(r.id,false),Ok(BeginRequest::Conflict)=>return StatusCode::CONFLICT.into_response(),Err(_)=>return fail("budget_request_rejected")};
-    if crate::budget_continuation::save(&state,&principal,&request,&body).is_err() {return fail("budget_checkpoint_unavailable");}
-    let Some(observer)=crate::budget_observer::Observer::acquire(state.video_stream_observers.clone(),request.clone()) else {
-        return (StatusCode::TOO_MANY_REQUESTS,Json(json!({"error":{"code":"budget_observer_busy"}}))).into_response();
+    let (request,fresh,subscription,publisher)={
+        let _admission=state.seedance_results.admission.lock().unwrap_or_else(|e|e.into_inner());
+        let begun=if supplied.is_some() {state.store.begin_billed_request(input)} else {state.store.begin_implicit_billed_video_request(input)};
+        let (request,fresh)=match begun {Ok(BeginRequest::Created(r))=>(r.id,true),Ok(BeginRequest::Existing(r))=>(r.id,false),Ok(BeginRequest::Conflict)=>return StatusCode::CONFLICT.into_response(),Err(_)=>return fail("budget_request_rejected")};
+        if crate::budget_continuation::save(&state,&principal,&request,&body).is_err() {return fail("budget_checkpoint_unavailable");}
+        let (subscription,publisher)=match state.seedance_results.subscribe(&request) {
+            Ok(v)=>v,Err(code)=>{
+                if fresh {let _=state.store.finish_unadmitted_request(&request);}
+                return request_failure(code,&request);
+            },
+        };
+        (request,fresh,subscription,publisher)
     };
     let stream=body["stream"].as_bool().unwrap_or(false);
-    let (done,receive)=tokio::sync::oneshot::channel();
-    let rid=request.clone();
-    tokio::spawn(async move {
-        let _observer=observer;
-        let outcome=seedance_work(state.clone(),principal,rid.clone(),body,fresh,images,false).await;
-        if outcome.is_err() {
-            // Only terminal steps may release execution. Unknown paid execution
-            // is retained; its budget and receipt remain recoverable.
-            finish_definite_failure(&state,&rid,outcome.as_ref().err().unwrap());
-        }
-        let _=done.send(outcome);
-    });
+    if let Some(publisher)=publisher {
+        let rid=request.clone();
+        tokio::spawn(async move {
+            // Exactly one HTTP leader also coordinates with background recovery.
+            // Subscribers never prepare/dispatch or re-run delivery selection.
+            let owner=async {
+                tokio::time::timeout(std::time::Duration::from_secs(45*60),async {
+                    loop {
+                        match crate::budget_observer::Observer::try_acquire(state.video_stream_observers.clone(),rid.clone()) {
+                            Ok(owner)=>return Ok(owner),
+                            Err(crate::budget_observer::AcquireError::Busy)=>tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                            Err(crate::budget_observer::AcquireError::Capacity)=>return Err("budget_preparation_busy".to_string()),
+                        }
+                    }
+                }).await.map_err(|_|"budget_execution_wait_timeout".to_string())?
+            }.await;
+            // Keep execution ownership through failure disposition and publication.
+            let outcome=match &owner {
+                Ok(_)=>seedance_work(state.clone(),principal,rid.clone(),body,fresh,images,false).await,
+                Err(code)=>Err(code.clone()),
+            };
+            if let Err(code)=&outcome {
+                finish_definite_failure(&state,&rid,code);
+                if fresh {let _=state.store.finish_unadmitted_request(&rid);}
+            }
+            publisher.complete(outcome);
+        });
+    }
     if !stream {
-        return match receive.await {
-            Ok(Ok(value))=>Json(value).into_response(),
-            Ok(Err(code))=>fail(crate::budget_errors::public_code(&code).unwrap_or("seedance_budget_execution_failed")),
-            _=>fail("seedance_budget_execution_failed"),
+        return match subscription.result().await {
+            Ok(value)=>Json(value).into_response(),
+            Err(code)=>request_failure(crate::budget_errors::public_code(&code).unwrap_or("seedance_budget_execution_failed"),&request),
         };
     }
     let (send,recv)=tokio::sync::mpsc::channel(8);
@@ -329,19 +351,20 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
         if send.send(Ok(axum::body::Bytes::from(format!("data: {initial}\n\n")))).await.is_err() {return;}
         // Heartbeats keep provider validation and long video generation alive;
         // this is Seedance orchestration, not a replacement for normal chat SSE.
-        let mut receive=receive;
+        let mut receive=Box::pin(subscription.result());
         let mut tick=tokio::time::interval(std::time::Duration::from_secs(10));
         loop {tokio::select! {
-            _=tick.tick()=>{if send.send(Ok(axum::body::Bytes::from_static(crate::seedance_sse::keep_alive()))).await.is_err() {break;}},
+            _=send.closed()=>break,
+            _=tick.tick()=>{if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),send.send(Ok(axum::body::Bytes::from_static(crate::seedance_sse::keep_alive())))).await,Ok(Ok(()))) {break;}},
             result=&mut receive=>{
                 let bytes=match result {
-                    Ok(Ok(value))=>crate::video_delivery::sse_completion(&value),
+                    Ok(value)=>crate::video_delivery::sse_completion(&value),
                     failure=>{
-                        let code=match &failure {Ok(Err(code))=>crate::budget_errors::public_code(code).unwrap_or("seedance_budget_execution_failed"),_=>"seedance_budget_execution_failed"};
+                        let code=match &failure {Err(code)=>crate::budget_errors::public_code(code).unwrap_or("seedance_budget_execution_failed"),_=>"seedance_budget_execution_failed"};
                         crate::seedance_sse::encode_event(&request,crate::seedance_sse::VideoStreamEvent::Failed {code:code.into(),request_id:request.clone()})
                     },
                 };
-                let _=send.send(Ok(axum::body::Bytes::from(bytes))).await;break;
+                let _=tokio::time::timeout(std::time::Duration::from_secs(5),send.send(Ok(axum::body::Bytes::from(bytes)))).await;break;
             }
         }}
     });
@@ -349,6 +372,12 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
     response.headers_mut().insert("content-type","text/event-stream; charset=utf-8".parse().unwrap());
     response.headers_mut().insert("cache-control","no-cache, no-transform".parse().unwrap());
     response.headers_mut().insert("x-accel-buffering","no".parse().unwrap());response
+}
+
+fn request_failure(code:&str,request:&str)->Response {
+    let mut response=fail(code);
+    *response.body_mut()=axum::body::Body::from(json!({"error":{"type":"billing_error","code":code,"message":code},"request_id":request}).to_string());
+    response
 }
 
 pub(crate) fn finish_definite_failure(state:&StarlinkRouterState,request:&str,code:&str) {

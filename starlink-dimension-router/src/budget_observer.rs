@@ -2,18 +2,25 @@
 use std::{collections::HashSet,sync::{Arc,Mutex}};
 
 pub(crate) struct Observer {owners:Arc<Mutex<HashSet<String>>>,request:String}
+pub(crate) enum AcquireError {Busy,Capacity}
 impl Observer {
     pub(crate) fn acquire(owners:Arc<Mutex<HashSet<String>>>,request:String)->Option<Self> {
         Self::acquire_with_capacity_rejection(owners,request,|| {})
     }
     pub(crate) fn acquire_with_capacity_rejection(owners:Arc<Mutex<HashSet<String>>>,request:String,reject:impl FnOnce())->Option<Self> {
+        Self::try_acquire_with_capacity_rejection(owners,request,reject).ok()
+    }
+    pub(crate) fn try_acquire(owners:Arc<Mutex<HashSet<String>>>,request:String)->Result<Self,AcquireError> {
+        Self::try_acquire_with_capacity_rejection(owners,request,|| {})
+    }
+    fn try_acquire_with_capacity_rejection(owners:Arc<Mutex<HashSet<String>>>,request:String,reject:impl FnOnce())->Result<Self,AcquireError> {
         {
             let mut busy=owners.lock().unwrap_or_else(|e|e.into_inner());
-            if busy.contains(&request) {return None;}
-            if busy.len()>=128 {reject();return None;}
+            if busy.contains(&request) {return Err(AcquireError::Busy);}
+            if busy.len()>=128 {reject();return Err(AcquireError::Capacity);}
             busy.insert(request.clone());
         }
-        Some(Self {owners,request})
+        Ok(Self {owners,request})
     }
 }
 impl Drop for Observer {
@@ -52,5 +59,16 @@ mod tests {
         assert!(rejected);
         assert_eq!(owners.lock().unwrap().len(),128);drop(guards);
         assert!(Observer::acquire(owners,"extra".into()).is_some());
+    }
+
+    #[test]
+    fn capacity_cleanup_cannot_race_a_new_execution_owner() {
+        let owners=Arc::new(Mutex::new(HashSet::new()));
+        let _guards=(0..128).map(|i|Observer::acquire(owners.clone(),i.to_string()).unwrap()).collect::<Vec<_>>();
+        assert!(Observer::acquire_with_capacity_rejection(owners.clone(),"new".into(),|| {
+            // Cleanup can terminalize the durable request. No other admission
+            // may acquire ownership between deciding capacity and that cleanup.
+            assert!(owners.try_lock().is_err(),"capacity cleanup must still exclude new execution owners");
+        }).is_none());
     }
 }

@@ -7,6 +7,9 @@ use starlink_dimension_router::{bridge_client::{BridgeClient,BridgeTransport,Bri
 #[path="support/reference_upload_cases.rs"]
 mod reference_upload_cases;
 
+#[path="support/seedance_reconnect_cases.rs"]
+mod seedance_reconnect_cases;
+
 struct Bridge {claims:Mutex<BTreeMap<String,Value>>,sends:AtomicUsize,video_intent:bool,
     large_downloads:std::sync::atomic::AtomicBool,active_downloads:Arc<AtomicUsize>,download_status:AtomicUsize}
 struct DownloadReader {active:Arc<AtomicUsize>}
@@ -701,7 +704,7 @@ async fn run_case_with_fault(probe:bool,stream:bool,video_intent:bool,reference:
             let _router=starlink_dimension_router::server::build_router(state.clone());
             if fault==BackgroundFault::HttpRace {
                 let r=user_routes::chat_completions(State(state.clone()),headers.clone(),Extension(principal.clone()),body.clone()).await;
-                assert!(matches!(r.status(),StatusCode::OK|StatusCode::TOO_MANY_REQUESTS));
+                assert_eq!(r.status(),StatusCode::OK,"background ownership must not reject the reconnecting HTTP client");
                 let _=axum::body::to_bytes(r.into_body(),65536).await.unwrap();
             }
             tokio::time::timeout(std::time::Duration::from_secs(5),async {

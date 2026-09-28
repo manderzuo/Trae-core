@@ -24,6 +24,7 @@ pub(crate) mod reference_diagnostics;
 pub(crate) mod budget_errors;
 pub(crate) mod budget_continuation;
 pub(crate) mod budget_observer;
+pub(crate) mod seedance_results;
 pub(crate) mod budget_chat;
 pub mod video_delivery;
 pub(crate) mod delivery_assist;
