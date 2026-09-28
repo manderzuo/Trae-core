@@ -566,8 +566,10 @@ async fn rewrap_api_key_vault(
         let encrypted=state.key_vault.reencrypt(context,version,ciphertext).map_err(|_|CoreError::ApiKeyEncryptionUnavailable)?;
         Ok((encrypted.ciphertext,encrypted.key_version))
     }).map_err(key_vault_admin_error)?;
+    let work_rewrapped=crate::work_media::rotate(&state).map_err(|_|key_vault_admin_error(CoreError::ApiKeyEncryptionUnavailable))?;
     Ok(no_store_json(json!({ "rewrapped": rewrapped, "active_key_version": active_version,
-        "continuations_rewrapped":continuations_rewrapped,"continuations_remaining":continuations_remaining })))
+        "continuations_rewrapped":continuations_rewrapped,"continuations_remaining":continuations_remaining,
+        "work_rewrapped":work_rewrapped })))
 }
 
 fn no_store_json(value: serde_json::Value) -> Response {

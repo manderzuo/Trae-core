@@ -26,6 +26,10 @@ fn prepare_v17_database(label: &str) -> (CoreStore, PathBuf) {
              DROP TABLE budget_steps;
              DROP TABLE budget_operations;
              DROP TABLE budget_preparations;
+             DROP TABLE IF EXISTS video_work_contexts;
+             DROP TABLE IF EXISTS video_work_versions;
+             DROP TABLE IF EXISTS video_work_media;
+             DROP TABLE IF EXISTS video_works;
              UPDATE schema_meta SET value = '17' WHERE key = 'schema_version';
              INSERT INTO users (id, name, role, status, created_at_ms, updated_at_ms)
                VALUES ('credit-user', 'Credit User', 'user', 'active', 1, 1);

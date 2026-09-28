@@ -44,6 +44,10 @@ fn v19_migration_adds_encrypted_api_key_storage_columns() {
              DROP TABLE budget_steps;
              DROP TABLE budget_operations;
              DROP TABLE budget_preparations;
+             DROP TABLE IF EXISTS video_work_contexts;
+             DROP TABLE IF EXISTS video_work_versions;
+             DROP TABLE IF EXISTS video_work_media;
+             DROP TABLE IF EXISTS video_works;
              UPDATE schema_meta SET value = '19' WHERE key = 'schema_version';",
         )
         .unwrap();

@@ -32,7 +32,11 @@ fn schema_v22_to_v23_preserves_old_reservations() {
         rusqlite::params![request.id, key.id],
     ).unwrap();
     connection.execute_batch(
-        "DROP TABLE IF EXISTS controlled_billing_steps;
+        "DROP TABLE IF EXISTS video_work_contexts;
+         DROP TABLE IF EXISTS video_work_versions;
+         DROP TABLE IF EXISTS video_work_media;
+         DROP TABLE IF EXISTS video_works;
+         DROP TABLE IF EXISTS controlled_billing_steps;
          DROP TABLE IF EXISTS controlled_billing_operations;
          DROP TABLE budget_settlements;
          DROP TABLE budget_receipt_evidence;
@@ -96,6 +100,10 @@ fn prepare_v11_quota_database(prefix: &str, mismatched_reservation_key: bool) ->
     connection
         .execute_batch(
             "PRAGMA foreign_keys = OFF;
+             DROP TABLE IF EXISTS video_work_contexts;
+             DROP TABLE IF EXISTS video_work_versions;
+             DROP TABLE IF EXISTS video_work_media;
+             DROP TABLE IF EXISTS video_works;
              DROP TABLE IF EXISTS budget_settlements;
              DROP TABLE IF EXISTS budget_receipt_evidence;
              DROP TABLE IF EXISTS budget_steps;
@@ -279,7 +287,11 @@ fn v14_migration_backfills_video_read_scope_for_existing_keys() {
         .unwrap();
     connection
         .execute_batch(
-            "ALTER TABLE api_keys DROP COLUMN secret_key_version;
+            "DROP TABLE IF EXISTS video_work_contexts;
+             DROP TABLE IF EXISTS video_work_versions;
+             DROP TABLE IF EXISTS video_work_media;
+             DROP TABLE IF EXISTS video_works;
+             ALTER TABLE api_keys DROP COLUMN secret_key_version;
              ALTER TABLE api_keys DROP COLUMN secret_ciphertext;
              DROP TABLE budget_settlements;
              DROP TABLE budget_receipt_evidence;

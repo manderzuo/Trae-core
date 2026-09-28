@@ -884,3 +884,56 @@ CREATE INDEX IF NOT EXISTS reference_uploads_key_expiry ON reference_uploads(api
 CREATE INDEX IF NOT EXISTS reference_uploads_expiry ON reference_uploads(expires_at_ms);
 CREATE INDEX IF NOT EXISTS reference_uploads_retry ON reference_uploads(api_key_id,dedupe_hash,created_at_ms);
 "#;
+pub(crate) const SCHEMA_V30: &str = r#"
+CREATE TABLE video_works (
+ work_id TEXT PRIMARY KEY,
+ owner_key_id TEXT NOT NULL REFERENCES api_keys(id),
+ owner_user_id TEXT NOT NULL REFERENCES users(id),
+ conversation_ref TEXT NOT NULL,
+ created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, deleted_at_ms INTEGER,
+ UNIQUE(owner_key_id, conversation_ref)
+);
+CREATE TABLE video_work_media (
+ media_id TEXT PRIMARY KEY,
+ work_id TEXT NOT NULL REFERENCES video_works(work_id),
+ owner_key_id TEXT NOT NULL REFERENCES api_keys(id),
+ kind TEXT NOT NULL CHECK(kind IN ('image','video','tail_frame')),
+ content_sha256 TEXT NOT NULL CHECK(length(content_sha256)=64),
+ encrypted_storage_ref BLOB NOT NULL CHECK(length(encrypted_storage_ref)>28),
+ key_version INTEGER NOT NULL CHECK(key_version>0),
+ size_bytes INTEGER NOT NULL CHECK(size_bytes>0),
+ expires_at_ms INTEGER NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('preparing','active','deleting','deleted')),
+ leases_json TEXT NOT NULL DEFAULT '[]',
+ UNIQUE(work_id,kind,content_sha256)
+);
+CREATE INDEX video_work_media_cleanup ON video_work_media(state,expires_at_ms);
+CREATE TABLE video_work_versions (
+ version_id TEXT PRIMARY KEY,
+ work_id TEXT NOT NULL REFERENCES video_works(work_id),
+ parent_version_id TEXT REFERENCES video_work_versions(version_id),
+ operation_request_id TEXT NOT NULL UNIQUE REFERENCES requests(id),
+ ordinal INTEGER NOT NULL CHECK(ordinal>0),
+ action TEXT NOT NULL CHECK(action IN ('create','revise','continue')),
+ state TEXT NOT NULL CHECK(state IN ('preparing','running','completed','failed','unknown')),
+ key_version INTEGER NOT NULL CHECK(key_version>0),
+ encrypted_snapshot BLOB NOT NULL CHECK(length(encrypted_snapshot)>28),
+ snapshot_sha256 TEXT NOT NULL CHECK(length(snapshot_sha256)=64),
+ context_handle_sha256 TEXT,
+ tail_frame_media_id TEXT REFERENCES video_work_media(media_id),
+ frame_state TEXT NOT NULL DEFAULT 'pending' CHECK(frame_state IN ('pending','running','ready','failed')),
+ frame_error TEXT,
+ delivery_state TEXT NOT NULL DEFAULT 'pending',
+ created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, deleted_at_ms INTEGER,
+ UNIQUE(work_id,ordinal)
+);
+CREATE TABLE video_work_contexts (
+ context_handle_sha256 TEXT PRIMARY KEY CHECK(length(context_handle_sha256)=64),
+ work_id TEXT NOT NULL REFERENCES video_works(work_id),
+ version_id TEXT REFERENCES video_work_versions(version_id),
+ key_version INTEGER NOT NULL CHECK(key_version>0),
+ encrypted_handle BLOB NOT NULL CHECK(length(encrypted_handle)>28)
+);
+CREATE UNIQUE INDEX video_work_version_handle ON video_work_contexts(version_id) WHERE version_id IS NOT NULL;
+CREATE UNIQUE INDEX video_work_pending_handle ON video_work_contexts(work_id) WHERE version_id IS NULL;
+"#;

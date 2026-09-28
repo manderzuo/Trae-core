@@ -3501,7 +3501,7 @@ mod tests {
         drop(connection);
 
         let connection = Connection::open(&database).unwrap();
-        connection.execute("UPDATE schema_meta SET value='25' WHERE key='schema_version'", []).unwrap();
+        connection.execute_batch("DROP TABLE IF EXISTS video_work_contexts; DROP TABLE IF EXISTS video_work_versions; DROP TABLE IF EXISTS video_work_media; DROP TABLE IF EXISTS video_works; UPDATE schema_meta SET value='25' WHERE key='schema_version';").unwrap();
         drop(connection);
         store.migrate().unwrap();
         assert_eq!(store.schema_version().unwrap(), crate::CURRENT_SCHEMA_VERSION);

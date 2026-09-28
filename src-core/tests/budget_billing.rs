@@ -1767,6 +1767,10 @@ fn v27_reconcile_indexes_migrate_and_cover_event_group_and_cursor_plans() {
         .execute_batch(
             "DROP INDEX IF EXISTS quota_ledger_by_event_group_entry;
              DROP INDEX IF EXISTS quota_reservations_by_created_id;
+             DROP TABLE IF EXISTS video_work_contexts;
+             DROP TABLE IF EXISTS video_work_versions;
+             DROP TABLE IF EXISTS video_work_media;
+             DROP TABLE IF EXISTS video_works;
              UPDATE schema_meta SET value = '26' WHERE key = 'schema_version';",
         )
         .unwrap();
@@ -3377,6 +3381,10 @@ fn v24_to_v27_upgrade_preserves_legacy_held_unknown_and_settled_billing() {
              DROP TABLE IF EXISTS budget_steps;
              DROP TABLE IF EXISTS budget_operations;
              DROP TABLE IF EXISTS budget_preparations;
+             DROP TABLE IF EXISTS video_work_contexts;
+             DROP TABLE IF EXISTS video_work_versions;
+             DROP TABLE IF EXISTS video_work_media;
+             DROP TABLE IF EXISTS video_works;
              UPDATE schema_meta SET value = '24' WHERE key = 'schema_version';",
         )
         .unwrap();
@@ -5110,7 +5118,7 @@ fn v25_to_v27_upgrade_backfills_revision_one_without_changing_financial_facts_or
         }
     }
     connection
-        .execute("UPDATE schema_meta SET value = '25' WHERE key = 'schema_version'", [])
+        .execute_batch("DROP TABLE IF EXISTS video_work_contexts; DROP TABLE IF EXISTS video_work_versions; DROP TABLE IF EXISTS video_work_media; DROP TABLE IF EXISTS video_works; UPDATE schema_meta SET value = '25' WHERE key = 'schema_version';")
         .unwrap();
     drop(connection);
     drop(store);

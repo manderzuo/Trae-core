@@ -282,7 +282,11 @@ fn schema_v24_preserves_existing_controlled_steps_when_adding_chat_kind() {
          DROP TABLE IF EXISTS budget_steps;
          DROP TABLE IF EXISTS budget_operations;
          DROP TABLE IF EXISTS budget_preparations;
-         UPDATE schema_meta SET value = '23' WHERE key = 'schema_version';",
+             DROP TABLE IF EXISTS video_work_contexts;
+             DROP TABLE IF EXISTS video_work_versions;
+             DROP TABLE IF EXISTS video_work_media;
+             DROP TABLE IF EXISTS video_works;
+             UPDATE schema_meta SET value = '23' WHERE key = 'schema_version';",
     ).unwrap();
     connection.pragma_update(None, "foreign_keys", "ON").unwrap();
     drop(connection);

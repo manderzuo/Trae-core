@@ -109,6 +109,10 @@ fn v7_databases_migrate_to_v11_without_importing_legacy_assets() {
              DROP TABLE budget_preparations;
              ALTER TABLE api_keys DROP COLUMN secret_key_version;
              ALTER TABLE api_keys DROP COLUMN secret_ciphertext;
+             DROP TABLE IF EXISTS video_work_contexts;
+             DROP TABLE IF EXISTS video_work_versions;
+             DROP TABLE IF EXISTS video_work_media;
+             DROP TABLE IF EXISTS video_works;
              UPDATE schema_meta SET value = '7' WHERE key = 'schema_version';",
         )
         .unwrap();

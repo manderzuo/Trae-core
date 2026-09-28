@@ -21,6 +21,8 @@ mod store;
 mod upstream;
 mod usage_trend;
 mod video_billing;
+mod video_work;
+pub use video_work::{VideoWork,VideoWorkVersion,VideoWorkSnapshot,WorkAction,WorkVersionState,WorkMutation,EncryptedWorkSnapshot,WorkMediaRef,WorkHandleRecord,WorkSecretRef,work_snapshot_context,work_handle_context};
 
 pub use cost::{CostError, CostEstimate, CostPolicy};
 pub use budget_billing::{

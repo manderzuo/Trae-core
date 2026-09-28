@@ -191,7 +191,11 @@ fn schema_v21_upgrades_request_relations_without_losing_existing_data() {
          DROP TABLE budget_operations;
          DROP TABLE budget_preparations;
          DROP TABLE request_relations;
-         UPDATE schema_meta SET value = '21' WHERE key = 'schema_version';",
+             DROP TABLE IF EXISTS video_work_contexts;
+             DROP TABLE IF EXISTS video_work_versions;
+             DROP TABLE IF EXISTS video_work_media;
+             DROP TABLE IF EXISTS video_works;
+             UPDATE schema_meta SET value = '21' WHERE key = 'schema_version';",
     ).unwrap();
     drop(connection);
 

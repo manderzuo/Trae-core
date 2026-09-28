@@ -26,11 +26,13 @@ pub fn spawn_cleanup(state: &Arc<crate::state::StarlinkRouterState>) {
             let Some(state) = weak_state.upgrade() else { break; };
             let cleanup_state = state.clone();
             match tokio::task::spawn_blocking(move || {
-                cleanup_expired_assets_once(
+                let count=cleanup_expired_assets_once(
                     &cleanup_state.store,
                     &cleanup_state.config.data_dir,
                     Utc::now().timestamp_millis(),
-                )
+                )?;
+                crate::work_media::cleanup(&cleanup_state,Utc::now().timestamp_millis()).map_err(AssetError::Storage)?;
+                Ok::<usize,AssetError>(count)
             }).await {
                 Ok(Err(error)) => eprintln!("Core asset cleanup failed: {error}"),
                 Err(error) => eprintln!("Core asset cleanup task failed: {error}"),
@@ -402,7 +404,7 @@ fn parse_data_url(value: &str) -> Result<(Option<String>, &str), AssetError> {
     Ok((None, value))
 }
 
-fn validate_filename(value: &str) -> Result<String, AssetError> {
+pub(crate) fn validate_filename(value: &str) -> Result<String, AssetError> {
     let value = value.trim();
     if value.is_empty() || value.len() > 128 || value == "." || value == ".." {
         return Err(AssetError::Invalid("filename 无效".into()));
@@ -413,7 +415,7 @@ fn validate_filename(value: &str) -> Result<String, AssetError> {
     Ok(value.to_string())
 }
 
-fn detect_format(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+pub(crate) fn detect_format(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") { return Some(("image/png", "png")); }
     if bytes.starts_with(b"\xff\xd8\xff") { return Some(("image/jpeg", "jpg")); }
     if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") { return Some(("image/gif", "gif")); }

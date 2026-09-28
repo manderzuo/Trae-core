@@ -139,6 +139,10 @@ impl KeyVault {
     }
 
     pub fn encrypt(&self, key_id: &str, plaintext: &str) -> Result<EncryptedKeyCopy, KeyVaultError> {
+        self.encrypt_bytes(key_id, plaintext.as_bytes())
+    }
+
+    pub fn encrypt_bytes(&self, key_id: &str, plaintext: &[u8]) -> Result<EncryptedKeyCopy, KeyVaultError> {
         let key = self.aead_key(self.active_version)?;
         let mut nonce_bytes = [0_u8; NONCE_LENGTH];
         SystemRandom::new()
@@ -146,7 +150,7 @@ impl KeyVault {
             .map_err(|_| KeyVaultError::EncryptionFailed)?;
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
         let aad = associated_data(key_id, self.active_version);
-        let mut sealed = plaintext.as_bytes().to_vec();
+        let mut sealed = plaintext.to_vec();
         key.seal_in_place_append_tag(nonce, Aad::from(aad.as_slice()), &mut sealed)
             .map_err(|_| KeyVaultError::EncryptionFailed)?;
         let mut ciphertext = Vec::with_capacity(NONCE_LENGTH + sealed.len());
@@ -164,6 +168,12 @@ impl KeyVault {
         key_version: u32,
         ciphertext: &[u8],
     ) -> Result<String, KeyVaultError> {
+        let mut bytes=self.decrypt_bytes(key_id,key_version,ciphertext)?;
+        let result=String::from_utf8(bytes.clone()).map_err(|_|KeyVaultError::CiphertextInvalid);
+        bytes.zeroize();result
+    }
+
+    pub fn decrypt_bytes(&self,key_id:&str,key_version:u32,ciphertext:&[u8])->Result<Vec<u8>,KeyVaultError> {
         if ciphertext.len() < NONCE_LENGTH + TAG_LENGTH {
             return Err(KeyVaultError::CiphertextInvalid);
         }
@@ -177,8 +187,7 @@ impl KeyVault {
         let plaintext = key
             .open_in_place(nonce, Aad::from(aad.as_slice()), &mut opened)
             .map_err(|_| KeyVaultError::CiphertextInvalid)?;
-        let result = String::from_utf8(plaintext.to_vec())
-            .map_err(|_| KeyVaultError::CiphertextInvalid);
+        let result = Ok(plaintext.to_vec());
         opened.zeroize();
         result
     }

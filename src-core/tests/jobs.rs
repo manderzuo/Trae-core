@@ -660,6 +660,10 @@ fn v8_migration_preserves_assets_and_does_not_import_legacy_video_jobs() {
              DROP TABLE budget_preparations;
              ALTER TABLE api_keys DROP COLUMN secret_key_version;
              ALTER TABLE api_keys DROP COLUMN secret_ciphertext;
+             DROP TABLE IF EXISTS video_work_contexts;
+             DROP TABLE IF EXISTS video_work_versions;
+             DROP TABLE IF EXISTS video_work_media;
+             DROP TABLE IF EXISTS video_works;
              UPDATE schema_meta SET value = '8' WHERE key = 'schema_version';",
         )
         .unwrap();

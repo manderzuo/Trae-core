@@ -95,6 +95,10 @@ fn v20_to_v21_migration_preserves_keys_and_quota_history_and_is_idempotent() {
              DROP TABLE budget_steps;
              DROP TABLE budget_operations;
              DROP TABLE budget_preparations;
+             DROP TABLE IF EXISTS video_work_contexts;
+             DROP TABLE IF EXISTS video_work_versions;
+             DROP TABLE IF EXISTS video_work_media;
+             DROP TABLE IF EXISTS video_works;
              UPDATE schema_meta SET value = '20' WHERE key = 'schema_version';",
         )
         .unwrap();

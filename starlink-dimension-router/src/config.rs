@@ -21,6 +21,16 @@ pub struct RouterConfig {
     #[serde(default)]
     pub budget_billing_v2: bool,
     #[serde(default)]
+    pub work_context_enabled: bool,
+    #[serde(default)]
+    pub continuation_enabled: bool,
+    #[serde(default = "work_retention_ms")]
+    pub work_media_retention_ms: i64,
+    #[serde(default = "work_key_limit")]
+    pub work_media_key_limit_bytes: i64,
+    #[serde(default = "work_global_limit")]
+    pub work_media_global_limit_bytes: i64,
+    #[serde(default)]
     pub bridge: Option<BridgeConfig>,
 }
 
@@ -42,6 +52,11 @@ impl RouterConfig {
             seedance_assistant_model: seedance_assistant_model(),
             public_base_url: String::new(),
             budget_billing_v2: false,
+            work_context_enabled: false,
+            continuation_enabled: false,
+            work_media_retention_ms: work_retention_ms(),
+            work_media_key_limit_bytes: work_key_limit(),
+            work_media_global_limit_bytes: work_global_limit(),
             bridge: None,
         }
     }
@@ -91,6 +106,10 @@ impl RouterConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.work_media_retention_ms<=0 || self.work_media_retention_ms>365*24*3600*1000
+            || self.work_media_key_limit_bytes<=0 || self.work_media_global_limit_bytes<self.work_media_key_limit_bytes {
+            return Err("作业素材保留期或容量配置无效".into());
+        }
         if self.host.trim().is_empty() || self.host.chars().any(char::is_whitespace) {
             return Err("路由器监听地址不能为空或包含空格".to_string());
         }
@@ -114,6 +133,9 @@ impl RouterConfig {
 }
 
 fn default_model() -> String { "deepseek-v4-flash".to_string() }
+fn work_retention_ms()->i64 {30*24*3600*1000}
+fn work_key_limit()->i64 {1024*1024*1024}
+fn work_global_limit()->i64 {10*1024*1024*1024}
 fn seedance_assistant_model() -> String { "glm-5.3-flash".into() }
 
 #[cfg(test)]
