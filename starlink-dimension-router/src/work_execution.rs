@@ -469,6 +469,7 @@ pub(crate) async fn execute(
     } else {
         let binding = load_binding(&state, &p, &request, &original)?;
         let parent = parent(&state, &p, &binding)?;
+        if parent.is_some(){state.seedance_results.progress(&request,Stage::Restoring);}
         if let Some(text) = &binding.clarification {
             return finish_read_only(&state, &p, &request, parent.as_ref(), text);
         }
@@ -565,6 +566,7 @@ pub(crate) async fn execute(
             }
         }
         let continuation = if decision.action == WorkIntent::Continue {
+            state.seedance_results.progress(&request,Stage::Tail);
             let mut input = normalized.clone();
             input["prompt"] = json!(decision.effective_prompt);
             Some(
@@ -637,7 +639,7 @@ pub(crate) async fn execute(
         .store
         .set_work_version_state(&p, &request, WorkVersionState::Running)
         .map_err(|_| "work_context_unavailable")?;
-    state.seedance_results.progress(&request, Stage::Submitting);
+    state.seedance_results.progress(&request, if version.action==aiwork_core::WorkAction::Continue {Stage::SubmittingSegment}else{Stage::Submitting});
     let s = state.clone();
     let owner = p.clone();
     let rid = request.clone();

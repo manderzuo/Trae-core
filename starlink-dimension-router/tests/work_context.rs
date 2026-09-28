@@ -109,7 +109,7 @@ impl Fixture {
             source_request_id: None,
             reference_mode: "user_reference".into(),
             summary: String::new(),
-            dispatch_body:None,
+            dispatch_body: None,
         };
         let raw = serde_json::to_string(&snapshot).unwrap();
         let encrypted = self
@@ -174,6 +174,24 @@ fn history_marker_resumes_exact_version() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn explicit_owned_context_handle_resolves_and_conflicts_clarify() {
+    let f = Fixture::new();
+    let (work, version, handle) = f.version("handle-body", vec![]);
+    let body = json!({"work_context":{"context_handle":handle},"messages":[{"role":"user","content":"改为夜景"}]});
+    let resolved = work_context::resolve(&f.state, &f.owner, &HeaderMap::new(), &body).unwrap();
+    assert!(
+        matches!(resolved,WorkResolution::Existing{work:w,base_version:Some(v)} if w.work_id==work && v.version_id==version)
+    );
+    assert!(work_context::resolve(&f.state, &f.other, &HeaderMap::new(), &body).is_err());
+    let (other, other_version, _) = f.version("other-parent", vec![]);
+    let conflicting = json!({"work_context":{"work_id":other,"base_version_id":other_version,"context_handle":handle}});
+    assert!(matches!(
+        work_context::resolve(&f.state, &f.owner, &HeaderMap::new(), &conflicting).unwrap(),
+        WorkResolution::Clarify { .. }
+    ));
 }
 #[test]
 fn same_key_new_chat_has_no_global_fallback() {

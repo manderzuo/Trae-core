@@ -2,14 +2,17 @@
 use serde_json::{json,Value};
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub(crate) enum Stage {Received,Assistant,References,Submitting,Processing,Delivery,QueryDelayed}
+pub(crate) enum Stage {Received,Restoring,Assistant,References,Tail,Submitting,SubmittingSegment,Processing,Delivery,QueryDelayed}
 impl Stage {
     fn name(self)->&'static str {match self {
-        Self::Received=>"received",Self::Assistant=>"organizing_prompt",Self::References=>"processing_references",
+        Self::Received=>"received",Self::Restoring=>"restoring_version",Self::Tail=>"preparing_tail_frame",Self::SubmittingSegment=>"submitting_segment",Self::Assistant=>"organizing_prompt",Self::References=>"processing_references",
         Self::Submitting=>"submitting_video",Self::Processing=>"processing",Self::Delivery=>"preparing_download",Self::QueryDelayed=>"status_query_delayed",
     }}
     fn message(self)->&'static str {match self {
         Self::Received=>"已接收请求，正在确认任务。",
+        Self::Restoring=>"正在恢复指定版本的提示词、规格与参考素材。",
+        Self::Tail=>"正在准备指定父版本的尾帧；新视频片段尚未提交。",
+        Self::SubmittingSegment=>"正在提交续写的新片段，原视频任务不会重发。",
         Self::Assistant=>"正在整理提示词。",
         Self::References=>"正在处理参考素材。",
         Self::Submitting=>"正在提交视频任务。",
@@ -19,6 +22,9 @@ impl Stage {
     }}
     fn waiting_message(self)->&'static str {match self {
         Self::Received=>"仍在确认任务状态。",
+        Self::Restoring=>"仍在恢复指定版本。",
+        Self::Tail=>"仍在准备父视频尾帧；新片段尚未提交。",
+        Self::SubmittingSegment=>"新片段尚在提交过程中。",
         Self::Assistant=>"仍在整理提示词。",
         Self::References=>"仍在处理参考素材。",
         Self::Submitting=>"任务尚在提交过程中。",
@@ -86,4 +92,16 @@ pub(crate) fn failure_value(request:&str,code:&str,settled:bool)->Value {
     json!({"id":format!("chatcmpl-{request}"),"object":"chat.completion.chunk","model":"seedance","created":chrono::Utc::now().timestamp(),
         "request_id":request,"error":{"type":"api_error","code":code,"message":text,"request_id":request,"billing_state":if settled {"settled"} else {"pending"}},
         "choices":[{"index":0,"delta":{"role":"assistant","content":text},"finish_reason":"stop"}]})
+}
+
+#[cfg(test)]
+mod work_feedback_tests {
+    #[test]
+    fn continuation_stages_are_truthful_and_do_not_claim_submission_early() {
+        let tail=super::Stage::Tail.message();
+        assert!(tail.contains("尾帧"));assert!(tail.contains("尚未提交"));
+        assert!(super::Stage::Restoring.message().contains("指定版本"));
+        assert!(super::Stage::SubmittingSegment.message().contains("新片段"));
+        assert!(super::message("frame_extraction_unavailable").contains("原任务结算不受影响"));
+    }
 }

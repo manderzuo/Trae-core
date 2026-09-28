@@ -53,6 +53,7 @@ pub(crate) fn public_code(code:&str)->Option<&'static str> {
         "continuation_disabled"=>"continuation_disabled",
         "continuation_capabilities_unavailable"=>"continuation_capabilities_unavailable",
         "frame_extraction_unavailable"=>"frame_extraction_unavailable",
+        "frame_output_invalid"=>"frame_output_invalid",
         "frame_extractor_busy"=>"frame_extractor_busy",
         "frame_identity_invalid"=>"frame_identity_invalid",
         "frame_result_not_ready"=>"frame_result_not_ready",

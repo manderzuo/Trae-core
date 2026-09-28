@@ -212,10 +212,15 @@ pub fn resolve(
             if !c.is_object() {
                 return Err(unavailable());
             }
-            let id = c["work_id"]
-                .as_str()
-                .filter(|s| !s.is_empty() && s.len() <= 128)
-                .ok_or_else(unavailable)?;
+            let handle = c
+                .get("context_handle")
+                .filter(|v| !v.is_null())
+                .map(|v| {
+                    v.as_str()
+                        .ok_or_else(unavailable)
+                        .and_then(|h| from_handle(state, p, h))
+                })
+                .transpose()?;
             let version = match c.get("base_version_id").filter(|v| !v.is_null()) {
                 Some(v) => Some(
                     v.as_str()
@@ -224,7 +229,24 @@ pub fn resolve(
                 ),
                 None => None,
             };
-            Some(existing(state, p, id, version)?)
+            if let Some(id) = c["work_id"]
+                .as_str()
+                .filter(|s| !s.is_empty() && s.len() <= 128)
+            {
+                let resolved = existing(state, p, id, version)?;
+                if handle
+                    .as_ref()
+                    .is_some_and(|h| identity(h) != identity(&resolved))
+                {
+                    return Ok(clarify());
+                }
+                Some(resolved)
+            } else {
+                if c.get("work_id").is_some_and(|v| !v.is_null()) || version.is_some() {
+                    return Err(unavailable());
+                }
+                Some(handle.ok_or_else(unavailable)?)
+            }
         }
         None => None,
     };
@@ -301,14 +323,18 @@ pub fn decorate_owned_request(
         .map_err(|_| unavailable())?
     {
         let h = issue_handle(state, p, &v.work_id, Some(&v.version_id))?;
-        let snapshot=read_snapshot(state,p,&v)?;
-        if snapshot.reference_mode=="tail_reference" {
-            if let Some(choices)=reply["choices"].as_array_mut(){for choice in choices {
-                if let Some(text)=choice["message"]["content"].as_str().map(str::to_owned) {
-                    let notice="本段使用上一版本尾帧作近似参考，生成独立新片段；不是原生视频延长或严格首帧锁定。";
-                    if !text.contains(notice){choice["message"]["content"]=json!(format!("{text}\n\n{notice}"));}
+        let snapshot = read_snapshot(state, p, &v)?;
+        if snapshot.reference_mode == "tail_reference" {
+            if let Some(choices) = reply["choices"].as_array_mut() {
+                for choice in choices {
+                    if let Some(text) = choice["message"]["content"].as_str().map(str::to_owned) {
+                        let notice="本段使用上一版本尾帧作近似参考，生成独立新片段；不是原生视频延长或严格首帧锁定。";
+                        if !text.contains(notice) {
+                            choice["message"]["content"] = json!(format!("{text}\n\n{notice}"));
+                        }
+                    }
                 }
-            }}
+            }
         }
         decorate_reply(
             reply,
