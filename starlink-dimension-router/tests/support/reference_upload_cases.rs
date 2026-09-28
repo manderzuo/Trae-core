@@ -55,6 +55,117 @@ fn follow(value:&Value)->Value {
         "tool_call_id":value["choices"][0]["message"]["tool_calls"][0]["id"],"content":"uploaded"}]})
 }
 
+fn upload_receipt(cfg:&Value)->String {
+    format!("SEEDANCE_REFERENCE_UPLOAD={}",json!({"id":cfg["id"],"status":"uploaded","files":1}))
+}
+
+#[tokio::test]
+async fn reference_upload_receipt_continues_rewritten_native_tool_id_once() {
+    let f=fixture("https://api.example.test");
+    let (call,cfg)=pending(&f,input(&["C:\\a.png"],false)).await;
+    assert_eq!(upload(&f,&cfg,0,PNG).await.status(),StatusCode::OK);
+    let mut body=follow(&call);
+    body["messages"][1]["tool_call_id"]=json!("client_runcommand_1");
+    body["messages"][1]["content"]=json!({"data":{"stdout":upload_receipt(&cfg),"exitCode":0}}).to_string().into();
+    let r=chat(&f,&f.key,body.clone()).await;
+    assert_eq!(r.status(),StatusCode::OK,"server-uploaded reference receipt must survive a rewritten native tool ID");
+    let result=json_response(r).await;
+    let sends=f.bridge.sends.load(Ordering::SeqCst);
+    let replay=json_response(chat(&f,&f.key,body).await).await;
+    assert_eq!(replay["request_id"],result["request_id"]);
+    assert_eq!(f.bridge.sends.load(Ordering::SeqCst),sends,"receipt replay cannot pay twice");
+    let claims=f.bridge.claims.lock().unwrap();
+    let videos:Vec<_>=claims.values().filter(|c|c["step_kind"]=="video").collect();
+    assert_eq!(videos.len(),1);
+    assert_eq!(videos[0]["body"]["image_asset_ids"],json!(["bridge-image"]));
+    assert_eq!(videos[0]["body"]["duration"],5);
+}
+
+#[tokio::test]
+async fn reference_upload_receipt_supports_missing_id_and_anthropic_tool_result() {
+    for anthropic in [false,true] {
+        let f=fixture("https://api.example.test");
+        let (call,cfg)=pending(&f,input(&["C:\\a.png"],false)).await;
+        assert_eq!(upload(&f,&cfg,0,PNG).await.status(),StatusCode::OK);
+        let mut body=follow(&call);
+        body["messages"][1]=if anthropic {
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"rewritten_native_id","content":[{"type":"text","text":upload_receipt(&cfg)}]}]})
+        } else {json!({"role":"tool","content":{"output":{"stdout":upload_receipt(&cfg),"exit_code":0}}})};
+        body["stream"]=json!(true);
+        let r=chat(&f,&f.key,body).await;
+        assert_eq!(r.status(),StatusCode::OK,"receipt identifies the upload, not a rewritten or lost tool ID");
+        let bytes=to_bytes(r.into_body(),256*1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("data: [DONE]"));
+        assert_eq!(f.bridge.claims.lock().unwrap().values().filter(|c|c["step_kind"]=="video").count(),1);
+    }
+}
+
+#[tokio::test]
+async fn reference_upload_receipt_cannot_override_call_id_or_mix_sessions() {
+    let f=fixture("https://api.example.test");
+    let (a,ca)=pending(&f,input(&["C:\\a.png"],false)).await;
+    let (b,cb)=pending(&f,input(&["C:\\b.png"],false)).await;
+    for cfg in [&ca,&cb] {assert_eq!(upload(&f,cfg,0,PNG).await.status(),StatusCode::OK);}
+    let mut mismatched=follow(&a);mismatched["messages"][1]["content"]=json!(upload_receipt(&cb));
+    let mut nested=follow(&a);nested["messages"][1]["tool_call_id"]=json!("rewritten");
+    nested["messages"][1]["content"]=json!({"stdout":upload_receipt(&ca),"result":{"stdout":upload_receipt(&cb)}});
+    let mut download_id=follow(&a);download_id["messages"][1]["tool_call_id"]=json!("call_seedance_save_request_other");
+    download_id["messages"][1]["content"]=json!(upload_receipt(&ca));
+    let mut batch=follow(&a);batch["messages"][1]=json!({"role":"user","content":[
+        {"type":"tool_result","tool_use_id":"rewritten_a","content":upload_receipt(&ca)},
+        {"type":"tool_result","tool_use_id":"rewritten_b","content":upload_receipt(&cb)}]});
+    let mut trailing=follow(&a);trailing["messages"].as_array_mut().unwrap().push(b["choices"][0]["message"].clone());
+    trailing["messages"].as_array_mut().unwrap().push(json!({"role":"tool","tool_call_id":"rewritten","content":format!("{}\n{}",upload_receipt(&ca),upload_receipt(&cb))}));
+    for body in [mismatched,nested,download_id,batch,trailing] {
+        let r=chat(&f,&f.key,body).await;
+        assert_eq!(r.status(),StatusCode::BAD_REQUEST);
+        assert_eq!(json_response(r).await["error"]["code"],"reference_upload_invalid");
+    }
+    assert_eq!(f.bridge.sends.load(Ordering::SeqCst),0,"ambiguity must not start any paid work");
+}
+
+#[tokio::test]
+async fn reference_upload_receipt_requires_owned_complete_server_bytes_and_success() {
+    let f=fixture("https://api.example.test");
+    let (call,cfg)=pending(&f,input(&["C:\\a.png"],false)).await;
+    let mut body=follow(&call);body["messages"][1]["tool_call_id"]=json!("rewritten");
+    body["messages"][1]["content"]=json!({"stdout":upload_receipt(&cfg),"exitCode":0});
+    let r=chat(&f,&f.key,body.clone()).await;
+    assert_eq!(json_response(r).await["error"]["code"],"reference_upload_incomplete");
+    assert_eq!(upload(&f,&cfg,0,PNG).await.status(),StatusCode::OK);
+    let foreign=f.state.store.issue_api_key("admin","foreign",BTreeSet::from(["admin:*".into()]),"bootstrap").unwrap();
+    assert_eq!(json_response(chat(&f,&foreign.plaintext,body.clone()).await).await["error"]["code"],"reference_upload_invalid");
+    for content in [json!({"data":{"stdout":upload_receipt(&cfg),"exitCode":1}}),
+        json!({"stdout":format!("{}\nSEEDANCE_REFERENCE_UPLOAD_FAILED: upload rejected",upload_receipt(&cfg))}),
+        json!({"stdout":"SEEDANCE_REFERENCE_UPLOAD_FAILED: image unavailable"})] {
+        body["messages"][1]["content"]=content;
+        assert_eq!(json_response(chat(&f,&f.key,body.clone()).await).await["error"]["code"],"reference_upload_failed");
+    }
+    assert_eq!(f.bridge.sends.load(Ordering::SeqCst),0);
+}
+
+#[tokio::test]
+async fn reference_upload_receipt_rejects_malformed_count_expiry_and_denied_tool() {
+    let f=fixture("https://api.example.test");
+    let (call,cfg)=pending(&f,input(&["C:\\a.png"],false)).await;
+    assert_eq!(upload(&f,&cfg,0,PNG).await.status(),StatusCode::OK);
+    let mut body=follow(&call);body["messages"][1]["tool_call_id"]=json!("rewritten");
+    for stdout in ["SEEDANCE_REFERENCE_UPLOAD=not-json".to_owned(),
+        format!("SEEDANCE_REFERENCE_UPLOAD={}",json!({"id":cfg["id"],"status":"uploaded","files":2})),
+        format!("SEEDANCE_REFERENCE_UPLOAD={}",json!({"id":"invalid","status":"uploaded","files":1})),
+        format!("SEEDANCE_REFERENCE_UPLOAD={}",json!({"id":cfg["id"],"status":"pending","files":1}))] {
+        body["messages"][1]["content"]=json!(stdout);
+        assert_eq!(json_response(chat(&f,&f.key,body.clone()).await).await["error"]["code"],"reference_upload_invalid");
+    }
+    body["messages"][1]["content"]=json!({"stdout":upload_receipt(&cfg),"sandbox":{"denied":true}});
+    assert_eq!(json_response(chat(&f,&f.key,body.clone()).await).await["error"]["code"],"reference_upload_failed");
+    let db=rusqlite::Connection::open(f.dir.path().join("data").join(aiwork_core::CORE_DB_FILE)).unwrap();
+    db.execute("UPDATE reference_uploads SET expires_at_ms=0 WHERE id=?1",[cfg["id"].as_str().unwrap()]).unwrap();
+    body["messages"][1]["content"]=json!(upload_receipt(&cfg));
+    assert_eq!(json_response(chat(&f,&f.key,body).await).await["error"]["code"],"reference_upload_invalid");
+    assert_eq!(f.bridge.sends.load(Ordering::SeqCst),0);
+}
+
 #[tokio::test]
 async fn reference_upload_roundtrip_is_immutable_idempotent_and_restores_original_spec() {
     let f=fixture("https://api.example.test");
@@ -167,10 +278,16 @@ async fn reference_upload_generated_powershell_command_sends_exact_unicode_path_
             .args(["-NoProfile","-NonInteractive","-EncodedCommand",&cmd]).env_remove("PSModulePath").output().await.unwrap();
         assert!(result.status.success(),"{shell}: {}",String::from_utf8_lossy(&result.stdout));
         assert!(String::from_utf8_lossy(&result.stdout).contains("SEEDANCE_REFERENCE_UPLOAD="));
+        // Feed the actual native terminal output back with the agent's ID,
+        // rather than using the old test-only literal "uploaded" response.
+        let mut body=follow(&call);body["messages"][1]["tool_call_id"]=json!("native_runcommand");
+        body["messages"][1]["content"]=json!({"data":{"stdout":String::from_utf8_lossy(&result.stdout),"exitCode":0}}).to_string().into();
+        assert_eq!(chat(&f,&f.key,body).await.status(),StatusCode::OK);
     }
     let record=f.state.store.reference_upload(cfg["id"].as_str().unwrap()).unwrap().unwrap();
     let asset=starlink_dimension_router::assets::read_owned(&f.state.store,&f.state.config.data_dir,&f.principal,record.asset_ids[0].as_deref().unwrap()).unwrap();
-    assert_eq!(asset.bytes,PNG);assert_eq!(f.bridge.sends.load(Ordering::SeqCst),0);
+    assert_eq!(asset.bytes,PNG);
+    assert_eq!(f.bridge.claims.lock().unwrap().values().filter(|c|c["step_kind"]=="video").count(),1,"PS5/PS7 receipt replay must use the same generated video");
     server.abort();let _=server.await;
 }
 
@@ -191,6 +308,10 @@ async fn reference_upload_generated_bash_command_sends_exact_literal_path_bytes(
     let record=f.state.store.reference_upload(id).unwrap().unwrap();
     let asset=starlink_dimension_router::assets::read_owned(&f.state.store,&f.state.config.data_dir,&f.principal,record.asset_ids[0].as_deref().unwrap()).unwrap();
     assert_eq!(asset.bytes,PNG);assert_eq!(f.bridge.sends.load(Ordering::SeqCst),0);
+    let mut body=follow(&call);body["messages"][1]["tool_call_id"]=json!("native_bash");
+    body["messages"][1]["content"]=json!({"output":{"stdout":String::from_utf8_lossy(&result.stdout),"exit_code":0}});
+    assert_eq!(chat(&f,&f.key,body).await.status(),StatusCode::OK);
+    assert_eq!(f.bridge.claims.lock().unwrap().values().filter(|c|c["step_kind"]=="video").count(),1);
     server.abort();let _=server.await;
 }
 

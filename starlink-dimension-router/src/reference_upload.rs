@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::state::StarlinkRouterState;
 
 const PREFIX: &str = "call_ref_upload_";
+const RECEIPT_PREFIX: &str = "SEEDANCE_REFERENCE_UPLOAD=";
 const TTL: i64 = 30*60*1000;
 fn context(id: &str) -> String { format!("reference-upload-v1:{id}") }
 fn valid_id(id: &str) -> bool { id.len()==32 && id.bytes().all(|b|b.is_ascii_hexdigit()) }
@@ -111,22 +112,119 @@ pub(crate) fn command(config: &Value, bash: bool) -> String {
     format!("case \"$(uname -s)\" in\nMINGW*|MSYS*|CYGWIN*) powershell.exe -NoProfile -NonInteractive -EncodedCommand {encoded_ps} ;;\n*)\n{unix}\n;;\nesac")
 }
 
+#[derive(Default)]
+struct UploadReply {
+    id: Option<String>,
+    files: Option<usize>,
+    recognized: bool,
+    failed: bool,
+    invalid: bool,
+}
+impl UploadReply {
+    fn identify(&mut self, id: &str) {
+        self.recognized = true;
+        if !valid_id(id) || self.id.as_deref().is_some_and(|old| old != id) {
+            self.invalid = true;
+        } else {
+            self.id = Some(id.to_owned());
+        }
+    }
+    fn receipt(&mut self, value: &Value) {
+        self.recognized = true;
+        let Some(id) = value["id"].as_str() else { self.invalid = true; return; };
+        self.identify(id);
+        let Some(files) = value["files"].as_u64().filter(|n| (1..=10).contains(n)) else {
+            self.invalid = true; return;
+        };
+        if self.files.is_some_and(|old| old != files as usize) { self.invalid = true; }
+        self.files = Some(files as usize);
+        match value["status"].as_str() {
+            Some("uploaded") => {},
+            Some("failed") => self.failed = true,
+            _ => self.invalid = true,
+        }
+    }
+}
+
+// Native agents may rewrite the tool ID and wrap stdout in JSON or text
+// blocks. Inspect only bounded tool output, never user/assistant history.
+fn scan_reply(value: &Value, depth: usize, remaining: &mut usize, reply: &mut UploadReply) {
+    if depth > 6 || *remaining == 0 { reply.invalid = true; return; }
+    *remaining -= 1;
+    if let Some(text) = value.as_str() {
+        if text.len() > 64*1024 { reply.invalid = true; return; }
+        // Unwrap JSON first: escaped stdout is not itself a receipt line.
+        if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+            scan_reply(&parsed, depth+1, remaining, reply);
+            return;
+        }
+        for line in text.lines() {
+            if line.contains("SEEDANCE_REFERENCE_UPLOAD_FAILED:") {
+                reply.recognized = true;
+                reply.failed = true;
+            }
+            let mut rest = line;
+            while let Some(index) = rest.find(RECEIPT_PREFIX) {
+                if *remaining == 0 { reply.invalid = true; return; }
+                *remaining -= 1;
+                rest = &rest[index+RECEIPT_PREFIX.len()..];
+                reply.recognized = true;
+                match serde_json::Deserializer::from_str(rest).into_iter::<Value>().next() {
+                    Some(Ok(receipt)) => reply.receipt(&receipt),
+                    _ => reply.invalid = true,
+                }
+            }
+        }
+    } else if let Some(values) = value.as_array() {
+        if values.len() > 32 { reply.invalid = true; }
+        for value in values.iter().take(32) { scan_reply(value, depth+1, remaining, reply); }
+    } else {
+        for field in ["text", "stdout", "output", "content", "result", "data", "message"] {
+            if let Some(value) = value.get(field) { scan_reply(value, depth+1, remaining, reply); }
+        }
+    }
+}
+
+fn upload_reply(body: &Value) -> Result<Option<(&Value, String, Option<usize>)>, &'static str> {
+    let Some(messages) = body["messages"].as_array() else { return Ok(None); };
+    let Some(last) = messages.last() else { return Ok(None); };
+    let tools: Vec<&Value> = if last["role"] == "tool" {
+        messages.iter().rev().take_while(|m| m["role"] == "tool").take(33).collect()
+    } else if last["role"] == "user" {
+        last["content"].as_array().map(|parts| parts.iter().filter(|p| p["type"] == "tool_result").take(33).collect()).unwrap_or_default()
+    } else { return Ok(None); };
+    let mut reply = UploadReply::default();
+    let mut remaining = 256;
+    let mut other_handoff = false;
+    for tool in &tools {
+        for field in ["tool_call_id", "tool_use_id"] {
+            if let Some(call) = tool[field].as_str() {
+                if let Some(id) = call.strip_prefix(PREFIX) { reply.identify(id); }
+                else if call.starts_with("call_seedance_") { other_handoff = true; }
+            }
+        }
+        scan_reply(&tool["content"], 0, &mut remaining, &mut reply);
+    }
+    if !reply.recognized { return Ok(None); }
+    // Exactly one issued upload command belongs to this continuation. Never
+    // discard another result or choose one of several conflicting receipts.
+    if tools.len() != 1 || reply.invalid || other_handoff { return Err("reference_upload_invalid"); }
+    if reply.failed { return Err("reference_upload_failed"); }
+    let Some(id) = reply.id else { return Err("reference_upload_invalid"); };
+    Ok(Some((tools[0], id, reply.files)))
+}
+
 /// Returns early for an upload tool call/error; successful follow-up restores
 /// the encrypted original request and pins its generation idempotency key.
 pub(crate) async fn before_chat(state:&Arc<StarlinkRouterState>,p:&Principal,headers:&mut HeaderMap,body:&mut Value)->Option<Response> {
-    let last=body["messages"].as_array()?.last()?;
-    let tool=if last["role"]=="tool" {Some(last)} else if last["role"]=="user" {
-        last["content"].as_array().and_then(|a|a.iter().find(|p|p["type"]=="tool_result"))
-    } else {None};
-    if let Some(tool)=tool {
-        let call=tool["tool_call_id"].as_str().or_else(||tool["tool_use_id"].as_str())?;
-        let id=call.strip_prefix(PREFIX)?;
-        if !valid_id(id) {return Some(bad("reference_upload_invalid"));}
-        let record=match state.store.reference_upload(id) {Ok(Some(r))=>r,_=>return Some(bad("reference_upload_invalid"))};
+    let follow_up=match upload_reply(body) {Ok(v)=>v,Err(code)=>return Some(bad(code))};
+    if let Some((tool,id,files))=follow_up {
+        let record=match state.store.reference_upload(&id) {Ok(Some(r))=>r,_=>return Some(bad("reference_upload_invalid"))};
         if record.key_id!=p.key_id || active(state,&record).is_none() {return Some(bad("reference_upload_invalid"));}
         if crate::video_delivery::tool_failed(tool,0) {return Some(bad("reference_upload_failed"));}
+        if files.is_some_and(|n|n!=record.asset_ids.len()) {return Some(bad("reference_upload_invalid"));}
         if record.asset_ids.iter().any(Option::is_none) {return Some(bad("reference_upload_incomplete"));}
-        let text=match state.key_vault.decrypt(&context(id),record.key_version,&record.ciphertext) {Ok(t)=>t,_=>return Some(bad("reference_upload_invalid"))};
+        let text=match state.key_vault.decrypt(&context(&id),record.key_version,&record.ciphertext) {Ok(t)=>t,_=>return Some(bad("reference_upload_invalid"))};
         let mut original:Value=match serde_json::from_str(&text) {Ok(v)=>v,Err(_)=>return Some(bad("reference_upload_invalid"))};
         remove_attachment_markup(&mut original);
         original["image_asset_ids"]=json!(record.asset_ids);
@@ -196,4 +294,58 @@ pub(crate) async fn upload(State(state):State<Arc<StarlinkRouterState>>,Path((id
         }
     }).await;
     result.unwrap_or_else(|_|error(StatusCode::SERVICE_UNAVAILABLE,"reference_upload_unavailable"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const ID: &str = "0123456789abcdef0123456789abcdef";
+    fn receipt() -> String {
+        format!("SEEDANCE_REFERENCE_UPLOAD={{\"id\":\"{ID}\",\"status\":\"uploaded\",\"files\":1}}")
+    }
+    fn body(content: Value) -> Value {
+        json!({"messages":[{"role":"tool","tool_call_id":"rewritten","content":content}]})
+    }
+    #[test]
+    fn receipt_in_user_or_old_assistant_text_cannot_resume_upload() {
+        for role in ["user", "assistant", "system"] {
+            let b=json!({"messages":[{"role":role,"content":receipt()}]});
+            assert!(upload_reply(&b).unwrap().is_none());
+        }
+        let b=json!({"messages":[{"role":"assistant","content":receipt()},
+            {"role":"tool","tool_call_id":"unrelated","content":"done"}]});
+        assert!(upload_reply(&b).unwrap().is_none());
+    }
+    #[test]
+    fn receipt_scan_rejects_unbounded_output_instead_of_ignoring_ambiguity() {
+        let mut deep=json!(receipt());
+        for _ in 0..7 {deep=json!({"content":deep});}
+        let large=json!("x".repeat(64*1024+1));
+        let many=json!(vec![json!(receipt());33]);
+        for content in [json!({"stdout":receipt(),"data":deep}),
+            json!({"stdout":receipt(),"output":large}),many] {
+            assert_eq!(upload_reply(&body(content)).err(),Some("reference_upload_invalid"));
+        }
+    }
+    #[test]
+    fn repeated_identical_receipt_is_not_a_different_upload_session() {
+        let b=body(json!({"stdout":format!("{}\n{}",receipt(),receipt())}));
+        let (_,id,files)=upload_reply(&b).unwrap().unwrap();
+        assert_eq!(id,ID);assert_eq!(files,Some(1));
+    }
+    #[test]
+    fn receipts_on_one_terminal_line_cannot_hide_a_conflicting_session() {
+        let other="SEEDANCE_REFERENCE_UPLOAD={\"id\":\"ffffffffffffffffffffffffffffffff\",\"status\":\"uploaded\",\"files\":1}";
+        let b=body(json!(format!("{} {other}",receipt())));
+        assert_eq!(upload_reply(&b).err(),Some("reference_upload_invalid"));
+    }
+    #[test]
+    fn upload_cannot_discard_a_second_tool_result_or_conflicting_id_field() {
+        let mut b=body(json!(receipt()));
+        b["messages"].as_array_mut().unwrap().push(json!({"role":"tool","tool_call_id":"unrelated","content":"done"}));
+        assert_eq!(upload_reply(&b).err(),Some("reference_upload_invalid"));
+        let mut b=body(json!(receipt()));
+        b["messages"][0]["tool_use_id"]=json!("call_ref_upload_ffffffffffffffffffffffffffffffff");
+        assert_eq!(upload_reply(&b).err(),Some("reference_upload_invalid"));
+    }
 }
