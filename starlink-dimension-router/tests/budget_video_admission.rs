@@ -254,6 +254,104 @@ async fn ten_keys_each_admit_two_reject_third_and_reuse_terminal_slot_before_rec
 async fn public_video_reserves_only_its_budget_and_replays_without_resubmission() {
     run_case(false,false,false).await;
 }
+
+fn delivery_tool() -> Value {
+    json!({"type":"function","function":{"name":"RunCommand","description":"Executes PowerShell commands, shell type powershell5","parameters":{"type":"object","required":["command","blocking","requires_approval"],"properties":{"command":{"type":"string"},"blocking":{"type":"boolean"},"requires_approval":{"type":"boolean"},"command_type":{"type":"string"},"cwd":{"type":"string"}}}}})
+}
+
+#[tokio::test]
+async fn completed_video_stream_calls_client_download_tool_and_receipt_never_regenerates() {
+    let dir=Directory(std::env::temp_dir().join(format!("core-delivery-{:032x}",rand::random::<u128>())));
+    let store=Arc::new(CoreStore::open(dir.path()).unwrap());store.migrate().unwrap();
+    store.create_user(NewUser {id:"admin".into(),name:"Admin".into(),role:UserRole::Admin},"bootstrap").unwrap();
+    store.create_user(NewUser {id:"user".into(),name:"User".into(),role:UserRole::User},"admin").unwrap();
+    let a=store.issue_api_key("admin","admin",BTreeSet::from(["admin:*".into()]),"bootstrap").unwrap();let admin=store.authenticate_api_key(&a.plaintext).unwrap();
+    let k=store.issue_api_key_as_admin_with_max_concurrency("user","Key",BTreeSet::from(["videos:submit".into()]),1,&admin).unwrap();
+    store.key_quota_grant_as_admin(&admin,KeyQuotaGrant {api_key_id:k.id.clone(),resource_kind:"credits".into(),amount:100_000_000,actor_user_id:"admin".into(),reason:"test".into()}).unwrap();
+    store.set_video_billing_control(aiwork_core::VideoBillingControlInput {mode:aiwork_core::VideoBillingMode::Active,reason:"test".into(),diagnostic_key_id:None,diagnostic_request_hash:None}).unwrap();
+    let bridge=Arc::new(Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent:true,large_downloads:std::sync::atomic::AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0)),download_status:AtomicUsize::new(200)});
+    let mut cfg=RouterConfig::defaults(dir.path().into());cfg.budget_billing_v2=true;cfg.public_base_url="https://api.example.test".into();
+    let state=StarlinkRouterState::for_test(store.clone(),BridgeClient::from_transport("http://bridge","bridge-only",bridge.clone()),cfg);
+    let principal=store.authenticate_api_key(&k.plaintext).unwrap();
+    let input=json!({"model":"seedance","stream":true,"tools":[delivery_tool()],"messages":[
+        {"role":"system","content":"Final workspace folder (for final deliverables and supporting assets) should locate in:\n`E:\\delivery test\\workspace`"},
+        {"role":"user","content":"生成5秒480p的猫视频"}]});
+    let response=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(principal.clone()),Bytes::from(input.to_string())).await;
+    assert_eq!(response.status(),StatusCode::OK);
+    let bytes=axum::body::to_bytes(response.into_body(),65536).await.unwrap();let wire=std::str::from_utf8(&bytes).unwrap();assert!(wire.ends_with("data: [DONE]\n\n"));
+    let frames:Vec<Value>=wire.lines().filter_map(|l|l.strip_prefix("data: ")).filter_map(|s|serde_json::from_str(s).ok()).collect();
+    let final_frame=frames.last().unwrap();let call=&final_frame["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(call["function"]["name"],"RunCommand","completed video must request a real client tool, not just a link");
+    assert_eq!(call["index"],0);assert_eq!(final_frame["choices"][0]["finish_reason"],"tool_calls");
+    let args:Value=serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args["blocking"],true);assert_eq!(args["cwd"],"E:\\delivery test\\workspace");
+    assert!(!args["command"].as_str().unwrap().contains(&k.plaintext));
+    let request=final_frame["request_id"].as_str().unwrap();let before=bridge.sends.load(Ordering::SeqCst);assert_eq!(before,2);
+    let mut clean_call=call.clone();clean_call.as_object_mut().unwrap().remove("index");
+    for (status,expected) in [("saved","已保存"),("failed","下载未完成")] {
+        let follow=json!({"model":"seedance","stream":false,"tools":[delivery_tool()],"messages":[
+            {"role":"user","content":"生成5秒480p的猫视频"},
+            {"role":"assistant","content":null,"tool_calls":[clean_call]},
+            {"role":"tool","tool_call_id":call["id"],"content":format!("Command output:\nSEEDANCE_DELIVERY_RECEIPT={}\n",json!({"seedance_delivery":1,"request_id":request,"status":status,"path":"E:\\delivery test\\workspace\\video.mp4","bytes":1234}))}]});
+        let response=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(principal.clone()),Bytes::from(follow.to_string())).await;
+        assert_eq!(response.status(),StatusCode::OK);
+        let result:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+        assert!(result["choices"][0]["message"]["content"].as_str().unwrap().contains(expected));
+        assert_eq!(bridge.sends.load(Ordering::SeqCst),before,"download receipt must never call helper/video again");
+        assert_eq!(store.active_execution_count_for_key(&k.id).unwrap(),0);
+    }
+    let invalid=json!({"model":"seedance","messages":[
+        {"role":"user","content":"生成5秒480p的猫视频"},
+        {"role":"assistant","tool_calls":[clean_call]},
+        {"role":"tool","tool_call_id":"wrong_call_id","content":"download failed"}]});
+    let response=user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(principal.clone()),Bytes::from(invalid.to_string())).await;
+    assert_eq!(response.status(),StatusCode::BAD_REQUEST,"unrecognized download reply must not become another generation");
+    assert_eq!(bridge.sends.load(Ordering::SeqCst),before);
+
+    // Delivery can be retried independently of generation and input retention.
+    use tower::ServiceExt;
+    let router=starlink_dimension_router::server::build_router(state.clone());
+    let retry=router.clone().oneshot(axum::http::Request::builder().method("POST").uri(format!("/v1/videos/{request}/delivery"))
+        .header("authorization",format!("Bearer {}",k.plaintext)).header("content-type","application/json")
+        .body(axum::body::Body::from(json!({"tools":[delivery_tool()]}).to_string())).unwrap()).await.unwrap();
+    assert_eq!(retry.status(),StatusCode::OK);
+    let retried:Value=serde_json::from_slice(&axum::body::to_bytes(retry.into_body(),65536).await.unwrap()).unwrap();
+    assert_eq!(retried["choices"][0]["finish_reason"],"tool_calls");
+    let args:Value=serde_json::from_str(retried["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
+    let command=args["command"].as_str().unwrap();
+    let url=command.lines().find(|l|l.starts_with("$deliveryUrl = ")).unwrap().trim_start_matches("$deliveryUrl = '").trim_end_matches('\'');
+    let uri=url.trim_start_matches("https://api.example.test");
+    let good=router.clone().oneshot(axum::http::Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(good.status(),StatusCode::OK,"download-only ticket needs no permanent Key");
+    assert_eq!(axum::body::to_bytes(good.into_body(),65536).await.unwrap(),"fixture-mp4");
+    let db=rusqlite::Connection::open(dir.path().join("data").join(aiwork_core::CORE_DB_FILE)).unwrap();
+    db.execute("DELETE FROM budget_continuations WHERE request_id=?1",[request]).unwrap();
+    let good=router.clone().oneshot(axum::http::Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(good.status(),StatusCode::OK,"temporary input pruning must not revoke a download ticket");
+    drop(good);
+    for bad in [format!("{uri}broken"),uri.replace(request,"request_foreign")] {
+        let r=router.clone().oneshot(axum::http::Request::builder().uri(bad).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(r.status(),StatusCode::NOT_FOUND);
+    }
+    for (key_id,issued,expires) in [(&k.id,0,900000),(&a.id,chrono::Utc::now().timestamp_millis(),chrono::Utc::now().timestamp_millis()+900000)] {
+        let sealed=state.key_vault.encrypt(&format!("video-download-v1:{request}"),&json!({"key_id":key_id,"issued_at_ms":issued,"expires_at_ms":expires}).to_string()).unwrap();
+        use base64::Engine as _;
+        let ticket=format!("{}.{}",sealed.key_version,base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sealed.ciphertext));
+        let r=router.clone().oneshot(axum::http::Request::builder().uri(format!("/v1/videos/{request}/download?ticket={ticket}")).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(r.status(),StatusCode::NOT_FOUND,"expired or wrong-Key ticket must be refused");
+    }
+    let foreign=store.issue_api_key_as_admin_with_max_concurrency("user","Other",BTreeSet::from(["videos:submit".into()]),1,&admin).unwrap();
+    let r=router.clone().oneshot(axum::http::Request::builder().method("POST").uri(format!("/v1/videos/{request}/delivery"))
+        .header("authorization",format!("Bearer {}",foreign.plaintext)).header("content-type","application/json")
+        .body(axum::body::Body::from("{}")).unwrap()).await.unwrap();
+    assert_eq!(r.status(),StatusCode::NOT_FOUND,"same user different Key may not issue a ticket for this task");
+    for sql in ["UPDATE api_keys SET status='revoked' WHERE id=?1","UPDATE api_keys SET status='active',scopes_json='[]' WHERE id=?1"] {
+        db.execute(sql,[&k.id]).unwrap();
+        let r=router.clone().oneshot(axum::http::Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(r.status(),StatusCode::NOT_FOUND,"current Key status/scope must win over a previously issued ticket");
+    }
+    assert_eq!(bridge.sends.load(Ordering::SeqCst),before,"delivery/download/authorization failures have no new paid dispatch");
+}
 #[tokio::test]
 async fn model_add_probe_uses_bounded_helper_and_does_not_generate_a_video() {
     run_case(true,false,false).await;

@@ -169,7 +169,7 @@ async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Principal,reques
     if let Some(video)=operation.as_ref().and_then(|op|op.steps.iter().find(|s|s.kind==BudgetStepKind::Video)).cloned() {
         if dispatch_only {return Ok(json!({"request_id":request,"status":"already_dispatched"}));}
         let result=wait_result(state.clone(),video).await?;
-        return completed_video(&state,&request,&result);
+        return completed_video(&state,&principal,&request,&result,&original);
     }
     let assist=if let Some(step)=operation.and_then(|op|op.steps.into_iter().find(|s|s.kind==BudgetStepKind::Assist)) {step} else {
         if !fresh {return Err("budget_preparation_requires_recovery".into());}
@@ -233,13 +233,11 @@ async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Principal,reques
     let step=tokio::task::spawn_blocking(move ||prepare_step(&s,&p,&rid,&rid,"seedance",body,BudgetStepKind::Video)).await.map_err(|_|"video worker failed")??;
     if dispatch_only {return Ok(json!({"request_id":request,"status":"dispatched"}));}
     let result=wait_result(state.clone(),step).await?;
-    completed_video(&state,&request,&result)
+    completed_video(&state,&principal,&request,&result,&original)
 }
-fn completed_video(state:&StarlinkRouterState,request:&str,result:&Value)->Result<Value,String> {
+fn completed_video(state:&StarlinkRouterState,principal:&Principal,request:&str,result:&Value,body:&Value)->Result<Value,String> {
     if result["status"]!="completed" {return Err("video_execution_failed".into());}
-    let url=format!("{}/v1/videos/{request}/content",state.config.public_base_url.trim_end_matches('/'));
-    let mut value=completion(request,&format!("视频已生成。请将视频下载到当前工作区：{url}"));
-    value["video_task"]=json!({"id":request,"status":"completed","content_url":url});Ok(value)
+    crate::video_delivery::completion(state,principal,request,body)
 }
 
 pub(crate) async fn video_content(state:Arc<StarlinkRouterState>,principal:Principal,request:String)->Response {
@@ -276,6 +274,7 @@ pub(crate) async fn video_content(state:Arc<StarlinkRouterState>,principal:Princ
 
 pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Principal,headers:axum::http::HeaderMap,body:Value)->Response {
     use aiwork_core::{BeginRequest,BeginRequestInput};
+    if let Some(response)=crate::video_delivery::follow_up(&state,&principal,&body) {return response;}
     if crate::user_routes::extract_seedance_prompt(&body).is_err() {return (StatusCode::BAD_REQUEST,Json(json!({"error":{"code":"seedance_prompt_missing"}}))).into_response();}
     let images=match inline_images(&body) {Ok(images)=>images,Err(code)=>return (StatusCode::BAD_REQUEST,Json(json!({"error":{"code":code}}))).into_response()};
     if !images.is_empty() && !principal.scopes.contains("assets:write") && !principal.scopes.contains("admin:*") {
@@ -323,12 +322,7 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
             _=tick.tick()=>{if send.send(Ok(axum::body::Bytes::from_static(crate::seedance_sse::keep_alive()))).await.is_err() {break;}},
             result=&mut receive=>{
                 let bytes=match result {
-                    Ok(Ok(value))=>{
-                        let mut chunk=json!({"id":value["id"],"object":"chat.completion.chunk","model":"seedance","created":value["created"],"request_id":request,
-                            "choices":[{"index":0,"delta":{"role":"assistant","content":value["choices"][0]["message"]["content"]},"finish_reason":"stop"}]});
-                        if !value["video_task"].is_null() {chunk["video_task"]=value["video_task"].clone();}
-                        format!("data: {chunk}\n\ndata: [DONE]\n\n").into_bytes()
-                    },
+                    Ok(Ok(value))=>crate::video_delivery::sse_completion(&value),
                     failure=>{
                         let code=match &failure {Ok(Err(code))=>crate::budget_errors::public_code(code).unwrap_or("seedance_budget_execution_failed"),_=>"seedance_budget_execution_failed"};
                         crate::seedance_sse::encode_event(&request,crate::seedance_sse::VideoStreamEvent::Failed {code:code.into(),request_id:request.clone()})

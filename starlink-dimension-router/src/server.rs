@@ -17,11 +17,13 @@ pub fn build_router(state: Arc<StarlinkRouterState>) -> Router {
         .route("/v1/videos/generations", post(user_routes::video_generations))
         .route("/v1/videos/:task_id", get(user_routes::video_task))
         .route("/v1/videos/:task_id/content", get(user_routes::video_content))
+        .route("/v1/videos/:task_id/delivery", post(crate::video_delivery::delivery).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
         .layer(from_fn_with_state(state.clone(), auth::user_auth));
     let admin = admin_routes::router()
         .layer(from_fn_with_state(state.clone(), admin_auth::require_admin));
     let public_admin = admin_routes::public_router()
-        .route("/v1/assets/:asset_id/content", get(user_routes::assets_content));
+        .route("/v1/assets/:asset_id/content", get(user_routes::assets_content))
+        .route("/v1/videos/:task_id/download", get(crate::video_delivery::download));
     Router::new()
         .route("/health", get(health))
         .route("/healthz", get(health))

@@ -121,6 +121,16 @@ schema 26 与新 v2 账本的恢复规则：一旦新 v2 账本已写入任何�
 
 ### Seedance 流式客户端
 
+#### 视频自动保存到客户端工作区（2026-09-28）
+
+当前 V2 Seedance Chat 完成后，若客户端声明 Trae Work 的 `RunCommand` / PowerShell 工具且未设置 `tool_choice=none`，Core 返回标准 `tool_calls`（SSE 带 `index`、`finish_reason=tool_calls` 和 `[DONE]`）。客户端执行短期授权下载命令，将 MP4 保存到系统上下文的 final workspace；没有该路径时使用客户端当前终端目录。工具结果返回后，Core 确认客户端报告的保存路径，不再调用文字模型或视频模型，不产生新生成费用。
+
+命令采用唯一临时文件、五分钟超时、最大 4 GiB、MP4 头检查、原子移动与不覆盖策略。失败只清理本次临时文件；客户端拒绝工具或没有适配工具时返回下载链接，不伪称已落地。仅核验了 Trae Work `RunCommand` 契约，其他 Agent 工具需独立适配；不能保证所有客户端都自动执行。
+
+普通 Key 可用 `POST /v1/videos/{request_id}/delivery` 重试已完成视频的交付，请求体提供原客户端 `tools` / `messages` / `stream`，不重新生成。`GET /v1/videos/{request_id}/content` 仍保留 Bearer Key 鉴权。工具使用的 `GET /v1/videos/{request_id}/download?ticket=...` 采用 15 分钟、单任务、仅下载的加密授权，不携带永久 Key；访问时重新核验用户、Key、视频读取作用域和任务归属。
+
+部署必须对短期下载路由禁用含 query 的访问/错误日志，HTTP 下载入口不做带授权 URL 的重定向。公网实例部署记录与验收依据见 `docs/video-workspace-delivery-acceptance-20260928.md`。
+
 客户端沿用 Core Base URL、普通 API Key 和模型名 seedance，无需额外配置请求头。对于不发送 Idempotency-Key 的 stream=true 请求，Core 会为该次请求生成内部编号，按同一 Key 分别记录提示词辅助和视频的真实回执，并在 SSE 中返回结果。同一 Key、同一内容的立即重试会复用运行中的任务或两分钟内完成的任务；显式发送 Idempotency-Key 的客户端仍可用同一键重连并复用原任务。
 
 没有客户端提供的稳定幂等键时，Core 无法可靠区分断线后的自动重试和用户主动再次提交：短时间内主动重复同一内容也会复用旧任务，超过窗口的重试则可能创建并计费新视频。服务端不会因 SSE 断开而自动重发生成请求。生产视频仍受持久化计费闸门约束：闸门为 paused 时返回 video_billing_paused，不执行上游生成，不能把兼容流式请求误认为已放开视频计费。
