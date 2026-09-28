@@ -390,11 +390,14 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
     let (send,recv)=tokio::sync::mpsc::channel(8);
     tokio::spawn(async move {
         let started=std::time::Instant::now();let mut progress=subscription.progress_receiver();
-        let initial=crate::seedance_feedback::progress_event(&request,&progress.borrow().clone(),0);
+        let current=progress.borrow_and_update().clone();let mut last_stage=current.stage;
+        let initial=crate::seedance_feedback::progress_event(&request,&current,0);
         if send.send(Ok(axum::body::Bytes::from(initial))).await.is_err() {return;}
         let mut receive=Box::pin(subscription.result());
         let every=std::time::Duration::from_secs(20);let mut tick=tokio::time::interval_at(tokio::time::Instant::now()+every,every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);let mut progress_open=true;
+        let reminder_delay=std::time::Duration::from_secs(60);
+        let reminder=tokio::time::sleep(reminder_delay);tokio::pin!(reminder);
         loop {let bytes=tokio::select! {
             biased;
             _=send.closed()=>break,
@@ -411,9 +414,17 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
             },
             changed=progress.changed(),if progress_open=>{
                 if changed.is_err() {progress_open=false;continue;}
-                crate::seedance_feedback::progress_event(&request,&progress.borrow_and_update().clone(),started.elapsed().as_secs())
+                let current=progress.borrow_and_update().clone();
+                if current.stage==last_stage {continue;}
+                last_stage=current.stage;
+                reminder.as_mut().reset(tokio::time::Instant::now()+reminder_delay);
+                crate::seedance_feedback::progress_event(&request,&current,started.elapsed().as_secs())
             },
-            _=tick.tick()=>crate::seedance_feedback::progress_event(&request,&progress.borrow().clone(),started.elapsed().as_secs()),
+            _=&mut reminder=>{
+                reminder.as_mut().reset(tokio::time::Instant::now()+reminder_delay);
+                crate::seedance_feedback::waiting_event(&request,&progress.borrow().clone(),started.elapsed().as_secs())
+            },
+            _=tick.tick()=>b": keep-alive\n\n".to_vec(),
         };
             if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5),send.send(Ok(axum::body::Bytes::from(bytes)))).await,Ok(Ok(()))) {break;}
         }

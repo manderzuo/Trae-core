@@ -9,13 +9,22 @@ impl Stage {
         Self::Submitting=>"submitting_video",Self::Processing=>"processing",Self::Delivery=>"preparing_download",Self::QueryDelayed=>"status_query_delayed",
     }}
     fn message(self)->&'static str {match self {
-        Self::Received=>"请求已接收，正在确认任务状态。",
-        Self::Assistant=>"正在识别请求并整理提示词。",
-        Self::References=>"正在处理本次请求携带的参考素材。",
-        Self::Submitting=>"正在准备额度并提交视频任务。",
-        Self::Processing=>"视频任务已提交，最近一次成功查询显示任务在处理中；继续等待同一任务。",
-        Self::Delivery=>"视频已生成，正在准备本机下载工具；是否保存成功以本机工具回报为准。",
-        Self::QueryDelayed=>"暂时无法取得最新任务状态，系统正在继续查询同一任务；本次查询异常尚不能判断视频生成失败。",
+        Self::Received=>"已接收请求，正在确认任务。",
+        Self::Assistant=>"正在整理提示词。",
+        Self::References=>"正在处理参考素材。",
+        Self::Submitting=>"正在提交视频任务。",
+        Self::Processing=>"任务已提交，正在生成。",
+        Self::Delivery=>"视频已生成，正在准备自动下载。",
+        Self::QueryDelayed=>"暂时无法获取最新状态，系统会继续查询；无需重新提交。",
+    }}
+    fn waiting_message(self)->&'static str {match self {
+        Self::Received=>"仍在确认任务状态。",
+        Self::Assistant=>"仍在整理提示词。",
+        Self::References=>"仍在处理参考素材。",
+        Self::Submitting=>"任务尚在提交过程中。",
+        Self::Processing=>"上游尚未返回完成结果；系统继续等待，无需重新提交。",
+        Self::Delivery=>"仍在准备自动下载。",
+        Self::QueryDelayed=>"暂未取得最新状态；系统继续查询，无需重新提交。",
     }}
 }
 #[derive(Clone)]
@@ -23,11 +32,19 @@ pub(crate) struct Progress {pub stage:Stage,pub last_confirmed_at_ms:Option<i64>
 impl Default for Progress {fn default()->Self {Self {stage:Stage::Received,last_confirmed_at_ms:None}}}
 
 pub(crate) fn progress_event(request:&str,progress:&Progress,elapsed_secs:u64)->Vec<u8> {
-    let text=if elapsed_secs>=20 {format!("{} 本次连接已等待{elapsed_secs}秒。\n",progress.stage.message())}
-        else {format!("{}\n",progress.stage.message())};
+    event(request,progress,elapsed_secs,"stage",progress.stage.message())
+}
+pub(crate) fn waiting_event(request:&str,progress:&Progress,elapsed_secs:u64)->Vec<u8> {
+    let text=format!("本次已等待{}分钟，{}",elapsed_secs/60,progress.stage.waiting_message());
+    event(request,progress,elapsed_secs,"waiting",&text)
+}
+fn event(request:&str,progress:&Progress,elapsed_secs:u64,kind:&str,text:&str)->Vec<u8> {
+    // Chat clients append content deltas and treat a single newline as a soft
+    // break. Complete paragraphs prevent stage updates from becoming one wall.
+    let text=format!("{text}\n\n");
     let value=json!({"id":format!("chatcmpl-{request}"),"object":"chat.completion.chunk","model":"seedance",
         "created":chrono::Utc::now().timestamp(),"request_id":request,
-        "task_progress":{"stage":progress.stage.name(),"last_confirmed_at_ms":progress.last_confirmed_at_ms,"connection_wait_seconds":elapsed_secs},
+        "task_progress":{"kind":kind,"stage":progress.stage.name(),"last_confirmed_at_ms":progress.last_confirmed_at_ms,"connection_wait_seconds":elapsed_secs},
         "choices":[{"index":0,"delta":{"role":"assistant","content":text},"finish_reason":null}]});
     format!("data: {value}\n\n").into_bytes()
 }

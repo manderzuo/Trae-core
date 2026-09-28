@@ -188,6 +188,7 @@ async fn seedance_feedback_starts_with_visible_text_while_helper_is_running() {
     let frame=tokio::time::timeout(Duration::from_secs(1),body.frame()).await.unwrap().unwrap().unwrap().into_data().unwrap();
     let chunk:Value=serde_json::from_str(std::str::from_utf8(&frame).unwrap().trim().strip_prefix("data: ").unwrap()).unwrap();
     assert!(!chunk["choices"][0]["delta"]["content"].as_str().unwrap().is_empty(),"comments and empty deltas cannot keep clients informed");
+    assert!(chunk["choices"][0]["delta"]["content"].as_str().unwrap().ends_with("\n\n"),"each status must form a Markdown paragraph instead of a soft line break");
     assert!(chunk["request_id"].as_str().unwrap().starts_with("request_"));
     assert!(chunk["choices"][0]["finish_reason"].is_null(),"progress cannot finish the model turn");
     f.bridge.open.store(true,Ordering::SeqCst);drop(body);
@@ -264,20 +265,54 @@ async fn seedance_feedback_mismatched_video_identity_cannot_supply_a_failure_rea
 }
 
 #[tokio::test(flavor="multi_thread",worker_threads=4)]
-async fn seedance_feedback_long_wait_emits_visible_progress_without_dispatching_again() {
+async fn seedance_feedback_long_wait_uses_silent_heartbeats_and_minute_reminders() {
     use http_body_util::BodyExt;
     let f=Fixture::new("video",false);let response=f.request(f.body(true,false),true).await;f.waiting().await;let mut body=response.into_body();
-    tokio::time::timeout(Duration::from_secs(24),async {
+    let mut heartbeats=0;let mut phases=BTreeSet::new();
+    tokio::time::timeout(Duration::from_secs(68),async {
         loop {let frame=body.frame().await.unwrap().unwrap().into_data().unwrap();
-            for line in std::str::from_utf8(&frame).unwrap().lines().filter_map(|l|l.strip_prefix("data: ")) {
-                if let Ok(v)=serde_json::from_str::<Value>(line) {if v["task_progress"]["connection_wait_seconds"].as_u64().is_some_and(|n|n>=20) {
-                    assert!(v["choices"][0]["delta"]["content"].as_str().unwrap().contains("等待"));
-                    assert!(v["choices"][0]["finish_reason"].is_null());return;
-                }}
+            let wire=std::str::from_utf8(&frame).unwrap();
+            if wire.starts_with(':') {heartbeats+=1;assert!(!wire.contains("data:"));continue;}
+            for line in wire.lines().filter_map(|l|l.strip_prefix("data: ")) {
+                if let Ok(v)=serde_json::from_str::<Value>(line) {
+                    let elapsed=v["task_progress"]["connection_wait_seconds"].as_u64().unwrap();
+                    let stage=v["task_progress"]["stage"].as_str().unwrap();
+                    let text=v["choices"][0]["delta"]["content"].as_str().unwrap();
+                    if elapsed<60 {
+                        assert!(phases.insert(stage.to_owned()),"unchanged stages must not be appended every twenty seconds");
+                    } else {
+                        assert!(heartbeats>=2,"the stream must stay alive silently before the first minute reminder");
+                        assert_eq!(v["task_progress"]["kind"],"waiting");
+                        assert!(text.contains("等待") && text.contains("分钟"));
+                        assert!(!text.contains("最近一次成功查询"),"reminders must not repeat the full internal status explanation");
+                        assert!(v["choices"][0]["finish_reason"].is_null());return;
+                    }
+                }
             }
         }
-    }).await.expect("a long-running video needs a visible waiting update");
+    }).await.expect("a long-running video needs one concise reminder after a minute, not a wall of repeated status");
     f.bridge.open.store(true,Ordering::SeqCst);drop(body);assert_eq!(f.bridge.inner.sends.load(Ordering::SeqCst),2);
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn seedance_feedback_reconnect_starts_one_paragraph_without_replaying_old_phases() {
+    use http_body_util::BodyExt;
+    let f=Fixture::new("video",false);let first=f.request(f.body(true,false),true).await;let mut first_body=first.into_body();
+    tokio::time::timeout(Duration::from_secs(5),async {
+        loop {let frame=first_body.frame().await.unwrap().unwrap().into_data().unwrap();
+            for line in std::str::from_utf8(&frame).unwrap().lines().filter_map(|l|l.strip_prefix("data: ")) {
+                if let Ok(v)=serde_json::from_str::<Value>(line) {if v["task_progress"]["stage"]=="processing" {return;}}
+            }
+        }
+    }).await.expect("wait for the actual submitted stage before reconnecting");
+    drop(first_body);
+    let second=f.request(f.body(true,false),true).await;let mut body=second.into_body();
+    let frame=tokio::time::timeout(Duration::from_secs(1),body.frame()).await.unwrap().unwrap().unwrap().into_data().unwrap();
+    let chunk:Value=serde_json::from_str(std::str::from_utf8(&frame).unwrap().trim().strip_prefix("data: ").unwrap()).unwrap();
+    assert_eq!(chunk["task_progress"]["stage"],"processing");
+    assert!(chunk["choices"][0]["delta"]["content"].as_str().unwrap().ends_with("\n\n"));
+    assert!(tokio::time::timeout(Duration::from_millis(300),body.frame()).await.is_err(),"a reconnect must not immediately repeat its initial status");
+    f.bridge.open.store(true,Ordering::SeqCst);drop(body);
 }
 
 #[tokio::test(flavor="multi_thread",worker_threads=4)]
