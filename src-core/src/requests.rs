@@ -1179,16 +1179,41 @@ impl CoreStore {
     /// reservation or dispatch. A reservation, job, lease, or request relation
     /// makes the request ineligible; those cases need their normal reconciliation.
     pub fn recover_abandoned_pre_dispatch_requests(&self) -> Result<usize, CoreError> {
+        self.recover_pre_dispatch_requests(Utc::now().timestamp_millis().saturating_sub(5 * 60 * 1_000), None)
+    }
+
+    /// The caller must exclusively own this request and have stopped preparing
+    /// it. Never release a reservation or infer non-execution from a timeout.
+    pub fn finish_unadmitted_request(&self, request_id: &str) -> Result<bool, CoreError> {
+        self.recover_pre_dispatch_requests(i64::MAX, Some(request_id)).map(|n| n != 0)
+    }
+
+    fn recover_pre_dispatch_requests(&self, cutoff: i64, request_id: Option<&str>) -> Result<usize, CoreError> {
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = Utc::now().timestamp_millis();
-        let cutoff = now.saturating_sub(5 * 60 * 1_000);
+        let error_code = if request_id.is_some() { "budget_pre_admission_failed" } else { "abandoned_pre_dispatch_recovered" };
+        let audit_action = if request_id.is_some() { "request.budget_pre_admission_failed" } else { "request.abandoned_pre_dispatch_recovered" };
         let candidates = {
             let mut statement = transaction.prepare(
                 "SELECT request.id, request.state, request.endpoint
                  FROM requests request
                  WHERE request.state IN ('received', 'validating')
                    AND request.updated_at_ms < ?1
+                   AND (?2 IS NULL OR request.id = ?2)
+                   AND NOT EXISTS (
+                     SELECT 1 FROM budget_operations operation WHERE operation.parent_request_id = request.id
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM budget_steps step WHERE step.request_id = request.id
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM budget_preparations preparation
+                     WHERE preparation.parent_request_id = request.id OR preparation.child_request_id = request.id
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM billing_receipts receipt WHERE receipt.request_id = request.id
+                   )
                    AND NOT EXISTS (
                      SELECT 1 FROM quota_reservations reservation
                      WHERE reservation.request_id = request.id
@@ -1204,7 +1229,7 @@ impl CoreStore {
                      WHERE relation.parent_request_id = request.id OR relation.child_request_id = request.id
                    )",
             )?;
-            let rows = statement.query_map([cutoff], |row| {
+            let rows = statement.query_map(params![cutoff, request_id], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -1230,12 +1255,12 @@ impl CoreStore {
                 RequestState::Failed,
                 Some(RequestResult {
                     status: None,
-                    error_code: Some("abandoned_pre_dispatch_recovered".into()),
+                    error_code: Some(error_code.into()),
                 }),
                 now,
             )?;
             Self::insert_audit_event(
-                &transaction, "system", "request.abandoned_pre_dispatch_recovered",
+                &transaction, "system", audit_action,
                 "request", request_id,
                 serde_json::json!({ "previous_state": state, "endpoint": endpoint }),
                 now,

@@ -31,6 +31,10 @@ impl BridgeTransport for Bridge {
             assert!(upload["data_base64"].as_str().unwrap().starts_with("iVBOR"));
             json!({"id":"bridge-image"})
         } else if url.ends_with("/key-registry") {json!({"applied":true})} else if url.ends_with("/budgets/prepare") {
+            let input:Value=serde_json::from_slice(body).unwrap();
+            if input["body"]["messages"][0]["content"]=="reject policy" {
+                return Ok(BridgeResponse {status:503,headers:BTreeMap::new(),body:serde_json::to_vec(&json!({"error":{"code":"budget_policy_unconfigured","message":"budget_policy_unconfigured"}})).unwrap()});
+            }
             assert_eq!(headers.get("content-type").map(String::as_str),Some("application/json"));
             let claim:Value=serde_json::from_slice(body).unwrap();self.claims.lock().unwrap().insert(claim["request_id"].as_str().unwrap().into(),claim.clone());
             json!({"wire_version":2,"dispatch_token":"fixture-dispatch","evidence_level":"policy_only","prepared_at_ms":chrono::Utc::now().timestamp_millis(),"revision":1,
@@ -138,6 +142,62 @@ async fn ordinary_chat_rejects_foreign_assets_before_budget_or_paid_send() {
     let state=StarlinkRouterState::for_test(store.clone(),BridgeClient::from_transport("http://bridge","bridge-only",bridge.clone()),cfg);
     let r=user_routes::chat_completions(State(state),HeaderMap::new(),Extension(principal),Bytes::from(json!({"model":"text-model","messages":[{"role":"user","content":"look"}],"image_asset_ids":["asset-other"]}).to_string())).await;
     assert!(r.status().is_client_error());assert!(bridge.claims.lock().unwrap().is_empty());assert_eq!(bridge.sends.load(Ordering::SeqCst),0);
+    assert_eq!(store.active_execution_count_for_key(&k.id).unwrap(),0,"rejected asset must not leak concurrency");
+}
+#[tokio::test]
+async fn rejected_chat_policy_releases_slot_and_next_model_can_run() {
+    let dir=Directory(std::env::temp_dir().join(format!("core-chat-rejected-{:032x}",rand::random::<u128>())));
+    let store=Arc::new(CoreStore::open(dir.path()).unwrap());store.migrate().unwrap();
+    store.create_user(NewUser {id:"admin".into(),name:"Admin".into(),role:UserRole::Admin},"bootstrap").unwrap();
+    store.create_user(NewUser {id:"user".into(),name:"User".into(),role:UserRole::User},"admin").unwrap();
+    let a=store.issue_api_key("admin","admin",BTreeSet::from(["admin:*".into()]),"bootstrap").unwrap();let admin=store.authenticate_api_key(&a.plaintext).unwrap();
+    let k=store.issue_api_key_as_admin_with_max_concurrency("user","Key",BTreeSet::from(["chat:invoke".into()]),1,&admin).unwrap();
+    store.key_quota_grant_as_admin(&admin,KeyQuotaGrant {api_key_id:k.id.clone(),resource_kind:"credits".into(),amount:200_000_000,actor_user_id:"admin".into(),reason:"isolated".into()}).unwrap();
+    let bridge=Arc::new(Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent:false,large_downloads:std::sync::atomic::AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0)),download_status:AtomicUsize::new(200)});
+    let mut cfg=RouterConfig::defaults(dir.path().into());cfg.budget_billing_v2=true;
+    let state=StarlinkRouterState::for_test(store.clone(),BridgeClient::from_transport("http://bridge","bridge-only",bridge.clone()),cfg);
+    let principal=store.authenticate_api_key(&k.plaintext).unwrap();
+    for (index,prompt) in ["reject policy","reject policy","hello"].iter().enumerate() {
+        let mut headers=HeaderMap::new();headers.insert("idempotency-key",format!("rejected-{index}").parse().unwrap());
+        let response=user_routes::chat_completions(State(state.clone()),headers,Extension(principal.clone()),Bytes::from(json!({"model":"text-model","messages":[{"role":"user","content":prompt}]}).to_string())).await;
+        assert_eq!(response.status(),if index<2 {StatusCode::SERVICE_UNAVAILABLE} else {StatusCode::OK});
+        assert_eq!(store.active_execution_count_for_key(&k.id).unwrap(),0,"policy rejection must not consume a slot");
+    }
+    assert_eq!(bridge.sends.load(Ordering::SeqCst),1);
+}
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn disconnected_chat_keeps_preparation_owner_until_worker_stops_then_frees_slot() {
+    struct Blocked {
+        entered:Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        resume:Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl BridgeTransport for Blocked {
+        fn send(&self,_:&str,url:&str,_:&BTreeMap<String,String>,_:&[u8])->Result<BridgeResponse,String> {
+            if url.ends_with("/key-registry") {return Ok(BridgeResponse {status:200,headers:BTreeMap::new(),body:b"{\"applied\":true}".to_vec()});}
+            assert!(url.ends_with("/budgets/prepare"));
+            self.entered.lock().unwrap().take().unwrap().send(()).unwrap();
+            self.resume.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            Err("budget_policy_unconfigured".into())
+        }
+    }
+    let dir=Directory(std::env::temp_dir().join(format!("core-chat-disconnect-{:032x}",rand::random::<u128>())));
+    let store=Arc::new(CoreStore::open(dir.path()).unwrap());store.migrate().unwrap();
+    store.create_user(NewUser {id:"admin".into(),name:"Admin".into(),role:UserRole::Admin},"bootstrap").unwrap();
+    let k=store.issue_api_key("admin","limited",BTreeSet::from(["chat:invoke".into()]),"bootstrap").unwrap();let principal=store.authenticate_api_key(&k.plaintext).unwrap();
+    let (entered,ready)=tokio::sync::oneshot::channel();let (resume,receiver)=std::sync::mpsc::channel();
+    let bridge=Arc::new(Blocked {entered:Mutex::new(Some(entered)),resume:Mutex::new(receiver)});
+    let mut cfg=RouterConfig::defaults(dir.path().into());cfg.budget_billing_v2=true;
+    let state=StarlinkRouterState::for_test(store.clone(),BridgeClient::from_transport("http://bridge","bridge-only",bridge),cfg);
+    let worker=tokio::spawn(user_routes::chat_completions(State(state.clone()),HeaderMap::new(),Extension(principal),Bytes::from(json!({"model":"text-model","messages":[{"role":"user","content":"hello"}]}).to_string())));
+    tokio::time::timeout(std::time::Duration::from_secs(2),ready).await.unwrap().unwrap();
+    worker.abort();assert!(worker.await.unwrap_err().is_cancelled());
+    assert_eq!(state.video_stream_observers.lock().unwrap().len(),1,"disconnect must not release a still-preparing owner");
+    assert_eq!(store.active_execution_count_for_key(&k.id).unwrap(),1);
+    resume.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2),async {
+        while !state.video_stream_observers.lock().unwrap().is_empty() {tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
+    }).await.unwrap();
+    assert_eq!(store.active_execution_count_for_key(&k.id).unwrap(),0);
 }
 #[tokio::test(flavor="multi_thread",worker_threads=4)]
 async fn ten_keys_each_admit_two_reject_third_and_reuse_terminal_slot_before_receipt() {

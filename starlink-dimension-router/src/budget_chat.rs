@@ -6,6 +6,18 @@ use axum::{http::{HeaderMap,StatusCode},response::{Response,IntoResponse},body::
 use serde_json::{json,Value};
 use crate::{state::StarlinkRouterState,budget_flow::{fail,prepare_step,read_result,wait_result},budget_observer::Observer};
 
+// Keep exclusive ownership until the blocking preparation worker has stopped,
+// even when its HTTP caller disconnects. Cleanup cannot race a new observer or
+// refund an admitted/possibly dispatched execution.
+struct AdmissionOwner {state:Arc<StarlinkRouterState>,request:String,_observer:Observer}
+impl Drop for AdmissionOwner {
+    fn drop(&mut self) {
+        if let Err(error)=self.state.store.finish_unadmitted_request(&self.request) {
+            eprintln!("chat pre-admission cleanup failed for {}: {error}",self.request);
+        }
+    }
+}
+
 pub(crate) async fn chat(state:Arc<StarlinkRouterState>,principal:Principal,headers:HeaderMap,original:Value,model:String)->Response {
     if !original["messages"].as_array().is_some_and(|v|!v.is_empty()) {return fail("invalid_budget_business_request");}
     let key=headers.get("idempotency-key").and_then(|v|v.to_str().ok()).filter(|v|!v.trim().is_empty()).map(str::to_owned)
@@ -14,7 +26,10 @@ pub(crate) async fn chat(state:Arc<StarlinkRouterState>,principal:Principal,head
         Ok(BeginRequest::Created(r))|Ok(BeginRequest::Existing(r))=>r.id,
         Ok(BeginRequest::Conflict)=>return fail("budget_identity_conflict"),Err(_)=>return fail("budget_request_rejected"),
     };
-    let Some(observer)=Observer::acquire(state.video_stream_observers.clone(),request.clone()) else {return StatusCode::TOO_MANY_REQUESTS.into_response()};
+    let Some(observer)=Observer::acquire_with_capacity_rejection(state.video_stream_observers.clone(),request.clone(),|| {
+        if let Err(error)=state.store.finish_unadmitted_request(&request) {eprintln!("chat capacity cleanup failed for {request}: {error}");}
+    }) else {return StatusCode::TOO_MANY_REQUESTS.into_response()};
+    let mut observer=AdmissionOwner {state:state.clone(),request:request.clone(),_observer:observer};
     // Identity and original-body fingerprint were checked above. A durable
     // budget is already bound to its normalized input; replaying its output
     // must not depend on an input asset that may since have expired.
@@ -27,8 +42,16 @@ pub(crate) async fn chat(state:Arc<StarlinkRouterState>,principal:Principal,head
         if let Err(r)=crate::user_routes::materialize_text_asset_ids(&state,&principal,&mut body) {return r;}
         if let Err(r)=crate::user_routes::validate_vision_data_urls(&body) {return r;}
         let s=state.clone();let rid=request.clone();let m=model.clone();
-        match tokio::task::spawn_blocking(move ||prepare_step(&s,&principal,&rid,&rid,&m,body,BudgetStepKind::Chat)).await {
-            Ok(Ok(s))=>s,Ok(Err(e))=>return fail(crate::budget_errors::public_code(&e).unwrap_or("chat_budget_admission_failed")),_=>return fail("chat_budget_admission_failed")
+        match tokio::task::spawn_blocking(move || {
+            let owner=observer;
+            let result=prepare_step(&s,&principal,&rid,&rid,&m,body,BudgetStepKind::Chat);
+            (owner,result)
+        }).await {
+            Ok((owner,result))=>{
+                observer=owner;
+                match result {Ok(step)=>step,Err(e)=>return fail(crate::budget_errors::public_code(&e).unwrap_or("chat_budget_admission_failed"))}
+            },
+            _=>return fail("chat_budget_admission_failed")
         }
     };
     if !original["stream"].as_bool().unwrap_or(false) {

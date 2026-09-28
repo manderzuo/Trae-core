@@ -4,9 +4,14 @@ use std::{collections::HashSet,sync::{Arc,Mutex}};
 pub(crate) struct Observer {owners:Arc<Mutex<HashSet<String>>>,request:String}
 impl Observer {
     pub(crate) fn acquire(owners:Arc<Mutex<HashSet<String>>>,request:String)->Option<Self> {
+        Self::acquire_with_capacity_rejection(owners,request,|| {})
+    }
+    pub(crate) fn acquire_with_capacity_rejection(owners:Arc<Mutex<HashSet<String>>>,request:String,reject:impl FnOnce())->Option<Self> {
         {
             let mut busy=owners.lock().unwrap_or_else(|e|e.into_inner());
-            if busy.len()>=128 || !busy.insert(request.clone()) {return None;}
+            if busy.contains(&request) {return None;}
+            if busy.len()>=128 {reject();return None;}
+            busy.insert(request.clone());
         }
         Some(Self {owners,request})
     }
@@ -41,6 +46,10 @@ mod tests {
         let owners=Arc::new(Mutex::new(HashSet::new()));
         let guards=(0..128).map(|i|Observer::acquire(owners.clone(),i.to_string()).unwrap()).collect::<Vec<_>>();
         assert!(Observer::acquire(owners.clone(),"extra".into()).is_none());
+        assert!(Observer::acquire_with_capacity_rejection(owners.clone(),"0".into(),|| panic!("existing owner must never be cleaned")).is_none());
+        let mut rejected=false;
+        assert!(Observer::acquire_with_capacity_rejection(owners.clone(),"extra".into(),|| rejected=true).is_none());
+        assert!(rejected);
         assert_eq!(owners.lock().unwrap().len(),128);drop(guards);
         assert!(Observer::acquire(owners,"extra".into()).is_some());
     }

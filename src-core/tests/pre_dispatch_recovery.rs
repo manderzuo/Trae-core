@@ -27,10 +27,14 @@ fn startup_recovers_only_old_unreserved_unrelated_requests_before_dispatch() {
     let old_validating = begin("old-validating");
     let recent = begin("recent");
     let protected = begin("protected");
+    let protected_operation = begin("protected-operation");
     store.transition_request(&old_validating, RequestState::Received, RequestState::Validating, None).unwrap();
 
     let database = dir.join("data").join(aiwork_core::CORE_DB_FILE);
     let connection = Connection::open(&database).unwrap();
+    connection.execute("UPDATE requests SET created_at_ms=1,updated_at_ms=1 WHERE id=?1",[&protected_operation]).unwrap();
+    connection.execute("INSERT INTO budget_operations (operation_id,parent_request_id,api_key_id,execution_state,created_at_ms,updated_at_ms) VALUES ('protected-op',?1,?2,'unknown',1,1)",params![protected_operation,key.id]).unwrap();
+    assert!(!store.finish_unadmitted_request(&protected_operation).unwrap());
     connection.execute(
         "UPDATE requests SET created_at_ms = 1, updated_at_ms = 1 WHERE id IN (?1, ?2, ?3)",
         params![old_received, old_validating, protected],
@@ -55,6 +59,8 @@ fn startup_recovers_only_old_unreserved_unrelated_requests_before_dispatch() {
     assert_eq!(store.request_state(&old_validating).unwrap(), RequestState::Failed);
     assert_eq!(store.request_state(&recent).unwrap(), RequestState::Received);
     assert_eq!(store.request_state(&protected).unwrap(), RequestState::Received);
+    assert_eq!(store.request_state(&protected_operation).unwrap(), RequestState::Received);
+    assert!(!store.finish_unadmitted_request(&protected).unwrap());
     let error_code: String = connection.query_row(
         "SELECT error_code FROM requests WHERE id = ?1", [&old_received], |row| row.get(0),
     ).unwrap();
@@ -64,6 +70,9 @@ fn startup_recovers_only_old_unreserved_unrelated_requests_before_dispatch() {
     ).unwrap();
     assert_eq!(audited, 2);
     assert_eq!(store.recover_abandoned_pre_dispatch_requests().unwrap(), 0);
+    assert!(store.finish_unadmitted_request(&recent).unwrap());
+    assert!(!store.finish_unadmitted_request(&recent).unwrap());
+    assert_eq!(store.request_state(&recent).unwrap(), RequestState::Failed);
 
     drop(connection);
     drop(store);
