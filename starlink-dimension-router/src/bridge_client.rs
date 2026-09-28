@@ -21,6 +21,9 @@ pub struct BridgeStreamingResponse {
     pub body: Box<dyn Read + Send>,
 }
 
+#[derive(Debug,Clone)]
+pub struct FrameDownload {pub bytes:Vec<u8>,pub width:u32,pub height:u32,pub timestamp_ms:i64,pub source_sha256:String,pub frame_sha256:String}
+
 impl BridgeStreamingResponse {
     pub fn into_buffered(self) -> Result<BridgeResponse, String> {
         let body = read_bounded_response(self.body, 64 * 1024 * 1024)?;
@@ -192,6 +195,28 @@ struct CoreKeyRegistrySnapshot {
 }
 
 impl BridgeClient {
+    pub fn last_frame(&self,step:&aiwork_core::BudgetStepView)->Result<FrameDownload,String> {
+        use sha2::{Digest,Sha256};
+        if step.kind!=aiwork_core::BudgetStepKind::Video||step.execution_state!=aiwork_core::BudgetExecutionState::Succeeded||step.task_ref.is_none(){return Err("frame_result_not_ready".into());}
+        let path=crate::budget_reconciler::request_path(step,"last-frame");
+        let headers=BTreeMap::from([("authorization".into(),format!("Bearer {}",self.bridge_secret)),("accept".into(),"image/png".into())]);
+        let response=self.transport.send_stream("POST",&format!("{}{path}",self.base_url),&headers,&[])?;
+        if response.status!=200 {return Err(if response.status==429 {"frame_extractor_busy"}else{"frame_extraction_unavailable"}.into());}
+        let header=|name:&str|response.headers.iter().find(|(k,_)|k.eq_ignore_ascii_case(name)).map(|(_,v)|v.as_str()).ok_or("frame_identity_invalid");
+        for (name,expected) in [("x-aiwork-request-id",&step.request_id),("x-aiwork-budget-id",&step.budget_id),("x-aiwork-core-key-id",&step.core_key_id),("x-aiwork-account-ref",&step.account_ref),("x-aiwork-bridge-instance-id",&step.bridge_instance_id)] {if header(name)?!=expected {return Err("frame_identity_invalid".into());}}
+        if header("content-type")?!="image/png"{return Err("frame_output_invalid".into());}
+        let length=header("content-length")?.parse::<usize>().map_err(|_|"frame_output_invalid")?;
+        if length<45||length>8*1024*1024{return Err("frame_output_invalid".into());}
+        let width=header("x-aiwork-frame-width")?.parse::<u32>().map_err(|_|"frame_output_invalid")?;
+        let height=header("x-aiwork-frame-height")?.parse::<u32>().map_err(|_|"frame_output_invalid")?;
+        let timestamp_ms=header("x-aiwork-frame-timestamp-ms")?.parse::<i64>().map_err(|_|"frame_output_invalid")?;
+        if width==0||height==0||u64::from(width)*u64::from(height)>8388608||!(0..=86400000).contains(&timestamp_ms){return Err("frame_output_invalid".into());}
+        let source_sha256=header("x-aiwork-source-sha256")?.to_owned();let frame_sha256=header("x-aiwork-frame-sha256")?.to_owned();
+        for sha in [&source_sha256,&frame_sha256] {if sha.len()!=64||!sha.bytes().all(|b|b.is_ascii_hexdigit()){return Err("frame_output_invalid".into());}}
+        let bytes=read_bounded_response(response.body,8*1024*1024)?;
+        if bytes.len()!=length||&bytes[..8]!=b"\x89PNG\r\n\x1a\n"||&bytes[12..16]!=b"IHDR"||&bytes[bytes.len()-8..bytes.len()-4]!=b"IEND"||u32::from_be_bytes(bytes[16..20].try_into().unwrap())!=width||u32::from_be_bytes(bytes[20..24].try_into().unwrap())!=height||format!("{:x}",Sha256::digest(&bytes))!=frame_sha256.to_ascii_lowercase(){return Err("frame_output_invalid".into());}
+        Ok(FrameDownload {bytes,width,height,timestamp_ms,source_sha256:source_sha256.to_ascii_lowercase(),frame_sha256:frame_sha256.to_ascii_lowercase()})
+    }
     pub(crate) fn budget_content(&self,step:&aiwork_core::BudgetStepView)->Result<BridgeStreamingResponse,String> {
         let path=crate::budget_reconciler::request_path(step,"content");
         let headers=BTreeMap::from([("authorization".into(),format!("Bearer {}",self.bridge_secret)),("accept".into(),"video/mp4".into())]);
