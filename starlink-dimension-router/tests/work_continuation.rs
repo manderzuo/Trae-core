@@ -18,6 +18,64 @@ fn continue_body(r: &Value) -> Value {
     b
 }
 #[tokio::test]
+async fn native_auto_uses_exact_parent_video_and_replay_does_not_resubmit() {
+    let f=Fixture::with_continuation(true);
+    let (r,v)=base(&f).await;
+    work_continuation::warm_tail_frame(f.state.clone(),f.owner.clone(),v.clone()).await.unwrap();
+    f.bridge.frame_failure.store(true,Ordering::SeqCst);
+    f.bridge.native_capability.store(true,Ordering::SeqCst);
+    let before_frames=f.bridge.frame_reads.load(Ordering::SeqCst);
+    let mut b=continue_body(&r);b["duration"]=json!(7);
+    let child=f.chat("native-child",&b).await;
+    assert_eq!(child["work_context"]["reference_mode"],"native_video_extend");
+    let version=f.state.store.work_version_for_request(&f.owner,child["request_id"].as_str().unwrap()).unwrap().unwrap();
+    assert_eq!(version.parent_version_id,Some(v.version_id));
+    let s=work_context::read_snapshot(&f.state,&f.owner,&version).unwrap();
+    let wire=s.dispatch_body.unwrap();
+    assert_eq!(wire["duration"],7);
+    assert_eq!(wire["video_asset_ids"].as_array().unwrap().len(),1);
+    assert!(wire["image_asset_ids"].is_null());
+    assert!(wire["prompt"].as_str().unwrap().contains("新片段"));
+    assert_eq!(f.bridge.source_reads.lock().unwrap().as_slice(),[r["request_id"].as_str().unwrap()]);
+    assert_eq!(f.bridge.frame_reads.load(Ordering::SeqCst),before_frames);
+    let replay=f.chat("native-child",&b).await;
+    assert_eq!(replay["request_id"],child["request_id"]);
+    assert_eq!(f.bridge.source_reads.lock().unwrap().len(),1);
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),2);
+    let grandchild=f.chat("native-grandchild",&continue_body(&child)).await;
+    assert_eq!(grandchild["work_context"]["reference_mode"],"native_video_extend");
+    assert_eq!(f.bridge.source_reads.lock().unwrap()[1],child["request_id"].as_str().unwrap());
+    let op=f.state.store.budget_operation(grandchild["request_id"].as_str().unwrap()).unwrap().unwrap();
+    let claims=f.bridge.claims.lock().unwrap();
+    assert_eq!(claims[&op.parent_request_id]["body"]["video_asset_ids"].as_array().unwrap().len(),1,"must not accumulate ancestor video clips");
+}
+#[tokio::test]
+async fn native_source_failure_never_falls_back_to_tail_or_text_only() {
+    for wrong_identity in [false,true] {
+        let f=Fixture::with_continuation(true);let (r,_)=base(&f).await;
+        f.bridge.native_capability.store(true,Ordering::SeqCst);
+        f.bridge.source_failure.store(!wrong_identity,Ordering::SeqCst);
+        f.bridge.source_identity_bad.store(wrong_identity,Ordering::SeqCst);
+        let mut b=continue_body(&r);b["continuation_mode"]=json!("native_video_extend");
+        let resp=f.response(&f.key,"missing-source",&b).await;
+        let text=String::from_utf8(to_bytes(resp.into_body(),65536).await.unwrap().to_vec()).unwrap();
+        assert!(text.contains(if wrong_identity{"source_video_identity_invalid"}else{"source_video_unavailable"}),"{text}");
+        assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),1);
+        let replay=f.response(&f.key,"missing-source",&b).await;drop(replay);
+        assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),2,"must not repay helper");
+    }
+}
+#[tokio::test]
+async fn native_does_not_read_foreign_parent_and_explicit_tail_stays_tail() {
+    let f=Fixture::with_continuation(true);let(r,v)=base(&f).await;f.bridge.native_capability.store(true,Ordering::SeqCst);
+    let mut alien=f.owner.clone();alien.key_id="foreign-key".into();
+    let result=work_continuation::prepare_continuation(f.state.clone(),alien,v,json!({"prompt":"continue","continuation_mode":"native_video_extend"}),"request-foreign").await;
+    assert!(result.is_err());assert!(f.bridge.source_reads.lock().unwrap().is_empty());
+    let mut b=continue_body(&r);b["continuation_mode"]=json!("tail_reference");
+    let child=f.chat("explicit-tail",&b).await;
+    assert_eq!(child["work_context"]["reference_mode"],"tail_reference");assert!(f.bridge.source_reads.lock().unwrap().is_empty());
+}
+#[tokio::test]
 async fn last_frame_bound_to_parent_video() {
     let f = Fixture::with_continuation(true);
     let (_, v) = base(&f).await;

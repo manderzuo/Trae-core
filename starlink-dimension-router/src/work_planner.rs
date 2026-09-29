@@ -385,6 +385,7 @@ pub fn merge_snapshot(
         watermark: false,
         user_media_ids: vec![],
         tail_frame_media_id: None,
+        continuation_video_media_id: None,
         parent_version_id: None,
         source_request_id: None,
         reference_mode: "none".into(),
@@ -438,6 +439,7 @@ pub fn merge_snapshot(
     if clear_reference(&current) {
         s.user_media_ids.clear();
         s.tail_frame_media_id = None;
+        s.continuation_video_media_id = None;
     } else if !fresh.is_empty() {
         if merge_reference(&current) && d.reference_policy == "merge" {
             for id in fresh {
@@ -449,6 +451,7 @@ pub fn merge_snapshot(
             s.user_media_ids = fresh;
         }
         s.tail_frame_media_id = None;
+        s.continuation_video_media_id = None;
     }
     if s.user_media_ids.len() > 10 {
         return Err("reference_image_limit".into());
@@ -457,6 +460,7 @@ pub fn merge_snapshot(
     // tail frame. Continuation's new parent frame is added by its executor.
     if d.action != WorkIntent::Continue {
         s.tail_frame_media_id = None;
+        s.continuation_video_media_id = None;
     }
     s.reference_mode = if s.user_media_ids.is_empty() {
         "none"

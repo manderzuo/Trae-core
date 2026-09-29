@@ -75,6 +75,9 @@ pub struct VideoWorkSnapshot {
     pub watermark: bool,
     pub user_media_ids: Vec<String>,
     pub tail_frame_media_id: Option<String>,
+    /// Full parent MP4 pinned by Core, never accepted from client input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_video_media_id: Option<String>,
     pub parent_version_id: Option<String>,
     pub source_request_id: Option<String>,
     pub reference_mode: String,

@@ -240,6 +240,7 @@ pub async fn prepare_continuation(
     p: Principal,
     base: VideoWorkVersion,
     input: Value,
+    request: &str,
 ) -> Result<VideoWorkSnapshot, String> {
     if !state.config.work_context_for_key(&p.key_id) || !state.config.continuation_enabled {
         return Err("continuation_disabled".into());
@@ -258,24 +259,20 @@ pub async fn prepare_continuation(
     })
     .await
     .map_err(|_| "continuation_capabilities_unavailable")??;
-    // Native fields are not yet proven for this provider. Never borrow another
-    // provider's first_frame/video_extend mapping, even if a bit is mis-set.
-    let verified = caps["contract_version"] == "tail-reference-v1"
-        && caps["evidence_digest"]
+    let verified = caps["evidence_digest"]
             .as_str()
             .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()));
-    if !(verified && caps["tail_reference"] == true
+    let native=verified && caps["contract_version"]=="video-reference-continuation-v1" && caps["native_video_extend"]==true;
+    let use_native=matches!(requested,ContinuationMode::Auto|ContinuationMode::NativeVideoExtend)&&native;
+    let tail=verified && matches!(caps["contract_version"].as_str(),Some("tail-reference-v1"|"video-reference-continuation-v1")) && caps["tail_reference"]==true;
+    if requested==ContinuationMode::NativeFirstFrame || (requested==ContinuationMode::NativeVideoExtend&&!native) || (!use_native && !(tail
         || pending_tail_allowed(
             &state.config,
             &p.key_id,
             &caps,
             requested,
             chrono::Utc::now().timestamp_millis(),
-        ))
-        || matches!(
-            requested,
-            ContinuationMode::NativeFirstFrame | ContinuationMode::NativeVideoExtend
-        )
+        )))
     {
         return Err("continuation_mode_unsupported".into());
     }
@@ -288,11 +285,34 @@ pub async fn prepare_continuation(
         clarification: None,
     };
     let mut next = work_planner::merge_snapshot(Some(&snapshot), &decision, &input)?;
-    let frame = warm_tail_frame(state, p, base.clone()).await?;
-    next.tail_frame_media_id = Some(frame.media_id);
-    next.reference_mode = "tail_reference".into();
+    if use_native {
+        state.seedance_results.progress(request,crate::seedance_feedback::Stage::SourceVideo);
+        let media=parent_video(state,p,base.clone()).await?;
+        next.continuation_video_media_id=Some(media.media_id);
+        next.tail_frame_media_id=None;
+        next.reference_mode="native_video_extend".into();
+        next.effective_prompt=format!("从参考视频1（@视频1）的结尾继续拍摄，生成{}秒的新片段；不要重放原片，不要求拼接或原样保留原片前缀。保持前段主体、场景和运动衔接。接下来：{}",next.duration,next.effective_prompt);
+    } else {
+        state.seedance_results.progress(request,crate::seedance_feedback::Stage::Tail);
+        let frame = warm_tail_frame(state, p, base.clone()).await?;
+        next.tail_frame_media_id = Some(frame.media_id);
+        next.continuation_video_media_id=None;
+        next.reference_mode = "tail_reference".into();
+    }
     next.parent_version_id = Some(base.version_id);
     Ok(next)
+}
+async fn parent_video(state:Arc<StarlinkRouterState>,p:Principal,base:VideoWorkVersion)->Result<WorkMediaRef,String> {
+    aiwork_core::require_scope(&p,"videos:read").map_err(|_|"insufficient_scope")?;
+    let owner=acquire(&state,&base).await?;
+    tokio::task::spawn_blocking(move || {
+        let _owner=owner;
+        let version=state.store.owned_work_version(&p,&base.version_id).map_err(|_|"work_parent_unavailable")?
+            .filter(|v|v.work_id==base.work_id && v.operation_request_id==base.operation_request_id && v.state==WorkVersionState::Completed).ok_or("work_parent_unavailable")?;
+        let step=crate::budget_flow::owned_video_step(&state,&p,&version.operation_request_id)?.ok_or("source_video_not_ready")?;
+        let bytes=state.bridge_client().source_video(&step)?;
+        crate::work_media::pin(&state,&p,&version.work_id,&crate::assets::ParsedAssetUpload{filename:"parent-video.mp4".into(),declared_mime:Some("video/mp4".into()),bytes},chrono::Utc::now().timestamp_millis())
+    }).await.map_err(|_|"source_video_unavailable")?
 }
 fn pending_tail_allowed(
     config: &crate::config::RouterConfig,

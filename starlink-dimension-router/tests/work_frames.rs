@@ -3,6 +3,42 @@ use aiwork_core::{BudgetStepView,BudgetStepKind,BudgetExecutionState,BudgetFinan
 use starlink_dimension_router::bridge_client::{BridgeClient,BridgeTransport,BridgeResponse};
 use sha2::{Digest,Sha256};
 struct Reply {body:Vec<u8>,headers:BTreeMap<String,String>}
+struct SourceReply(Reply);
+impl BridgeTransport for SourceReply {
+    fn send(&self,method:&str,url:&str,headers:&BTreeMap<String,String>,_:&[u8])->Result<BridgeResponse,String> {
+        assert_eq!(method,"GET");assert!(url.ends_with("/requests/request-frame/content?budget_id=budget-frame"));assert_eq!(headers["authorization"],"Bearer bridge-only");
+        Ok(BridgeResponse{status:200,headers:self.0.headers.clone(),body:self.0.body.clone()})
+    }
+}
+fn source_reply()->Reply {
+    let mut r=reply();r.body=b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2".to_vec();
+    r.headers.insert("content-type".into(),"video/mp4".into());r.headers.insert("content-length".into(),"24".into());
+    r.headers.insert("x-aiwork-task-ref".into(),"video-frame".into());r
+}
+#[test]
+fn source_video_rejects_wrong_binding_truncated_or_oversized_artifact() {
+    let get=|r:Reply|BridgeClient::from_transport("http://bridge","bridge-only",Arc::new(SourceReply(r))).source_video(&step());
+    assert_eq!(get(source_reply()).unwrap().len(),24);
+    for (field,value) in [("x-aiwork-request-id","other"),("x-aiwork-budget-id","other"),("x-aiwork-core-key-id","other"),("x-aiwork-account-ref","other"),("x-aiwork-bridge-instance-id","other"),("x-aiwork-task-ref","other"),("content-type","text/html"),("content-length","25"),("content-length","33554433")] {
+        let mut r=source_reply();r.headers.insert(field.into(),value.into());assert!(get(r).is_err(),"{field}");
+    }
+    let mut r=source_reply();r.body[4]=b'x';assert!(get(r).is_err());
+    let mut pending=step();pending.execution_state=BudgetExecutionState::Running;
+    assert!(BridgeClient::from_transport("http://bridge","bridge-only",Arc::new(SourceReply(source_reply()))).source_video(&pending).is_err());
+}
+#[test]
+fn real_http_source_video_retains_task_identity_headers() {
+    use std::{io::{Read,Write},net::TcpListener,time::Duration};
+    let listener=TcpListener::bind("127.0.0.1:0").unwrap();let base=format!("http://{}",listener.local_addr().unwrap());let expected=source_reply();
+    let server=std::thread::spawn(move||{
+        let (mut stream,_)=listener.accept().unwrap();stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut bytes=Vec::new();let mut buffer=[0;1024];
+        while !bytes.windows(4).any(|w|w==b"\r\n\r\n") {let n=stream.read(&mut buffer).unwrap();assert!(n>0);bytes.extend_from_slice(&buffer[..n]);assert!(bytes.len()<8192);}
+        assert!(String::from_utf8(bytes).unwrap().starts_with("GET /internal/bridge/v2/requests/request-frame/content?budget_id=budget-frame "));
+        let mut head=String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");for(k,v)in expected.headers{head.push_str(&format!("{k}: {v}\r\n"));}head.push_str("\r\n");stream.write_all(head.as_bytes()).unwrap();stream.write_all(&expected.body).unwrap();
+    });
+    let result=BridgeClient::new(base,"bridge-only").source_video(&step());server.join().unwrap();assert_eq!(result.unwrap().len(),24);
+}
 impl BridgeTransport for Reply {
     fn send(&self,method:&str,url:&str,headers:&BTreeMap<String,String>,_:&[u8])->Result<BridgeResponse,String> {
         assert_eq!(method,"POST");assert!(url.ends_with("/requests/request-frame/last-frame?budget_id=budget-frame"));assert_eq!(headers["authorization"],"Bearer bridge-only");

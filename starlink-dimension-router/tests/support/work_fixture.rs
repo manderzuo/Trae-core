@@ -25,6 +25,10 @@ pub(crate) struct Bridge {
     pub(crate) assist_sends: AtomicUsize,
     pub(crate) unknown: std::sync::atomic::AtomicBool,
     pub(crate) tail_capability: std::sync::atomic::AtomicBool,
+    pub(crate) native_capability: std::sync::atomic::AtomicBool,
+    pub(crate) source_failure: std::sync::atomic::AtomicBool,
+    pub(crate) source_identity_bad: std::sync::atomic::AtomicBool,
+    pub(crate) source_reads: Mutex<Vec<String>>,
     pub(crate) frame_failure: std::sync::atomic::AtomicBool,
     pub(crate) frame_reads: AtomicUsize,
     pub(crate) billing_final: std::sync::atomic::AtomicBool,
@@ -90,8 +94,21 @@ impl BridgeTransport for Bridge {
                 body,
             });
         }
+        if url.contains("/content?") {
+            if self.source_failure.load(Ordering::SeqCst) {return Err("source unavailable".into());}
+            let claims=self.claims.lock().unwrap();
+            let (id,c)=claims.iter().find(|(id,_)|url.contains(&format!("/requests/{id}/content?budget_id=b-{id}"))).ok_or("missing exact content claim")?;
+            self.source_reads.lock().unwrap().push(id.clone());
+            let mut body=b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2".to_vec();body.extend_from_slice(id.as_bytes());
+            return Ok(BridgeResponse {status:200,headers:BTreeMap::from([
+                ("content-type".into(),"video/mp4".into()),("content-length".into(),body.len().to_string()),
+                ("x-aiwork-request-id".into(),id.clone()),("x-aiwork-budget-id".into(),format!("b-{id}")),
+                ("x-aiwork-core-key-id".into(),if self.source_identity_bad.load(Ordering::SeqCst) {"foreign-key".into()}else{c["core_key_id"].as_str().unwrap().into()}),
+                ("x-aiwork-account-ref".into(),"exclusive-account".into()),("x-aiwork-bridge-instance-id".into(),"fixture".into()),("x-aiwork-task-ref".into(),format!("video-{id}"))]),body});
+        }
         let value = if url.ends_with("/video-capabilities") {
-            json!({"tail_reference":self.tail_capability.load(Ordering::SeqCst),"native_first_frame":false,"native_video_extend":false,"contract_version":"tail-reference-v1","evidence_digest":"ab".repeat(32)})
+            let native=self.native_capability.load(Ordering::SeqCst);
+            json!({"tail_reference":self.tail_capability.load(Ordering::SeqCst),"native_first_frame":false,"native_video_extend":native,"contract_version":if native{"video-reference-continuation-v1"}else{"tail-reference-v1"},"evidence_digest":"ab".repeat(32)})
         } else if url.ends_with("/key-registry") {
             json!({"applied":true})
         } else if url.ends_with("/v1/assets") {
@@ -241,6 +258,10 @@ impl Fixture {
             assist_sends: AtomicUsize::new(0),
             unknown: std::sync::atomic::AtomicBool::new(false),
             tail_capability: std::sync::atomic::AtomicBool::new(true),
+            native_capability: std::sync::atomic::AtomicBool::new(false),
+            source_failure: std::sync::atomic::AtomicBool::new(false),
+            source_identity_bad: std::sync::atomic::AtomicBool::new(false),
+            source_reads: Mutex::new(Vec::new()),
             frame_failure: std::sync::atomic::AtomicBool::new(false),
             frame_reads: AtomicUsize::new(0),
             billing_final: std::sync::atomic::AtomicBool::new(false),

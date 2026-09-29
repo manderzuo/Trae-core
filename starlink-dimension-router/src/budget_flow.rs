@@ -472,7 +472,8 @@ pub(crate) fn finish_definite_failure(state:&StarlinkRouterState,request:&str,co
         "quota_insufficient"|"budget_policy_unconfigured"|"budget_policy_expired"|"budget_policy_invalid"|
         "reference_video_budget_metadata_required"|"invalid_budget_business_request"|"reference_image_limit"|
         "invalid_image_asset_ids"|"invalid_reference_image"|"video_continuation_not_authorized"|
-        "work_parent_required"|"work_decision_invalid"|"work_spec_unsupported"|"continuation_mode_unsupported") {
+        "work_parent_required"|"work_decision_invalid"|"work_spec_unsupported"|"continuation_mode_unsupported"|
+        "source_video_not_ready"|"source_video_unavailable"|"source_video_invalid"|"source_video_identity_invalid") {
         let _=state.store.finish_budget_execution(request,aiwork_core::BudgetExecutionState::Failed);
     }
 }

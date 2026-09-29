@@ -360,6 +360,8 @@ fn pin_and_bind(
     let mut snapshot = work_planner::merge_snapshot(base, d, &original)?;
     if let Some(c) = continuation {
         snapshot.tail_frame_media_id = c.tail_frame_media_id.clone();
+        snapshot.continuation_video_media_id = c.continuation_video_media_id.clone();
+        snapshot.effective_prompt = c.effective_prompt.clone();
         snapshot.reference_mode = c.reference_mode.clone();
     }
     snapshot.parent_version_id = if d.action == WorkIntent::Create {
@@ -371,14 +373,10 @@ fn pin_and_bind(
     let mut wire = json!({"model":"seedance","prompt":snapshot.effective_prompt,"duration":snapshot.duration,"resolution":snapshot.resolution,"ratio":snapshot.ratio,"watermark":snapshot.watermark});
     let mut image_assets = Vec::new();
     let mut video_assets = Vec::new();
-    let references = snapshot
-        .user_media_ids
+    let references = snapshot.continuation_video_media_id.iter().chain(snapshot.user_media_ids
         .iter()
-        .chain(snapshot.tail_frame_media_id.iter())
+        .chain(snapshot.tail_frame_media_id.iter()))
         .collect::<Vec<_>>();
-    if references.len() > 10 {
-        return Err("reference_image_limit".into());
-    }
     for id in references {
         let media = state
             .store
@@ -386,6 +384,10 @@ fn pin_and_bind(
             .map_err(|_| "work_media_unavailable")?
             .filter(|m| m.work_id == work.work_id)
             .ok_or("work_media_unavailable")?;
+        // The full immediate parent replaces historical video references;
+        // retaining every ancestor would exceed upstream limits and mix motion.
+        if snapshot.continuation_video_media_id.is_some() && media.kind=="video" && Some(id)!=snapshot.continuation_video_media_id.as_ref() {continue;}
+        if image_assets.len()+video_assets.len()>=10 {return Err("reference_image_limit".into());}
         let asset = crate::work_media::materialize(state, p, &media, now)?;
         let owned = crate::assets::read_owned(&state.store, &state.config.data_dir, p, &asset.id)
             .map_err(|_| "work_media_unavailable")?;
@@ -578,7 +580,6 @@ pub(crate) async fn execute(
             }
         }
         let continuation = if decision.action == WorkIntent::Continue {
-            state.seedance_results.progress(&request,Stage::Tail);
             let mut input = normalized.clone();
             input["prompt"] = json!(decision.effective_prompt);
             Some(
@@ -587,6 +588,7 @@ pub(crate) async fn execute(
                     p.clone(),
                     parent.as_ref().ok_or("work_parent_required")?.clone(),
                     input,
+                    &request,
                 )
                 .await?,
             )

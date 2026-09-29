@@ -2,13 +2,15 @@
 use serde_json::{json,Value};
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub(crate) enum Stage {Received,Restoring,Assistant,References,Tail,Submitting,SubmittingSegment,Processing,Delivery,QueryDelayed}
+pub(crate) enum Stage {Received,Restoring,Assistant,References,Tail,SourceVideo,Submitting,SubmittingSegment,Processing,Delivery,QueryDelayed}
 impl Stage {
     fn name(self)->&'static str {match self {
+        Self::SourceVideo=>"preparing_parent_video",
         Self::Received=>"received",Self::Restoring=>"restoring_version",Self::Tail=>"preparing_tail_frame",Self::SubmittingSegment=>"submitting_segment",Self::Assistant=>"organizing_prompt",Self::References=>"processing_references",
         Self::Submitting=>"submitting_video",Self::Processing=>"processing",Self::Delivery=>"preparing_download",Self::QueryDelayed=>"status_query_delayed",
     }}
     fn message(self)->&'static str {match self {
+        Self::SourceVideo=>"正在读取指定父版本的完整视频，用于续写新片段；尚未提交生成。",
         Self::Received=>"已接收请求，正在确认任务。",
         Self::Restoring=>"正在恢复指定版本的提示词、规格与参考素材。",
         Self::Tail=>"正在准备指定父版本的尾帧；新视频片段尚未提交。",
@@ -21,6 +23,7 @@ impl Stage {
         Self::QueryDelayed=>"暂时无法获取最新状态，系统会继续查询；无需重新提交。",
     }}
     fn waiting_message(self)->&'static str {match self {
+        Self::SourceVideo=>"仍在读取父版本完整视频；新片段尚未提交。",
         Self::Received=>"仍在确认任务状态。",
         Self::Restoring=>"仍在恢复指定版本。",
         Self::Tail=>"仍在准备父视频尾帧；新片段尚未提交。",
@@ -65,6 +68,8 @@ pub(crate) fn video_failure(result:&Value)->&'static str {
     }
 }
 pub(crate) fn message(code:&str)->&'static str {match code {
+    "source_video_not_ready"=>"父视频尚未确认完成，未提交续写片段。",
+    "source_video_unavailable"|"source_video_invalid"|"source_video_identity_invalid"=>"无法读取并核验指定父视频，已停止本次续写；没有改用尾帧或无素材生成，原视频不受影响。",
     "continuation_disabled"=>"续写功能尚未启用；本次未提交新的视频片段。",
     "continuation_mode_unsupported"=>"上游尚未验证所选续写模式；本次未提交新的视频片段。",
     "work_parent_unavailable"=>"指定的父视频版本不可用，不能续写；请检查版本编号与权限。",

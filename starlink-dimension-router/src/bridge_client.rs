@@ -222,6 +222,23 @@ impl BridgeClient {
         let headers=BTreeMap::from([("authorization".into(),format!("Bearer {}",self.bridge_secret)),("accept".into(),"video/mp4".into())]);
         self.transport.send_stream("GET",&format!("{}{path}",self.base_url),&headers,&[])
     }
+    pub fn source_video(&self,step:&aiwork_core::BudgetStepView)->Result<Vec<u8>,String> {
+        if step.kind!=aiwork_core::BudgetStepKind::Video || step.execution_state!=aiwork_core::BudgetExecutionState::Succeeded || step.task_ref.is_none() {
+            return Err("source_video_not_ready".into());
+        }
+        let response=self.budget_content(step).map_err(|_|"source_video_unavailable")?;
+        if response.status!=200 {return Err("source_video_unavailable".into());}
+        let header=|name:&str|response.headers.iter().find(|(k,_)|k.eq_ignore_ascii_case(name)).map(|(_,v)|v.as_str()).ok_or("source_video_identity_invalid");
+        for (name,expected) in [("x-aiwork-request-id",&step.request_id),("x-aiwork-budget-id",&step.budget_id),("x-aiwork-core-key-id",&step.core_key_id),("x-aiwork-account-ref",&step.account_ref),("x-aiwork-bridge-instance-id",&step.bridge_instance_id),("x-aiwork-task-ref",step.task_ref.as_ref().unwrap())] {
+            if header(name)?!=expected {return Err("source_video_identity_invalid".into());}
+        }
+        if header("content-type")?.split(';').next()!=Some("video/mp4") {return Err("source_video_invalid".into());}
+        let length=header("content-length")?.parse::<usize>().map_err(|_|"source_video_invalid")?;
+        if !(12..=crate::assets::MAX_ASSET_BYTES).contains(&length) {return Err("source_video_invalid".into());}
+        let bytes=read_bounded_response(response.body,crate::assets::MAX_ASSET_BYTES as u64).map_err(|_|"source_video_invalid")?;
+        if bytes.len()!=length || crate::assets::detect_format(&bytes).map(|x|x.0)!=Some("video/mp4") {return Err("source_video_invalid".into());}
+        Ok(bytes)
+    }
     pub fn new(base_url: impl Into<String>, bridge_secret: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -872,7 +889,7 @@ impl BridgeTransport for HttpBridgeTransport {
         for name in ["content-type","content-length","content-disposition","cache-control","retry-after",
             "x-aiwork-frame-width","x-aiwork-frame-height","x-aiwork-frame-timestamp-ms",
             "x-aiwork-source-sha256","x-aiwork-frame-sha256","x-aiwork-request-id",
-            "x-aiwork-budget-id","x-aiwork-core-key-id","x-aiwork-account-ref","x-aiwork-bridge-instance-id"] {
+            "x-aiwork-budget-id","x-aiwork-core-key-id","x-aiwork-account-ref","x-aiwork-bridge-instance-id","x-aiwork-task-ref"] {
             if let Some(value)=response.header(name) {response_headers.insert(name.into(),value.to_string());}
         }
         Ok(BridgeStreamingResponse {

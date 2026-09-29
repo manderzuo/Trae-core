@@ -324,11 +324,11 @@ pub fn decorate_owned_request(
     {
         let h = issue_handle(state, p, &v.work_id, Some(&v.version_id))?;
         let snapshot = read_snapshot(state, p, &v)?;
-        if snapshot.reference_mode == "tail_reference" {
+        if matches!(snapshot.reference_mode.as_str(),"tail_reference"|"native_video_extend") {
             if let Some(choices) = reply["choices"].as_array_mut() {
                 for choice in choices {
                     if let Some(text) = choice["message"]["content"].as_str().map(str::to_owned) {
-                        let notice="本段使用上一版本尾帧作近似参考，生成独立新片段；不是原生视频延长或严格首帧锁定。";
+                        let notice=if snapshot.reference_mode=="native_video_extend" {"本段根据上一版本的完整视频继续生成，是独立的新片段；原片保持不变，不自动拼接，也不保证严格首帧锁定。"}else{"本段使用上一版本尾帧作近似参考，生成独立新片段；不是原生视频延长或严格首帧锁定。"};
                         if !text.contains(notice) {
                             choice["message"]["content"] = json!(format!("{text}\n\n{notice}"));
                         }
