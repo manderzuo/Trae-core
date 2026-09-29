@@ -3,6 +3,28 @@ mod fixture;
 use fixture::*;
 
 #[tokio::test]
+async fn async_direct_helper_prepare_rejection_is_failed_not_permanently_queued() {
+    let f=Fixture::new();
+    f.bridge.assist_prepare_failure.store(true,Ordering::SeqCst);
+    let response=f.app.clone().oneshot(Request::post("/v1/videos/generations").header("authorization",format!("Bearer {}",f.key)).header("idempotency-key","direct-policy-failure").header("content-type","application/json").body(Body::from(json!({"model":"seedance","prompt":"生成橘猫散步视频","duration":5,"resolution":"480p","ratio":"16:9"}).to_string())).unwrap()).await.unwrap();
+    assert_eq!(response.status(),StatusCode::ACCEPTED);
+    let accepted:Value=serde_json::from_slice(&to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+    let rid=accepted["request_id"].as_str().unwrap();
+    for _ in 0..50 {
+        if f.state.store.request_state(rid).unwrap()==aiwork_core::RequestState::Failed {break;}
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(f.state.store.request_state(rid).unwrap(),aiwork_core::RequestState::Failed,"pre-admission failure must terminate parent and release preparation slot");
+    assert!(f.state.store.budget_operation(rid).unwrap().is_none());
+    let status=f.app.clone().oneshot(Request::get(format!("/v1/videos/{rid}")).header("authorization",format!("Bearer {}",f.key)).body(Body::empty()).unwrap()).await.unwrap();
+    let status:Value=serde_json::from_slice(&to_bytes(status.into_body(),65536).await.unwrap()).unwrap();
+    assert_eq!(status["task"]["status"],"failed");
+    assert_eq!(status["task"]["error"]["code"],"budget_not_sent");
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),0);
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+}
+
+#[tokio::test]
 async fn non_gray_key_keeps_legacy_generation_without_work_version() {
     let f = Fixture::with_gray_keys(true, Some(vec!["key_some_other_key".into()]));
     let first = f.chat("non-gray", &create()).await;

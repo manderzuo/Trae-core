@@ -135,7 +135,9 @@ pub(crate) async fn video_status(state:Arc<StarlinkRouterState>,principal:Princi
         let Some(step)=owned_video_step(&state,&principal,&request)? else {
             if state.config.work_context_for_key(&principal.key_id) && state.store.active_principal_for_request(&request).map_err(|_|"work_context_unavailable")?.is_some_and(|p|p.key_id==principal.key_id&&p.user_id==principal.user_id) {
                 let failed=state.store.budget_operation(&request).map_err(|_|"work_context_unavailable")?.is_some_and(|op|matches!(op.execution_state,aiwork_core::BudgetExecutionState::Failed|aiwork_core::BudgetExecutionState::Canceled)) || state.store.request_state(&request).map_err(|_|"work_context_unavailable")?==aiwork_core::RequestState::Failed;
-                return Ok(Some(json!({"task":{"id":request,"status":if failed {"failed"}else{"queued"}},"request_id":request})));
+                let mut reply=json!({"task":{"id":request,"status":if failed {"failed"}else{"queued"}},"request_id":request});
+                if failed {reply["task"]["error"]=failure_feedback(&state,"budget_not_sent",&request)["error"].clone();}
+                return Ok(Some(reply));
             }
             return Ok(None);
         };

@@ -525,7 +525,7 @@ pub(crate) async fn execute(
             let s = state.clone();
             let p = p.clone();
             let parent = request.clone();
-            tokio::task::spawn_blocking(move || {
+            let prepared=tokio::task::spawn_blocking(move || {
                 crate::budget_flow::prepare_step(
                     &s,
                     &p,
@@ -537,7 +537,18 @@ pub(crate) async fn execute(
                 )
             })
             .await
-            .map_err(|_| "assist_worker_unavailable")??
+            .map_err(|_| "assist_worker_unavailable")?;
+            match prepared {
+                Ok(step)=>step,
+                Err(error)=>{
+                    // Core records dispatch before paid I/O. This existing CAS
+                    // aborts only a preparation with no execution/billing evidence;
+                    // admitted or unknown paid work is retained, never refunded.
+                    let code=crate::budget_errors::public_code(&error).unwrap_or("assist_preparation_failed");
+                    let _=state.store.abort_budget_preparation(&request,code);
+                    return Err(error);
+                }
+            }
         };
         let result = crate::budget_flow::wait_result(state.clone(), assist).await?;
         if result
@@ -833,6 +844,7 @@ pub(crate) async fn submit_direct(
                 Err(code) => Err(code.clone()),
             };
             if let Err(code) = &outcome {
+                eprintln!("video work {rid} failed: {}",crate::budget_errors::public_code(code).unwrap_or("work_execution_requires_attention"));
                 crate::budget_flow::finish_definite_failure(&state, &rid, code);
                 reflect_failure(&state, &rid, code);
                 if fresh {
