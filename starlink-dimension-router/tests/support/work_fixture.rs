@@ -29,6 +29,7 @@ pub(crate) struct Bridge {
     pub(crate) frame_reads: AtomicUsize,
     pub(crate) billing_final: std::sync::atomic::AtomicBool,
     pub(crate) assist_prepare_failure: std::sync::atomic::AtomicBool,
+    pub(crate) assist_prepare_panic: std::sync::atomic::AtomicBool,
 }
 impl BridgeTransport for Bridge {
     fn send(
@@ -43,6 +44,7 @@ impl BridgeTransport for Bridge {
             Some("Bearer bridge-only")
         );
         let input: Value = serde_json::from_slice(raw).unwrap_or(Value::Null);
+        if url.ends_with("/budgets/prepare") && input["step_kind"]=="assist" && self.assist_prepare_panic.load(Ordering::SeqCst) {panic!("simulated preparation worker interruption");}
         if url.ends_with("/budgets/prepare") && input["step_kind"]=="assist" && self.assist_prepare_failure.load(Ordering::SeqCst) {
             return Ok(BridgeResponse {status:503,headers:BTreeMap::new(),body:serde_json::to_vec(&json!({"error":{"code":"budget_policy_unconfigured"}})).unwrap()});
         }
@@ -241,6 +243,7 @@ impl Fixture {
             frame_reads: AtomicUsize::new(0),
             billing_final: std::sync::atomic::AtomicBool::new(false),
             assist_prepare_failure: std::sync::atomic::AtomicBool::new(false),
+            assist_prepare_panic: std::sync::atomic::AtomicBool::new(false),
         });
         let mut config = RouterConfig::defaults(dir.clone());
         config.budget_billing_v2 = true;

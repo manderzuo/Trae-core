@@ -844,7 +844,12 @@ pub(crate) async fn submit_direct(
                 Err(code) => Err(code.clone()),
             };
             if let Err(code) = &outcome {
-                eprintln!("video work {rid} failed: {}",crate::budget_errors::public_code(code).unwrap_or("work_execution_requires_attention"));
+                let safe=crate::budget_errors::public_code(code).unwrap_or("work_execution_requires_attention");
+                eprintln!("video work {rid} failed: {safe}");
+                // Covers interrupted workers and replayed orphan preparations,
+                // not only ordinary helper rejection. The store CAS refuses
+                // termination if any execution/billing evidence exists.
+                let _=state.store.abort_budget_preparation(&rid,safe);
                 crate::budget_flow::finish_definite_failure(&state, &rid, code);
                 reflect_failure(&state, &rid, code);
                 if fresh {

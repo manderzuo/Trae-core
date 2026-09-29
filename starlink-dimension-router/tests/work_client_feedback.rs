@@ -3,6 +3,24 @@ mod fixture;
 use fixture::*;
 
 #[tokio::test]
+async fn interrupted_async_preparation_is_terminal_without_paid_send() {
+    let f=Fixture::new();
+    f.bridge.assist_prepare_panic.store(true,Ordering::SeqCst);
+    let response=f.app.clone().oneshot(Request::post("/v1/videos/generations").header("authorization",format!("Bearer {}",f.key)).header("idempotency-key","direct-worker-interrupted").header("content-type","application/json").body(Body::from(json!({"model":"seedance","prompt":"生成橘猫散步视频","duration":5,"resolution":"480p","ratio":"16:9"}).to_string())).unwrap()).await.unwrap();
+    assert_eq!(response.status(),StatusCode::ACCEPTED);
+    let accepted:Value=serde_json::from_slice(&to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+    let rid=accepted["request_id"].as_str().unwrap();
+    for _ in 0..50 {
+        if f.state.store.request_state(rid).unwrap()==aiwork_core::RequestState::Failed {break;}
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(f.state.store.request_state(rid).unwrap(),aiwork_core::RequestState::Failed,"worker interruption must not leave an unsent parent queued forever");
+    assert!(f.state.store.budget_operation(rid).unwrap().is_none());
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),0);
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+}
+
+#[tokio::test]
 async fn async_direct_helper_prepare_rejection_is_failed_not_permanently_queued() {
     let f=Fixture::new();
     f.bridge.assist_prepare_failure.store(true,Ordering::SeqCst);

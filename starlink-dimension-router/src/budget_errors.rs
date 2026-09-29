@@ -21,6 +21,8 @@ pub(crate) fn public_code(code:&str)->Option<&'static str> {
         "invalid_chat_image"=>"invalid_chat_image",
         "budget_chat_input_too_large"=>"budget_chat_input_too_large",
         "budget_preparation_failed"=>"budget_preparation_failed",
+        "budget_preparation_requires_recovery"=>"budget_preparation_requires_recovery",
+        "assist_worker_unavailable"=>"assist_worker_unavailable",
         "budget_dispatch_not_accepted"=>"budget_dispatch_not_accepted",
         "bridge_state_unavailable"=>"bridge_state_unavailable",
         "key_concurrency_exceeded"=>"key_concurrency_exceeded",
