@@ -214,7 +214,10 @@ pub fn parse_decision(raw: &str) -> Result<WorkDecision, String> {
     if raw.len() > 16 * 1024 {
         return Err(invalid());
     }
-    let d: WorkDecision = serde_json::from_str(raw.trim()).map_err(|_| invalid())?;
+    let mut d: WorkDecision = serde_json::from_str(raw.trim()).map_err(|_| invalid())?;
+    // GLM may emit null when this turn changes no specification. Null is
+    // exactly an empty patch, never permission to invent defaults or fields.
+    if d.spec_patch.is_null() {d.spec_patch=json!({});}
     if !matches!(
         d.reference_policy.as_str(),
         "inherit" | "replace" | "merge" | "clear"

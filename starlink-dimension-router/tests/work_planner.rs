@@ -44,6 +44,20 @@ fn revise_inherits_unspecified_fields() {
     assert_eq!(s.user_media_ids, vec!["old-image"]);
     assert!(s.effective_prompt.contains("放慢"));
 }
+
+#[test]
+fn glm_null_spec_patch_means_no_change_not_invalid_revision() {
+    let raw=json!({"action":"revise","effective_prompt":"红色绸布在柔和月光下起伏","spec_patch":null,"reference_policy":"inherit","clarification":null}).to_string();
+    let d=work_planner::parse_decision(&raw).unwrap();
+    assert_eq!(d.spec_patch,json!({}));
+    let s=work_planner::merge_snapshot(Some(&base()),&d,&body("改成夜景，其他不变")).unwrap();
+    assert_eq!((s.duration,s.resolution.as_str(),s.ratio.as_str()),(10,"720p","9:16"));
+    assert_eq!(s.user_media_ids,vec!["old-image"]);
+    for invalid in [json!([]),json!(""),json!({"core_key_id":"foreign"})] {
+        let mut value:Value=serde_json::from_str(&raw).unwrap();value["spec_patch"]=invalid;
+        assert!(work_planner::parse_decision(&value.to_string()).is_err());
+    }
+}
 #[test]
 fn current_explicit_spec_wins() {
     let mut b = body("改成5秒480P 16:9");
