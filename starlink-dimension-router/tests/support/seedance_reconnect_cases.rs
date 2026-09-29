@@ -2,7 +2,7 @@
 use super::*;
 use std::{sync::atomic::AtomicBool,time::Duration};
 
-struct DelayedBridge {inner:Bridge,kind:&'static str,open:AtomicBool,seen:AtomicUsize,fail:bool,query_outage:AtomicBool,query_unknown:AtomicBool,missing_task_ref:AtomicBool,failure_reason:Mutex<String>,result_task_id:Mutex<String>}
+struct DelayedBridge {inner:Bridge,kind:&'static str,open:AtomicBool,seen:AtomicUsize,fail:bool,query_outage:AtomicBool,query_unknown:AtomicBool,missing_task_ref:AtomicBool,failure_reason:Mutex<String>,failure_detail:Mutex<Option<Value>>,result_task_id:Mutex<String>}
 impl BridgeTransport for DelayedBridge {
     fn send(&self,method:&str,url:&str,headers:&BTreeMap<String,String>,body:&[u8])->Result<BridgeResponse,String> {
         let mut response=self.inner.send(method,url,headers,body)?;
@@ -16,7 +16,7 @@ impl BridgeTransport for DelayedBridge {
                 if url.contains("/result?") {self.seen.fetch_add(1,Ordering::SeqCst);value["status"]=json!("not_ready");value["result"]=Value::Null;}
                 else {value["status"]=json!("running");value["execution"]["state"]=json!("running");value["execution"]["finished_at_ms"]=Value::Null;value["execution"]["result_available"]=json!(false);}
             } else if self.fail {
-                if url.contains("/result?") {value["result"]=json!({"id":"native-video","status":"failed","error":self.failure_reason.lock().unwrap().clone()});}
+                if url.contains("/result?") {value["result"]=self.failure_detail.lock().unwrap().clone().unwrap_or_else(||json!({"id":"native-video","status":"failed","error":self.failure_reason.lock().unwrap().clone()}));}
                 else {value["status"]=json!("failed");value["execution"]["state"]=json!("failed");}
             }
             if self.query_unknown.load(Ordering::SeqCst) && url.contains("/execution?") {
@@ -41,7 +41,7 @@ impl Fixture {
         let k=store.issue_api_key_as_admin_with_max_concurrency("user","Key",BTreeSet::from(["videos:submit".into(),"assets:write".into()]),1,&admin).unwrap();
         store.key_quota_grant_as_admin(&admin,KeyQuotaGrant {api_key_id:k.id.clone(),resource_kind:"credits".into(),amount:500_000_000,actor_user_id:"admin".into(),reason:"isolated".into()}).unwrap();
         store.set_video_billing_control(aiwork_core::VideoBillingControlInput {mode:aiwork_core::VideoBillingMode::Active,reason:"fixture".into(),diagnostic_key_id:None,diagnostic_request_hash:None}).unwrap();
-        let bridge=Arc::new(DelayedBridge {inner:Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent:true,large_downloads:AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0)),download_status:AtomicUsize::new(200)},kind,open:AtomicBool::new(false),seen:AtomicUsize::new(0),fail,query_outage:AtomicBool::new(false),query_unknown:AtomicBool::new(false),missing_task_ref:AtomicBool::new(false),failure_reason:Mutex::new(String::new()),result_task_id:Mutex::new("native-video".into())});
+        let bridge=Arc::new(DelayedBridge {inner:Bridge {claims:Mutex::new(BTreeMap::new()),sends:AtomicUsize::new(0),video_intent:true,large_downloads:AtomicBool::new(false),active_downloads:Arc::new(AtomicUsize::new(0)),download_status:AtomicUsize::new(200)},kind,open:AtomicBool::new(false),seen:AtomicUsize::new(0),fail,query_outage:AtomicBool::new(false),query_unknown:AtomicBool::new(false),missing_task_ref:AtomicBool::new(false),failure_reason:Mutex::new(String::new()),failure_detail:Mutex::new(None),result_task_id:Mutex::new("native-video".into())});
         let principal=store.authenticate_api_key(&k.plaintext).unwrap();
         let mut cfg=RouterConfig::defaults(dir.path().into());cfg.budget_billing_v2=true;cfg.public_base_url="https://core.example".into();
         let state=StarlinkRouterState::for_test(store,BridgeClient::from_transport("http://bridge","bridge-only",bridge.clone()),cfg);
@@ -217,6 +217,72 @@ async fn seedance_feedback_safety_failure_is_readable_for_stream_and_nonstream()
     let value:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
     assert_eq!(value["error"]["code"],"video_safety_check_failed");
     assert!(value["error"]["message"].as_str().unwrap().contains("安全检查未通过"));
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn seedance_feedback_preserves_unknown_upstream_reason_across_stream_replay_and_query() {
+    let f=Fixture::new("video",true);
+    *f.bridge.failure_reason.lock().unwrap()="Reference video exceeds supported duration; token=private-token; https://internal.example/task?ticket=private-ticket".into();
+    let first=f.request(f.body(true,false),true).await;f.waiting().await;
+    f.bridge.open.store(true,Ordering::SeqCst);
+    let result=read_stream(first).await;
+    let request=result["request_id"].as_str().unwrap().to_string();
+    let message=result["error"]["message"].as_str().unwrap();
+    assert!(message.contains("Reference video exceeds supported duration"),"an unrecognized cause must not be replaced by a generic server error: {message}");
+    assert!(!result.to_string().contains("private-token"));
+    assert!(!result.to_string().contains("internal.example"));
+    assert!(!result.to_string().contains("private-ticket"));
+    assert!(!message.contains("安全检查未通过"));
+    assert!(!message.contains("未扣费"));
+    let replay=read_stream(f.request(f.body(true,false),true).await).await;
+    assert_eq!(replay["error"],result["error"]);
+    // An empty in-flight registry simulates a Core restart. The durable bridge
+    // result, not a transient map, must supply exactly the same error.
+    let restarted=StarlinkRouterState::for_test(f.state.store.clone(),BridgeClient::from_transport("http://bridge","bridge-only",f.bridge.clone()),f.state.config.clone());
+    let response=user_routes::video_task(State(restarted),axum::extract::Path(request.clone()),HeaderMap::new(),Extension(f.principal.clone())).await;
+    assert_eq!(response.status(),StatusCode::OK);
+    let query:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+    assert_eq!(query["task"]["error"],result["error"]);
+    assert_eq!(f.bridge.inner.sends.load(Ordering::SeqCst),2,"replay/query must never redispatch");
+    let mut other=f.principal.clone();other.key_id="other-key".into();
+    let response=user_routes::video_task(State(f.state.clone()),axum::extract::Path(request),HeaderMap::new(),Extension(other)).await;
+    assert_eq!(response.status(),StatusCode::NOT_FOUND,"another Key cannot read a failure reason");
+    // A separately submitted non-stream request exercises that response format.
+    let response=f.request(f.body(false,false),false).await;
+    assert_eq!(response.status(),StatusCode::UNPROCESSABLE_ENTITY,"a confirmed upstream failure must not appear as a gateway 503");
+    let nonstream:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+    assert_eq!(nonstream["error"]["message"],result["error"]["message"]);
+    assert_eq!(nonstream["error"]["upstream"],result["error"]["upstream"]);
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn seedance_feedback_http_provider_code_is_preserved_without_raw_body() {
+    let f=Fixture::new("video",true);
+    *f.bridge.failure_reason.lock().unwrap()=r#"Seedance 上游 HTTP 422: {"error":{"code":"INVALID_DURATION","message":"Reference duration exceeds maximum","account_id":"private-account"},"token":"private-token"}"#.into();
+    let response=f.request(f.body(true,false),true).await;f.waiting().await;f.bridge.open.store(true,Ordering::SeqCst);
+    let result=read_stream(response).await;
+    assert_eq!(result["error"]["upstream"]["code"],"INVALID_DURATION");
+    assert_eq!(result["error"]["upstream"]["http_status"],422);
+    assert!(result["error"]["message"].as_str().unwrap().contains("Reference duration exceeds maximum"));
+    assert!(!result.to_string().contains("private-account"));assert!(!result.to_string().contains("private-token"));
+    assert_eq!(result["error"]["billing_state"],"pending");
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn seedance_feedback_structured_bridge_failure_survives_restart_query() {
+    let f=Fixture::new("video",true);
+    *f.bridge.failure_detail.lock().unwrap()=Some(json!({"id":"native-video","status":"failed","error":"Reference duration exceeds maximum","upstream_error":{"code":"INVALID_DURATION","message":"Reference duration exceeds maximum","http_status":422}}));
+    let response=f.request(f.body(true,false),true).await;f.waiting().await;f.bridge.open.store(true,Ordering::SeqCst);
+    let streamed=read_stream(response).await;
+    assert_eq!(streamed["error"]["upstream"]["code"],"INVALID_DURATION");
+    assert_eq!(streamed["error"]["upstream"]["http_status"],422);
+    assert_eq!(streamed["error"]["billing_state"],"pending");
+    let restarted=StarlinkRouterState::for_test(f.state.store.clone(),BridgeClient::from_transport("http://bridge","bridge-only",f.bridge.clone()),f.state.config.clone());
+    let id=streamed["request_id"].as_str().unwrap().to_string();
+    let response=user_routes::video_task(State(restarted),axum::extract::Path(id),HeaderMap::new(),Extension(f.principal.clone())).await;
+    let queried:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+    assert_eq!(queried["task"]["error"],streamed["error"]);
+    assert_eq!(f.bridge.inner.sends.load(Ordering::SeqCst),2);
 }
 
 #[tokio::test(flavor="multi_thread",worker_threads=4)]

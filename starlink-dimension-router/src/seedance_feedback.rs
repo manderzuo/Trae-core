@@ -59,12 +59,30 @@ fn event(request:&str,progress:&Progress,elapsed_secs:u64,kind:&str,text:&str)->
 }
 
 pub(crate) fn video_failure(result:&Value)->&'static str {
-    let reason=result["error"].as_str().or_else(||result.pointer("/error/message").and_then(Value::as_str)).unwrap_or("").trim().to_ascii_lowercase();
+    let detail=aiwork_core::UpstreamFailure::from_value(result);
+    let reason=detail.message.as_deref().unwrap_or("").trim().to_ascii_lowercase();
     match reason.as_str() {
         "video security check failed"=>"video_safety_check_failed",
         "image security check failed"=>"reference_safety_check_failed",
         "text security check failed"=>"prompt_safety_check_failed",
         _=>"video_execution_failed",
+    }
+}
+
+/// Only verified result payloads may populate upstream details. Infrastructure
+/// errors use the safe code allowlist and never expose raw Rust/network errors.
+#[derive(Clone,Debug,PartialEq,Eq)]
+pub(crate) struct Failure {
+    pub code: &'static str,
+    pub upstream: Option<aiwork_core::UpstreamFailure>,
+}
+impl From<&str> for Failure {
+    fn from(code:&str)->Self {Self {code:crate::budget_errors::public_code(code).unwrap_or("seedance_budget_execution_failed"),upstream:None}}
+}
+impl From<String> for Failure {fn from(code:String)->Self {Self::from(code.as_str())}}
+impl Failure {
+    pub fn video(result:&Value)->Self {
+        Self {code:video_failure(result),upstream:Some(aiwork_core::UpstreamFailure::from_value(result))}
     }
 }
 pub(crate) fn message(code:&str)->&'static str {match code {
@@ -101,12 +119,20 @@ pub(crate) fn message(code:&str)->&'static str {match code {
     "budget_preparation_busy"=>"系统正在处理较多任务，请稍后重试。",
     _=>"暂时无法完成本次任务结果的核验，请保留任务编号以便继续查询。",
 }}
-pub(crate) fn failure_value(request:&str,code:&str,settled:bool)->Value {
+pub(crate) fn failure_value(request:&str,failure:&Failure,settled:bool)->Value {
+    let code=failure.code;
     let billing=if settled {"积分已结算，可在 Key 使用记录查看实际扣费。"} else {"积分尚在核对，系统会按真实回执结算。"};
-    let text=format!("{} {billing}",message(code));
-    json!({"id":format!("chatcmpl-{request}"),"object":"chat.completion.chunk","model":"seedance","created":chrono::Utc::now().timestamp(),
+    let reason=match &failure.upstream {
+        Some(detail) if code=="video_execution_failed"=>format!("上游返回：{}。",detail.description()),
+        Some(detail)=>format!("{} 上游原始说明：{}。",message(code),detail.description()),
+        None=>message(code).into(),
+    };
+    let text=format!("{reason} {billing}");
+    let mut value=json!({"id":format!("chatcmpl-{request}"),"object":"chat.completion.chunk","model":"seedance","created":chrono::Utc::now().timestamp(),
         "request_id":request,"error":{"type":"api_error","code":code,"message":text,"request_id":request,"billing_state":if settled {"settled"} else {"pending"}},
-        "choices":[{"index":0,"delta":{"role":"assistant","content":text},"finish_reason":"stop"}]})
+        "choices":[{"index":0,"delta":{"role":"assistant","content":text},"finish_reason":"stop"}]});
+    if let Some(detail)=&failure.upstream {value["error"]["upstream"]=json!(detail);}
+    value
 }
 
 #[cfg(test)]

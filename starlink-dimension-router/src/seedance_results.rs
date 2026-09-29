@@ -4,7 +4,7 @@ use serde_json::Value;
 use tokio::sync::{watch,OwnedSemaphorePermit,Semaphore};
 use crate::seedance_feedback::{Progress,Stage};
 
-type Outcome=Result<Value,String>;
+type Outcome=Result<Value,crate::seedance_feedback::Failure>;
 type SharedOutcome=Option<Arc<Outcome>>;
 struct Entry {receiver:watch::Receiver<SharedOutcome>,progress:watch::Sender<Progress>}
 pub(crate) struct SeedanceResults {
@@ -82,7 +82,7 @@ mod tests {
         let owner=owner.unwrap();let (ready,entered)=tokio::sync::oneshot::channel();
         let task=tokio::spawn(async move {let _owner=owner;ready.send(()).unwrap();std::future::pending::<()>().await;});
         entered.await.unwrap();task.abort();assert!(task.await.unwrap_err().is_cancelled());
-        for waiter in [first,second] {assert_eq!(tokio::time::timeout(Duration::from_secs(1),waiter.result()).await.unwrap().unwrap_err(),"seedance_budget_execution_failed");}
+        for waiter in [first,second] {assert_eq!(tokio::time::timeout(Duration::from_secs(1),waiter.result()).await.unwrap().unwrap_err().code,"seedance_budget_execution_failed");}
         assert!(registry.entries.lock().unwrap().is_empty());assert_eq!(registry.slots.available_permits(),256);
         let (_,owner)=registry.subscribe("one").unwrap();assert!(owner.is_some());
     }

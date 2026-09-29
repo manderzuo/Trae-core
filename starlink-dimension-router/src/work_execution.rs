@@ -481,7 +481,7 @@ pub(crate) async fn execute(
     original: Value,
     fresh: bool,
     dispatch_only: bool,
-) -> Result<Value, String> {
+) -> Result<Value, crate::seedance_feedback::Failure> {
     use crate::seedance_feedback::Stage;
     let operation = state
         .store
@@ -498,10 +498,10 @@ pub(crate) async fn execute(
         let parent = parent(&state, &p, &binding)?;
         if parent.is_some(){state.seedance_results.progress(&request,Stage::Restoring);}
         if let Some(text) = &binding.clarification {
-            return finish_read_only(&state, &p, &request, parent.as_ref(), text);
+            return finish_read_only(&state, &p, &request, parent.as_ref(), text).map_err(Into::into);
         }
         if let Some(d) = work_planner::read_only_decision(&original, parent.is_some()) {
-            return read_only(&state, &p, &request, parent.as_ref(), &d, &original).await;
+            return read_only(&state, &p, &request, parent.as_ref(), &d, &original).await.map_err(Into::into);
         }
         let base = parent
             .as_ref()
@@ -572,7 +572,7 @@ pub(crate) async fn execute(
                     // aborts only a preparation with no execution/billing evidence;
                     // admitted or unknown paid work is retained, never refunded.
                     crate::budget_flow::abort_preparation_failure(&state,&request,&error);
-                    return Err(error);
+                    return Err(error.into());
                 }
             }
         };
@@ -592,7 +592,7 @@ pub(crate) async fn execute(
         )?;
         work_planner::resolve_uploaded_video_action(&mut decision, parent.is_some(), &normalized);
         if decision.paid_action().is_none() {
-            return read_only(&state, &p, &request, parent.as_ref(), &decision, &original).await;
+            return read_only(&state, &p, &request, parent.as_ref(), &decision, &original).await.map_err(Into::into);
         }
         if let Some(explicit) = original["action"].as_str() {
             if serde_json::to_value(decision.action)
@@ -701,11 +701,11 @@ pub(crate) async fn execute(
     }
     let result = crate::budget_flow::wait_result(state.clone(), step).await?;
     if result["status"] != "completed" {
-        return Err(crate::seedance_feedback::video_failure(&result).into());
+        return Err(crate::seedance_feedback::Failure::video(&result));
     }
     complete_version(&state, &p, &request)?;
     state.seedance_results.progress(&request, Stage::Delivery);
-    crate::video_delivery::completion(&state, &p, &request, &original).await
+    crate::video_delivery::completion(&state, &p, &request, &original).await.map_err(Into::into)
 }
 pub(crate) fn complete_version(
     state: &Arc<StarlinkRouterState>,
@@ -870,9 +870,10 @@ pub(crate) async fn submit_direct(
                     )
                     .await
                 }
-                Err(code) => Err(code.clone()),
+                Err(code) => Err(code.clone().into()),
             };
-            if let Err(code) = &outcome {
+            if let Err(failure) = &outcome {
+                let code=failure.code;
                 let safe=crate::budget_errors::public_code(code).unwrap_or("work_execution_requires_attention");
                 eprintln!("video work {rid} failed: {safe}");
                 // Covers interrupted workers and replayed orphan preparations,

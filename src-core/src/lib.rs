@@ -1,4 +1,6 @@
 mod cost;
+mod upstream_failure;
+pub use upstream_failure::UpstreamFailure;
 mod budget_billing;
 mod budget_continuation;
 pub use budget_continuation::BudgetContinuation;
