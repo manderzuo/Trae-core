@@ -238,6 +238,19 @@ pub fn parse_decision(raw: &str) -> Result<WorkDecision, String> {
     }
     Ok(d)
 }
+
+/// An explicitly uploaded source video is usable without a stored parent.
+/// "Continue" in the prompt can mean extending that file, not Core's
+/// tail-frame workflow. Keep the full video and prompt; never claim native
+/// extension support from this routing decision alone.
+pub fn resolve_uploaded_video_action(decision: &mut WorkDecision, has_parent: bool, body: &Value) {
+    if !has_parent && decision.action == WorkIntent::Continue
+        && matches!(body["action"].as_str(), None | Some("create"))
+        && body["video_asset_ids"].as_array().is_some_and(|a| !a.is_empty())
+    {
+        decision.action = WorkIntent::Create;
+    }
+}
 fn validate_spec(v: &Value) -> Result<(), String> {
     let fields = v.as_object().ok_or_else(invalid)?;
     for (field, val) in fields {

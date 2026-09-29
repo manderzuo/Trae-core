@@ -2,6 +2,34 @@
 mod fixture;
 use fixture::*;
 #[tokio::test]
+async fn source_video_extension_preserves_full_asset_without_tail_fallback() {
+    use starlink_dimension_router::assets::{self,ParsedAssetUpload};
+    let f=Fixture::new();
+    let stored=assets::write_asset(&f.state.config.data_dir,&f.owner,ParsedAssetUpload{filename:"source.mp4".into(),declared_mime:Some("video/mp4".into()),bytes:b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2".to_vec()}).unwrap();
+    let asset=assets::persist_asset(&f.state.store,&f.owner,&stored).unwrap();
+    *f.bridge.helper_decision.lock().unwrap()=Some(json!({"action":"continue","effective_prompt":"保留原视频前5秒，再向后延长5秒","spec_patch":{"duration":10},"reference_policy":"replace","clarification":null}));
+    let b=json!({"model":"seedance","duration":10,"resolution":"480p","ratio":"16:9","video_asset_ids":[asset.id],"messages":[{"role":"user","content":"向后延长上传视频"}]});
+    let result=f.chat("source-video-extend",&b).await;
+    let version=f.state.store.work_version_for_request(&f.owner,result["request_id"].as_str().unwrap()).unwrap().unwrap();
+    assert_eq!(version.action,aiwork_core::WorkAction::Create);
+    assert!(version.parent_version_id.is_none());
+    let snapshot=work_context::read_snapshot(&f.state,&f.owner,&version).unwrap();
+    assert!(snapshot.tail_frame_media_id.is_none());
+    assert_eq!(snapshot.user_media_ids.len(),1);
+    let media=f.state.store.owned_work_media(&f.owner,&snapshot.user_media_ids[0]).unwrap().unwrap();
+    assert_eq!(media.content_sha256,asset.sha256);
+    let wire=snapshot.dispatch_body.unwrap();
+    assert_eq!(wire["duration"],10);
+    assert_eq!(wire["prompt"],"保留原视频前5秒,再向后延长5秒");
+    assert_eq!(wire["video_asset_ids"].as_array().unwrap().len(),1);
+    assert!(wire["image_asset_ids"].is_null());
+    assert_eq!(f.bridge.frame_reads.load(Ordering::SeqCst),0);
+    let replay=f.chat("source-video-extend",&b).await;
+    assert_eq!(replay["request_id"],result["request_id"]);
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),1);
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);
+}
+#[tokio::test]
 async fn request_unique_binding() {
     let f = Fixture::new();
     let result = f.chat("create", &create()).await;

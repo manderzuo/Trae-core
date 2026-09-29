@@ -558,12 +558,13 @@ pub(crate) async fn execute(
         {
             return Err("work_decision_invalid".into());
         }
-        let decision = work_planner::parse_decision(
+        let mut decision = work_planner::parse_decision(
             result
                 .pointer("/choices/0/message/content")
                 .and_then(Value::as_str)
                 .ok_or("work_decision_invalid")?,
         )?;
+        work_planner::resolve_uploaded_video_action(&mut decision, parent.is_some(), &normalized);
         if decision.paid_action().is_none() {
             return read_only(&state, &p, &request, parent.as_ref(), &decision, &original).await;
         }

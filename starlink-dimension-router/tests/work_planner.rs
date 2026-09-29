@@ -30,6 +30,22 @@ fn body(text: &str) -> Value {
     json!({"messages":[{"role":"user","content":text}]})
 }
 #[test]
+fn uploaded_video_extension_uses_owned_source_instead_of_guessing_parent() {
+    let raw=json!({"action":"continue","effective_prompt":"延长上传的视频，保留前5秒，再续拍5秒","spec_patch":{"duration":10},"reference_policy":"replace","clarification":null});
+    let mut d=work_planner::parse_decision(&raw.to_string()).unwrap();
+    let b=json!({"video_asset_ids":["owned-video"],"duration":10,"resolution":"480p","ratio":"16:9"});
+    work_planner::resolve_uploaded_video_action(&mut d,false,&b);
+    let snapshot=work_planner::merge_snapshot(None,&d,&b).unwrap();
+    assert_eq!(d.action,WorkIntent::Create);
+    assert_eq!(snapshot.duration,10);
+    assert!(snapshot.effective_prompt.contains("保留前5秒"));
+    for (has_parent,input) in [(true,b.clone()),(false,json!({})),(false,json!({"image_asset_ids":["image"]})),(false,json!({"action":"continue","video_asset_ids":["owned-video"]}))] {
+        let mut d=work_planner::parse_decision(&raw.to_string()).unwrap();
+        work_planner::resolve_uploaded_video_action(&mut d,has_parent,&input);
+        assert_eq!(d.action,WorkIntent::Continue,"explicit parent continuation must not downgrade");
+    }
+}
+#[test]
 fn revise_inherits_unspecified_fields() {
     let s = work_planner::merge_snapshot(
         Some(&base()),

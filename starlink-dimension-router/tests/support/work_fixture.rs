@@ -30,6 +30,7 @@ pub(crate) struct Bridge {
     pub(crate) billing_final: std::sync::atomic::AtomicBool,
     pub(crate) assist_prepare_failure: std::sync::atomic::AtomicBool,
     pub(crate) assist_prepare_panic: std::sync::atomic::AtomicBool,
+    pub(crate) helper_decision: Mutex<Option<Value>>,
 }
 impl BridgeTransport for Bridge {
     fn send(
@@ -150,6 +151,7 @@ impl BridgeTransport for Bridge {
                     } else {
                         json!({"action":if payload["requested_action"]=="continue"{"continue"}else if parent&&!create{"revise"}else{"create"},"effective_prompt":prompt,"spec_patch":{},"reference_policy":"inherit","clarification":null})
                     };
+                    let decision=self.helper_decision.lock().unwrap().clone().unwrap_or(decision);
                     json!({"choices":[{"message":{"content":decision.to_string()},"finish_reason":"stop"}]})
                 };
             } else if url.contains("/billing?") {
@@ -244,6 +246,7 @@ impl Fixture {
             billing_final: std::sync::atomic::AtomicBool::new(false),
             assist_prepare_failure: std::sync::atomic::AtomicBool::new(false),
             assist_prepare_panic: std::sync::atomic::AtomicBool::new(false),
+            helper_decision: Mutex::new(None),
         });
         let mut config = RouterConfig::defaults(dir.clone());
         config.budget_billing_v2 = true;

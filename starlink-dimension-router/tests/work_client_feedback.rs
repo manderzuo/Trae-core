@@ -3,6 +3,25 @@ mod fixture;
 use fixture::*;
 
 #[tokio::test]
+async fn missing_parent_after_paid_helper_terminates_without_video_or_refund() {
+    let f=Fixture::new();
+    *f.bridge.helper_decision.lock().unwrap()=Some(json!({"action":"continue","effective_prompt":"接着上一段生成","spec_patch":{},"reference_policy":"inherit","clarification":null}));
+    let response=f.response(&f.key,"missing-parent-after-helper",&create()).await;
+    assert_eq!(response.status(),StatusCode::BAD_REQUEST);
+    let result:Value=serde_json::from_slice(&to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+    let rid=result["request_id"].as_str().unwrap();
+    let op=f.state.store.budget_operation(rid).unwrap().unwrap();
+    assert_eq!(op.execution_state,aiwork_core::BudgetExecutionState::Failed,"terminal planner rejection left parent running");
+    assert_eq!(op.steps.len(),1);
+    assert_eq!(op.steps[0].kind,aiwork_core::BudgetStepKind::Assist);
+    assert_eq!(op.steps[0].financial_state,aiwork_core::BudgetFinancialState::Held,"already sent helper must retain billing until actual receipt");
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+    let status=f.app.clone().oneshot(Request::get(format!("/v1/videos/{rid}")).header("authorization",format!("Bearer {}",f.key)).body(Body::empty()).unwrap()).await.unwrap();
+    let status:Value=serde_json::from_slice(&to_bytes(status.into_body(),65536).await.unwrap()).unwrap();
+    assert_eq!(status["task"]["status"],"failed");
+}
+
+#[tokio::test]
 async fn interrupted_async_preparation_is_terminal_without_paid_send() {
     let f=Fixture::new();
     f.bridge.assist_prepare_panic.store(true,Ordering::SeqCst);
