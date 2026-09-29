@@ -17,9 +17,31 @@
 
 ## 本地验证
 
-Core 312 passed；存储270 passed / 1 ignored；AI Work762 passed / 8 ignored；MCP集成57 passed。
+Core 312 passed；存储270 passed / 1 ignored；AI Work762 passed / 8 ignored；MCP集成57 passed、冒烟29 passed。
 新增回归覆盖自动选择、显式尾帧保留、错误身份/文件、跨Key父版本拒绝、失败不降级、同请求重放不重提交、多代续写只传直接父视频，以及真实HTTP传输保留身份响应头。
 
 ## 发布验收
 
-待本次受控公网续写完成后，补充运行版本、实际父视频摘要、请求编号、下载结果、实际扣费与结算时延。之前手动上传完整视频的112.9696积分样本只作为上游能力证据，不冒充本次自动接入验收。
+已通过公网 MCP `seedance_continue` 的 `auto` 模式完成一次真实付费验收，没有由客户端上传视频：
+
+- 父版本 `version_eQMYy8pah1DgoUgVMBOENg`，父请求 `request_vxaGh0i2QQhr6CFE3XiVpg`。
+- 新请求 `request_2RdFz7kJqXG28sD3XZudqg`，新版本 `version_KRTl_afX5kjywnSUUuL-hA`，上游任务 `video-1790657192949-1`。
+- 保持同一个作业 `work_CaMY7ZyNU4FzX5ScViRryw`，父子关系正确，公开状态 `reference_mode=native_video_extend`。
+- 实际送往上游：1张原参考图、1段完整父视频；父视频805103字节，SHA256 `a115deaa6fe689c8b4e83b8bf27b8cdaf3dce65bf88c2d749a865792e676b50f`，与指定父版本MP4一致。没有尾帧替代。
+- 产物5.09秒、864×496、24fps，921112字节；SHA256 `9a8ced0cfd338fcca91ca2c04d3d9b5634b2c5ccb346f962b1e12b20b6b8fa57`。MCP成功下载至系统Downloads。实际解码首帧观察到夜景中的红色绸布；不据此声称严格无缝衔接。
+- 视频实际66.5664积分，辅助GLM0.0728积分，总计66.6392。视频预占84、返还17.4336；辅助预占2、返还1.9272；无欠额。
+- 桥接完成时间1790657354960，Core真实结算时间1790657359929，间隔4.969秒。周Key可用余额从6385.1956变为6318.5564，差额与两笔实际费用严格一致；历史预占1433未改变。
+- 原样重放同一幂等键仍返回同一个请求，账本中仅1笔辅助+1笔视频、余额不变；AI Work重启后查询仍返回completed和同一版本关系。
+- 本规格已从84积分临时风险预占校准为74积分（本次真实66.5664加10%后向上取整），仅是实测样本预算，不是上游官方价格上限；结算仍按真实回执。其他未校准的参考视频时长/规格不因本次样本被宣称已全部支持。
+
+## 发布记录
+
+Core源代码 `883c633dc72234f20cd04d373dee148f54802057`，公网二进制SHA256 `0cd8a682f3c10335aa5bd785d20aef6319da84510762c763b813dc214435d008`，release `20260929-native-video-continuation`。
+
+AI Work源代码 `4dcdd312b9ea8bbd13e73ce9f94ca402be4b46e5`，本机二进制SHA256 `8935265c0e58315b308fb8f83be436f2d98020b3085cca4ef5179ee81bd49e23`，release `E:/AIWORK/releases/20260929-native-video-continuation-4dcdd31`。发布目录包含原有Python/PowerShell运行资源，持久启动器已更新；重启后7864网关和8899代理均监听。AI Work仍在本机，不是移至公网。
+
+MCP `9e7d5c8` 已推送并安装本机副本，保留现有DPAPI凭据。三个仓库均正常快进推送main和工作分支。
+
+能力证据摘要 `37b507bbf7f9160875e07cdf7c2753085616ec17d91ac3ed1e82129036a8d7e7`；Core仅周Key灰度不变。部署前备份配置和一致性SQLite，验证全Key余额、预占及旧unknown记录不变。重启桥接通过已有恢复协议保留11笔历史未决记录，没有清账解锁。
+
+本轮完成自动取父视频→续写→下载→结算的真实链路；没有额外测试所有桌面客户端UI，也没有开放严格首帧或自动拼接。
