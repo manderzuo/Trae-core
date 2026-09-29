@@ -4114,6 +4114,32 @@ fn video_failed_no_charge_without_task_ref_releases_only_its_hold() {
 }
 
 #[test]
+fn first_execution_failure_survives_restart_duplicate_and_late_helper_settlement() {
+    let (directory,store,key,admin)=budget_fixture("first-failure-receipt",2,1_000_000_000);
+    let parent=begin_video_parent(&store,&key,"first-failure-parent");
+    let child=match store.begin_budget_assist_request(&parent,budget_assist_input(&key,"first-failure-child")).unwrap() {
+        BeginRequest::Created(r)=>r,_=>panic!("new child required")
+    };
+    let budget="first-failure-helper-budget";
+    store.begin_budget_operation(&parent,assist_budget_step(&store,&key,&parent,&child.id,budget)).unwrap();
+    dispatch_current_budget_step(&store,&child.id).unwrap();
+    let first=aiwork_core::RequestResult {status:Some(503),error_code:Some("budget_policy_unconfigured".into())};
+    assert!(store.finish_budget_execution_with_result(&parent,aiwork_core::BudgetExecutionState::Failed,Some(first.clone())).is_err(),"running helper must not be closed or refunded");
+    assert!(store.request_result(&parent).unwrap().is_none());
+    store.mark_budget_step_execution(&child.id,aiwork_core::BudgetExecutionState::Succeeded).unwrap();
+    store.finish_budget_execution_with_result(&parent,aiwork_core::BudgetExecutionState::Failed,Some(first.clone())).unwrap();
+    assert_eq!(store.budget_operation(&parent).unwrap().unwrap().steps[0].financial_state,aiwork_core::BudgetFinancialState::Held);
+    drop(store);let store=CoreStore::open(&directory.0).unwrap();
+    assert_eq!(store.request_result(&parent).unwrap(),Some(first.clone()));
+    assert_eq!(store.finish_budget_execution_with_result(&parent,aiwork_core::BudgetExecutionState::Failed,Some(aiwork_core::RequestResult {status:Some(400),error_code:Some("work_parent_required".into())})).unwrap(),aiwork_core::BudgetMutation::Duplicate);
+    let receipt=final_budget_receipt(&child.id,budget,"0.2");
+    store.apply_budget_receipt(receipt.clone()).unwrap();store.apply_budget_receipt(receipt).unwrap();
+    assert_eq!(store.request_result(&parent).unwrap(),Some(first));
+    let balance=store.key_quota_balance_as_admin(&admin,&key,"credits").unwrap();
+    assert_eq!((balance.available,balance.held),(999_800_000,0));
+}
+
+#[test]
 fn zero_final_and_failed_no_charge_with_same_source_are_not_duplicate_statuses() {
     let (directory, store, key_id, _) = budget_fixture("receipt-status-semantic", 1, 1_000_000_000);
     let parent_request_id = begin_video_parent(&store, &key_id, "receipt-status-semantic-parent");

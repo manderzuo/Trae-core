@@ -571,8 +571,7 @@ pub(crate) async fn execute(
                     // Core records dispatch before paid I/O. This existing CAS
                     // aborts only a preparation with no execution/billing evidence;
                     // admitted or unknown paid work is retained, never refunded.
-                    let code=crate::budget_errors::public_code(&error).unwrap_or("assist_preparation_failed");
-                    let _=state.store.abort_budget_preparation(&request,code);
+                    crate::budget_flow::abort_preparation_failure(&state,&request,&error);
                     return Err(error);
                 }
             }
@@ -806,7 +805,7 @@ pub(crate) async fn submit_direct(
             crate::budget_continuation::save_with_headers(&state, &p, &request, &body, &headers)
         {
             if fresh {
-                let _ = state.store.finish_unadmitted_request(&request);
+                crate::budget_flow::finish_unadmitted_failure(&state,&request,&code);
             }
             return crate::budget_flow::fail(&code);
         }
@@ -879,11 +878,11 @@ pub(crate) async fn submit_direct(
                 // Covers interrupted workers and replayed orphan preparations,
                 // not only ordinary helper rejection. The store CAS refuses
                 // termination if any execution/billing evidence exists.
-                let _=state.store.abort_budget_preparation(&rid,safe);
+                crate::budget_flow::abort_preparation_failure(&state,&rid,code);
                 crate::budget_flow::finish_definite_failure(&state, &rid, code);
                 reflect_failure(&state, &rid, code);
                 if fresh {
-                    let _ = state.store.finish_unadmitted_request(&rid);
+                    crate::budget_flow::finish_unadmitted_failure(&state,&rid,code);
                 }
             }
             publisher.complete(outcome);

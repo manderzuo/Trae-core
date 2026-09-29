@@ -136,7 +136,12 @@ pub(crate) async fn video_status(state:Arc<StarlinkRouterState>,principal:Princi
             if state.config.work_context_for_key(&principal.key_id) && state.store.active_principal_for_request(&request).map_err(|_|"work_context_unavailable")?.is_some_and(|p|p.key_id==principal.key_id&&p.user_id==principal.user_id) {
                 let failed=state.store.budget_operation(&request).map_err(|_|"work_context_unavailable")?.is_some_and(|op|matches!(op.execution_state,aiwork_core::BudgetExecutionState::Failed|aiwork_core::BudgetExecutionState::Canceled)) || state.store.request_state(&request).map_err(|_|"work_context_unavailable")?==aiwork_core::RequestState::Failed;
                 let mut reply=json!({"task":{"id":request,"status":if failed {"failed"}else{"queued"}},"request_id":request});
-                if failed {reply["task"]["error"]=failure_feedback(&state,"budget_not_sent",&request)["error"].clone();}
+                if failed {
+                    let result=state.store.request_result(&request).map_err(|_|"work_context_unavailable")?;
+                    let code=result.as_ref().and_then(|r|r.error_code.as_deref()).and_then(crate::budget_errors::public_code).unwrap_or("budget_failure_reason_unavailable");
+                    reply["task"]["error"]=failure_feedback(&state,code,&request)["error"].clone();
+                    reply["task"]["error"]["http_status"]=json!(result.and_then(|r|r.status));
+                }
                 return Ok(Some(reply));
             }
             return Ok(None);
@@ -239,7 +244,7 @@ pub(crate) async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Princ
         let s=state.clone();let p=principal.clone();let parent=request.clone();
         match tokio::task::spawn_blocking(move ||prepare_step(&s,&p,&parent,&child,&model,body,BudgetStepKind::Assist)).await.map_err(|_|"assist worker failed")? {
             Ok(step)=>step,
-            Err(error)=>{let _=state.store.abort_budget_preparation(&request,"assist_preparation_failed");return Err(error);},
+            Err(error)=>{abort_preparation_failure(&state,&request,&error);return Err(error);},
         }
     };
     let result=wait_result(state.clone(),assist).await?;
@@ -360,10 +365,10 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
         let _admission=state.seedance_results.admission.lock().unwrap_or_else(|e|e.into_inner());
         let begun=if supplied.is_some() {state.store.begin_billed_request(input)} else {state.store.begin_implicit_billed_video_request(input)};
         let (request,fresh)=match begun {Ok(BeginRequest::Created(r))=>(r.id,true),Ok(BeginRequest::Existing(r))=>(r.id,false),Ok(BeginRequest::Conflict)=>return StatusCode::CONFLICT.into_response(),Err(_)=>return fail("budget_request_rejected")};
-        if let Err(code)=crate::budget_continuation::save_with_headers(&state,&principal,&request,&body,&headers) {if fresh {let _=state.store.finish_unadmitted_request(&request);}return fail(crate::budget_errors::public_code(&code).unwrap_or("budget_checkpoint_unavailable"));}
+        if let Err(code)=crate::budget_continuation::save_with_headers(&state,&principal,&request,&body,&headers) {if fresh {finish_unadmitted_failure(&state,&request,&code);}return fail(crate::budget_errors::public_code(&code).unwrap_or("budget_checkpoint_unavailable"));}
         let (subscription,publisher)=match state.seedance_results.subscribe(&request) {
             Ok(v)=>v,Err(code)=>{
-                if fresh {let _=state.store.finish_unadmitted_request(&request);}
+                if fresh {finish_unadmitted_failure(&state,&request,code);}
                 return request_failure(&state,code,&request);
             },
         };
@@ -395,7 +400,7 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
             if let Err(code)=&outcome {
                 finish_definite_failure(&state,&rid,code);
                 if work_enabled {crate::work_execution::reflect_failure(&state,&rid,code);}
-                if fresh {let _=state.store.finish_unadmitted_request(&rid);}
+                if fresh {finish_unadmitted_failure(&state,&rid,code);}
             }
             publisher.complete(outcome);
         });
@@ -454,12 +459,18 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
     response.headers_mut().insert("x-accel-buffering","no".parse().unwrap());response
 }
 
+fn stored_failure_code(state:&StarlinkRouterState,request:&str)->Option<&'static str> {
+    if state.store.request_state(request).ok()!=Some(aiwork_core::RequestState::Failed) {return None;}
+    state.store.request_result(request).ok().flatten().and_then(|r|r.error_code.and_then(|c|crate::budget_errors::public_code(&c)))
+}
 fn failure_feedback(state:&StarlinkRouterState,code:&str,request:&str)->Value {
+    let code=stored_failure_code(state,request).unwrap_or(code);
     let settled=state.store.budget_operation(request).ok().flatten().is_some_and(|op|!op.steps.is_empty() && op.steps.iter().all(|s|
         matches!(s.financial_state,aiwork_core::BudgetFinancialState::Settled|aiwork_core::BudgetFinancialState::Released)));
     crate::seedance_feedback::failure_value(request,code,settled)
 }
 fn request_failure(state:&StarlinkRouterState,code:&str,request:&str)->Response {
+    let code=stored_failure_code(state,request).unwrap_or(code);
     let mut response=fail(code);
     let value=failure_feedback(state,code,request);
     *response.body_mut()=axum::body::Body::from(json!({"error":value["error"],"request_id":request}).to_string());
@@ -479,10 +490,21 @@ pub(crate) fn finish_definite_failure(state:&StarlinkRouterState,request:&str,co
         // execution, not finance. A late helper receipt can still settle normally.
         // Do the same version/media cleanup for background continuations that
         // have no HTTP observer to reflect the terminal disposition.
-        if state.store.finish_budget_execution(request,aiwork_core::BudgetExecutionState::Failed).is_ok() {
+        if state.store.finish_budget_execution_with_result(request,aiwork_core::BudgetExecutionState::Failed,public_failure_result(code)).is_ok() {
             crate::work_execution::reflect_failure(state,request,code);
         }
     }
+}
+fn public_failure_result(code:&str)->Option<aiwork_core::RequestResult> {
+    crate::budget_errors::public_code(code).map(|safe|aiwork_core::RequestResult {status:Some(i64::from(fail(safe).status().as_u16())),error_code:Some(safe.into())})
+}
+pub(crate) fn abort_preparation_failure(state:&StarlinkRouterState,request:&str,code:&str) {
+    let safe=crate::budget_errors::public_code(code).unwrap_or("budget_preparation_failed");
+    let _=state.store.abort_budget_preparation_with_result(request,safe,public_failure_result(safe));
+}
+pub(crate) fn finish_unadmitted_failure(state:&StarlinkRouterState,request:&str,code:&str) {
+    let safe=crate::budget_errors::public_code(code).unwrap_or("budget_preparation_failed");
+    if let Some(result)=public_failure_result(safe) {let _=state.store.finish_unadmitted_request_with_result(request,result);}
 }
 pub(crate) async fn resume_checkpoint(state:Arc<StarlinkRouterState>,checkpoint:aiwork_core::BudgetContinuation)->Result<(),String> {
     let context=checkpoint.encryption_context();

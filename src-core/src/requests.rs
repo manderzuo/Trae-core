@@ -904,6 +904,20 @@ impl CoreStore {
         self.begin_request_internal(input, true, false, None, false)
     }
 
+    /// Caller must check request ownership before exposing the returned result.
+    pub fn request_result(&self,request_id:&str)->Result<Option<RequestResult>,CoreError> {
+        let connection=self.connection.lock().expect("core store mutex poisoned");
+        Ok(Self::request_handle_in_connection(&connection,request_id)?.result)
+    }
+
+    pub(crate) fn validate_failure_result(result:&RequestResult)->Result<(),CoreError> {
+        if !result.status.is_some_and(|n|(400..=599).contains(&n)) || !result.error_code.as_deref().is_some_and(|s|
+            !s.is_empty() && s.len()<=96 && s.bytes().all(|b|b.is_ascii_lowercase() || b.is_ascii_digit() || b==b'_')) {
+            return Err(CoreError::IdempotencyConflict);
+        }
+        Ok(())
+    }
+
     /// Creates an authenticated, Core-numbered request before an upstream
     /// quote is available. Callers must be behind the normal API-key auth
     /// boundary; paid dispatch still requires `reserve_credit_quote`.
@@ -1179,16 +1193,21 @@ impl CoreStore {
     /// reservation or dispatch. A reservation, job, lease, or request relation
     /// makes the request ineligible; those cases need their normal reconciliation.
     pub fn recover_abandoned_pre_dispatch_requests(&self) -> Result<usize, CoreError> {
-        self.recover_pre_dispatch_requests(Utc::now().timestamp_millis().saturating_sub(5 * 60 * 1_000), None)
+        self.recover_pre_dispatch_requests(Utc::now().timestamp_millis().saturating_sub(5 * 60 * 1_000), None,None)
     }
 
     /// The caller must exclusively own this request and have stopped preparing
     /// it. Never release a reservation or infer non-execution from a timeout.
     pub fn finish_unadmitted_request(&self, request_id: &str) -> Result<bool, CoreError> {
-        self.recover_pre_dispatch_requests(i64::MAX, Some(request_id)).map(|n| n != 0)
+        self.recover_pre_dispatch_requests(i64::MAX, Some(request_id),None).map(|n| n != 0)
     }
 
-    fn recover_pre_dispatch_requests(&self, cutoff: i64, request_id: Option<&str>) -> Result<usize, CoreError> {
+    pub fn finish_unadmitted_request_with_result(&self,request_id:&str,result:RequestResult)->Result<bool,CoreError> {
+        Self::validate_failure_result(&result)?;
+        self.recover_pre_dispatch_requests(i64::MAX,Some(request_id),Some(result)).map(|n|n!=0)
+    }
+
+    fn recover_pre_dispatch_requests(&self, cutoff: i64, request_id: Option<&str>, result:Option<RequestResult>) -> Result<usize, CoreError> {
         let mut connection = self.connection.lock().expect("core store mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = Utc::now().timestamp_millis();
@@ -1253,16 +1272,16 @@ impl CoreStore {
             Self::transition_request_on_connection(
                 &transaction, request_id, RequestState::Validating,
                 RequestState::Failed,
-                Some(RequestResult {
+                Some(result.clone().unwrap_or_else(||RequestResult {
                     status: None,
                     error_code: Some(error_code.into()),
-                }),
+                })),
                 now,
             )?;
             Self::insert_audit_event(
                 &transaction, "system", audit_action,
                 "request", request_id,
-                serde_json::json!({ "previous_state": state, "endpoint": endpoint }),
+                serde_json::json!({ "previous_state": state, "endpoint": endpoint,"phase":"pre_admission","error_code":result.as_ref().and_then(|r|r.error_code.as_deref()).unwrap_or(error_code),"http_status":result.as_ref().and_then(|r|r.status) }),
                 now,
             )?;
         }

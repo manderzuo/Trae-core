@@ -46,14 +46,17 @@ async fn reference_prepare_rejection_releases_slot_without_refunding_paid_helper
             assert_eq!(version.state, aiwork_core::WorkVersionState::Failed);
             assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst), 0);
             let replay = f.response(&f.key, "rejected-reference", &body).await;
-            assert_eq!(replay.status(), if stream { StatusCode::OK } else { StatusCode::CONFLICT });
+            assert_eq!(replay.status(), if stream { StatusCode::OK } else { StatusCode::BAD_REQUEST });
             let replay_raw = to_bytes(replay.into_body(), 256 * 1024).await.unwrap();
             let replay: Value = if stream {
                 std::str::from_utf8(&replay_raw).unwrap().lines().filter_map(|l| l.strip_prefix("data: "))
                     .filter_map(|l| serde_json::from_str(l).ok()).last().unwrap()
             } else { serde_json::from_slice(&replay_raw).unwrap() };
             assert_eq!(replay["request_id"], rid);
-            assert_eq!(replay["error"]["code"], "video_continuation_not_active");
+            assert_eq!(replay["error"]["code"], code);
+            let query=f.app.clone().oneshot(Request::get(format!("/v1/videos/{rid}")).header("authorization",format!("Bearer {}",f.key)).body(Body::empty()).unwrap()).await.unwrap();
+            let query:Value=serde_json::from_slice(&to_bytes(query.into_body(),65536).await.unwrap()).unwrap();
+            assert_eq!(query["task"]["error"]["code"],code);
             assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst), 1, "failed idempotent replay must not charge again");
 
             // A different request can run immediately, before the old helper bill arrives.
@@ -207,6 +210,17 @@ async fn missing_parent_after_paid_helper_terminates_without_video_or_refund() {
     let status=f.app.clone().oneshot(Request::get(format!("/v1/videos/{rid}")).header("authorization",format!("Bearer {}",f.key)).body(Body::empty()).unwrap()).await.unwrap();
     let status:Value=serde_json::from_slice(&to_bytes(status.into_body(),65536).await.unwrap()).unwrap();
     assert_eq!(status["task"]["status"],"failed");
+    assert_eq!(status["task"]["error"]["code"],"work_parent_required");
+    let first=f.state.store.request_result(rid).unwrap().unwrap();
+    assert_eq!(first.status,Some(400));assert_eq!(first.error_code.as_deref(),Some("work_parent_required"));
+    assert_eq!(f.state.store.finish_budget_execution_with_result(rid,aiwork_core::BudgetExecutionState::Failed,Some(aiwork_core::RequestResult {status:Some(503),error_code:Some("budget_policy_unconfigured".into())})).unwrap(),aiwork_core::BudgetMutation::Duplicate);
+    assert_eq!(f.state.store.request_result(rid).unwrap(),Some(first));
+    assert_eq!(f.state.store.budget_operation(rid).unwrap().unwrap().steps[0].financial_state,aiwork_core::BudgetFinancialState::Held);
+    let replay=f.response(&f.key,"missing-parent-after-helper",&create()).await;
+    assert_eq!(replay.status(),StatusCode::BAD_REQUEST);
+    let replay:Value=serde_json::from_slice(&to_bytes(replay.into_body(),65536).await.unwrap()).unwrap();
+    assert_eq!(replay["error"]["code"],"work_parent_required");
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
 }
 
 #[tokio::test]
@@ -244,7 +258,11 @@ async fn async_direct_helper_prepare_rejection_is_failed_not_permanently_queued(
     let status=f.app.clone().oneshot(Request::get(format!("/v1/videos/{rid}")).header("authorization",format!("Bearer {}",f.key)).body(Body::empty()).unwrap()).await.unwrap();
     let status:Value=serde_json::from_slice(&to_bytes(status.into_body(),65536).await.unwrap()).unwrap();
     assert_eq!(status["task"]["status"],"failed");
-    assert_eq!(status["task"]["error"]["code"],"budget_not_sent");
+    assert_eq!(status["task"]["error"]["code"],"budget_policy_unconfigured");
+    assert_eq!(status["task"]["error"]["http_status"],503);
+    let stored=f.state.store.request_result(rid).unwrap();
+    assert!(!f.state.store.finish_unadmitted_request_with_result(rid,aiwork_core::RequestResult {status:Some(400),error_code:Some("work_parent_required".into())}).unwrap());
+    assert_eq!(stored,f.state.store.request_result(rid).unwrap());
     assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),0);
     assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
 }

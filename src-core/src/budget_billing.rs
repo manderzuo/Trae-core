@@ -309,6 +309,11 @@ impl CoreStore {
         parent_request_id: &str,
         reason: &str,
     ) -> Result<BudgetMutation, CoreError> {
+        self.abort_budget_preparation_with_result(parent_request_id,reason,None)
+    }
+
+    pub fn abort_budget_preparation_with_result(&self,parent_request_id:&str,reason:&str,result:Option<RequestResult>)->Result<BudgetMutation,CoreError> {
+        if let Some(result)=&result {Self::validate_failure_result(result)?;}
         if parent_request_id.trim().is_empty() || reason.trim().is_empty() {
             return Err(CoreError::InvalidConfiguration {
                 key: "budget_preparations.abort".into(),
@@ -347,8 +352,8 @@ impl CoreStore {
             return Err(CoreError::IdempotencyConflict);
         }
 
-        Self::fail_budget_preparation_request(&transaction, parent_request_id, now)?;
-        Self::fail_budget_preparation_request(&transaction, &child_request_id, now)?;
+        Self::fail_budget_preparation_request(&transaction, parent_request_id, result.clone(), now)?;
+        Self::fail_budget_preparation_request(&transaction, &child_request_id, None, now)?;
         let changed = transaction.execute(
             "UPDATE budget_preparations SET state = 'aborted', abort_reason = ?1, updated_at_ms = ?2
              WHERE parent_request_id = ?3 AND child_request_id = ?4 AND state = 'open'",
@@ -363,7 +368,7 @@ impl CoreStore {
             "request.budget_preparation_aborted",
             "request",
             parent_request_id,
-            serde_json::json!({"child_request_id": child_request_id, "reason": reason}),
+            serde_json::json!({"child_request_id": child_request_id, "reason": reason,"phase":"helper_preparation","http_status":result.as_ref().and_then(|r|r.status),"error_code":result.as_ref().and_then(|r|r.error_code.as_deref())}),
             now,
         )?;
         transaction.commit()?;
@@ -397,8 +402,8 @@ impl CoreStore {
             )? {
                 continue;
             }
-            Self::fail_budget_preparation_request(&transaction, &parent_request_id, now)?;
-            Self::fail_budget_preparation_request(&transaction, &child_request_id, now)?;
+            Self::fail_budget_preparation_request(&transaction, &parent_request_id, None, now)?;
+            Self::fail_budget_preparation_request(&transaction, &child_request_id, None, now)?;
             let changed = transaction.execute(
                 "UPDATE budget_preparations SET state = 'aborted',
                    abort_reason = 'abandoned_budget_preparation_recovered', updated_at_ms = ?1
@@ -1072,6 +1077,18 @@ impl CoreStore {
         parent_request_id: &str,
         terminal: BudgetExecutionState,
     ) -> Result<BudgetMutation, CoreError> {
+        self.finish_budget_execution_with_result(parent_request_id,terminal,None)
+    }
+
+    /// Record the first definite failure atomically with execution completion.
+    /// Duplicate terminal calls never overwrite its cause or financial facts.
+    pub fn finish_budget_execution_with_result(
+        &self,parent_request_id:&str,terminal:BudgetExecutionState,result:Option<RequestResult>,
+    ) -> Result<BudgetMutation,CoreError> {
+        if let Some(result)=&result {
+            Self::validate_failure_result(result)?;
+            if terminal!=BudgetExecutionState::Failed {return Err(CoreError::IdempotencyConflict);}
+        }
         if !matches!(terminal, BudgetExecutionState::Succeeded | BudgetExecutionState::Failed | BudgetExecutionState::Canceled) {
             return Err(CoreError::IdempotencyConflict);
         }
@@ -1112,7 +1129,7 @@ impl CoreStore {
         if step_count == 0 || unfinished_count != 0 {
             return Err(CoreError::IdempotencyConflict);
         }
-        Self::finish_parent_request_execution(&transaction, parent_request_id, terminal, now)?;
+        Self::finish_parent_request_execution(&transaction, parent_request_id, terminal, result.clone(), now)?;
         let changed = transaction.execute(
             "UPDATE budget_operations
              SET execution_state = ?1, updated_at_ms = ?2, execution_finished_at_ms = ?2
@@ -1121,6 +1138,11 @@ impl CoreStore {
         )?;
         if changed != 1 {
             return Err(CoreError::IdempotencyConflict);
+        }
+        if let Some(result)=result {
+            let has_video:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM budget_steps WHERE operation_id=?1 AND kind='video')",[&operation_id],|r|r.get(0))?;
+            Self::insert_audit_event(&transaction,"system","request.budget_execution_failed","request",parent_request_id,
+                serde_json::json!({"phase":if has_video {"video_execution"} else {"pre_video"},"error_code":result.error_code,"http_status":result.status}),now)?;
         }
         transaction.commit()?;
         Ok(BudgetMutation::Applied)
@@ -1733,6 +1755,7 @@ impl CoreStore {
         connection: &Connection,
         parent_request_id: &str,
         terminal: BudgetExecutionState,
+        result: Option<RequestResult>,
         now: i64,
     ) -> Result<(), CoreError> {
         let state_value: String = connection
@@ -1791,7 +1814,7 @@ impl CoreStore {
             Self::transition_request_on_connection(connection, parent_request_id, state, RequestState::Unknown, None, now)?;
             state = RequestState::Unknown;
         }
-        Self::transition_request_on_connection(connection, parent_request_id, state, target, None, now)
+        Self::transition_request_on_connection(connection, parent_request_id, state, target, result, now)
     }
 
     fn sync_assist_request_execution(
@@ -1919,6 +1942,7 @@ impl CoreStore {
     fn fail_budget_preparation_request(
         connection: &Connection,
         request_id: &str,
+        result:Option<RequestResult>,
         now: i64,
     ) -> Result<(), CoreError> {
         let state: String = connection
@@ -1950,10 +1974,10 @@ impl CoreStore {
             request_id,
             RequestState::Validating,
             RequestState::Failed,
-            Some(RequestResult {
+            Some(result.unwrap_or_else(||RequestResult {
                 status: None,
                 error_code: Some("budget_preparation_aborted".into()),
-            }),
+            })),
             now,
         )
     }
