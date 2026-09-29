@@ -35,18 +35,33 @@ Core/MCP 集成使用假桥接验证真实路由、数据库、Node→PowerShell
 
 ## 未完成的验收与原因
 
-本计划付费视频 **0/9**，严格原生样本 **0/1**；没有真实扣费或视觉验收结果。
+新版作业/续写真实验收仍未完成。2026-09-29 恢复积分授权后，已完成现网基线视频 **1/9**，严格原生样本 **0/1**；这笔占用同一总样本上限，不能重复计算，但不作为新版上下文/续写已通过的证据。
 
 | 客户端 | 实际情况 |
 | --- | --- |
 | TRAE Work CN API | 已选取窗口，但截图捕获超时；无截图控件树只有通用区域，无法可靠定位工作区/输入框。未发起任务。 |
 | DSH API | 已选取窗口，窗口捕获超时。未发起任务。 |
-| Codex MCP | 本地 MCP 协议集成通过；未把假网关集成写成 Codex 宿主的真实付费验收。 |
+| Codex MCP | 恢复测试时，实际 Codex MCP 已提供7个旧工具；doctor→submit→status→download 完成一笔现网参考图付费基线。新增改版/续写工具尚未部署，未验收。 |
 | Chrome 管理页 | 浏览器工具初始化报 `failed to write kernel assets / os error 3`，没有读取到管理页状态。 |
 
 还发现验收环境约束：`key_registry_sync::sync_now` 是全量同步，且 `budget_flow::prepare_step` 每次准备预算都会调用它。用空库测试 Core 直连正在使用的 AI Work，不仅有后台同步风险，也有付费准备时的同步风险，会覆盖/冲突现有 Key 登记。没有这样启动测试实例，也没有清理或改写旧用户账本。
 
 续测需要可操作的客户端，及与正式 Key 登记隔离的桥接/账户，或经过审计的同一正式 Core 测试灰度环境；不能临时忽略登记、关闭计费保护或把旧用户 Key 放到影子账本中冒充隔离测试。
+
+## 现网真实付费基线（恢复授权后）
+
+使用已配置的“周”普通 Key，经真实 Codex MCP 调用公网 `https://api.gemstory.cn/v1`，不是假网关。未新建 Key，未清理旧账本、旧预占或重启程序。
+
+- doctor：网关和鉴权成功，模型目录19项；该检查没有收费。
+- submit 仅调用一次：`request_54EFRGUQID9Xa-Drevu34w`；固定幂等键 `work-continuation-20260929-baseline-reference-01`。
+- 5秒、480p、16:9；显式上传本计划红色合成参考图，120字节，SHA256 `171303000410d291b70cf61208be8ee6fab3361ff9a719a0df9005d5ece89410`。AI Work 素材 `asset-1790642456-87b4c478ef59` 的大小/MIME/摘要与本地相同，证明传至 AI Work；该记录本身不证明所有上游请求字段或真实人物一致性。
+- 唯一视频预算 `budget_EjxHFaboez0THglSRQ2csobfDPwZ3FFR-bCx3IY8rrY`，唯一上游任务 `video-1790642457627-26`；Core dispatch_attempted=1，执行 succeeded、财务 settled、debt=0。此 MCP 直接视频接口只有一个视频步骤，没有辅助文字步骤。
+- 预占62积分，真实 final 回执扣费56.208，释放差额5.792。AI Work 与 Core 的实际扣费一致。AI Work finished_at_ms=1790642557844，Core settled_at_ms=1790642561232，记录时间差3.388秒；两机时钟相关的小样本，不外推到负载P95或所有模型。
+- Core Key 可用余额从6723.79变为6667.582，差值恰为56.208。原有1433积分未决预占、1个未决执行保持原样。注意 SUM(delta) 已经是扣除预占后的 available，不能再次减 held；测试探针首版的展示解释已纠正，不涉及业务代码改动。
+- status completed 后，实际 MCP download 保存至 `C:/Users/StarLink/Downloads/aiwork-seedance-20260929-084319-request_54EFRGUQID9Xa-Drevu34w.mp4`，707862字节，MP4 `ftyp` 签名，SHA256 `0dae4b14682c71efaf2ce423ed3e96f687db8d622f1872cca2034e197fcbef80`。
+- 产物 H264/AAC、约5.09秒、864×496（上游480p档实际编码尺寸），实际解码出第2秒画面，观察为红色绸布，符合这笔基线提示词。首个整流转 null 解码命令因该 FFmpeg 未提供默认PCM音频编码器失败，随后显式只取视频PNG成功；未重新生成视频，也未将失败命令写成通过。
+
+本次无503、观察者竞争、参考图缺失或下载工具错误。结论只适用于这一现网 MCP 基线；没有发送“改成夜景”和“续写”去旧版本盲耗积分。新版端到端验收需先进入安全隔离/灰度运行环境。
 
 ## 发布状态与边界
 
