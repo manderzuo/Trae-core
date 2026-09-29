@@ -33,9 +33,16 @@ impl BridgeTransport for Bridge {
         if url.contains("/content?") {return Ok(BridgeResponse {status:self.download_status.load(Ordering::SeqCst) as u16,headers:BTreeMap::from([("content-type".into(),"video/mp4".into())]),body:b"fixture-mp4".to_vec()});}
         let value=if url.ends_with("/v1/assets") {
             let upload:Value=serde_json::from_slice(body).unwrap();
-            assert_eq!(upload["mime_type"],"image/png");
-            assert!(upload["data_base64"].as_str().unwrap().starts_with("iVBOR"));
-            json!({"id":"bridge-image"})
+            if upload["mime_type"]=="video/mp4" {
+                use base64::Engine;
+                let bytes=base64::engine::general_purpose::STANDARD.decode(upload["data_base64"].as_str().unwrap()).unwrap();
+                assert_eq!(&bytes[4..8],b"ftyp");
+                json!({"id":"bridge-video"})
+            } else {
+                assert_eq!(upload["mime_type"],"image/png");
+                assert!(upload["data_base64"].as_str().unwrap().starts_with("iVBOR"));
+                json!({"id":"bridge-image"})
+            }
         } else if url.ends_with("/key-registry") {json!({"applied":true})} else if url.ends_with("/budgets/prepare") {
             let input:Value=serde_json::from_slice(body).unwrap();
             if input["body"]["messages"][0]["content"]=="reject policy" {

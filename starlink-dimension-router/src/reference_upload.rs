@@ -14,11 +14,12 @@ fn context(id: &str) -> String { format!("reference-upload-v1:{id}") }
 fn valid_id(id: &str) -> bool { id.len()==32 && id.bytes().all(|b|b.is_ascii_hexdigit()) }
 fn error(status: StatusCode, code: &str) -> Response {
     let message = match code {
-        "reference_upload_tool_unavailable" => "图片仅提供了本机路径，但客户端本轮没有可用的联网终端工具。请允许终端工具或直接发送图片数据；未提交视频、未扣费。",
-        "reference_upload_incomplete" => "参考图片尚未完整上传，未提交视频、未扣费。请重新附加原图并允许客户端上传。",
-        "reference_upload_failed" => "客户端图片上传工具执行失败，未提交视频、未扣费。",
-        "reference_upload_invalid_path" => "附件不是支持的本机图片路径；未提交视频、未扣费。",
-        _ => "参考图片上传会话无效或已过期，请重新附加原图；未提交视频、未扣费。",
+        "reference_upload_tool_unavailable" => "素材仅提供了本机路径，但客户端本轮没有可用的联网终端工具。请允许终端工具或直接上传素材；未提交视频、未扣费。",
+        "reference_upload_incomplete" => "参考素材尚未完整上传，未提交视频、未扣费。请重新附加素材并允许客户端上传。",
+        "reference_upload_failed" => "客户端素材上传工具执行失败，未提交视频、未扣费。",
+        "reference_upload_invalid_path" => "附件不是支持的本机图片或 MP4/WebM 视频路径；未提交视频、未扣费。",
+        "reference_upload_type_mismatch" => "素材内容与附件格式不一致；未提交视频、未扣费。",
+        _ => "参考素材上传会话无效或已过期，请重新附加素材；未提交视频、未扣费。",
     };
     (status,Json(json!({"error":{"type":"invalid_request_error","code":code,"message":message}}))).into_response()
 }
@@ -38,7 +39,13 @@ fn valid_path(path: &str) -> bool {
     path.len()<=4096 && (windows||unix) && !path.chars().any(char::is_control)
         && !path.split(['/', '\\']).any(|part|part=="..")
         && !path[if windows {2} else {0}..].contains(':')
-        && matches!(ext.as_str(),"png"|"jpg"|"jpeg"|"gif"|"webp")
+        && matches!(ext.as_str(),"png"|"jpg"|"jpeg"|"gif"|"webp"|"mp4"|"webm")
+}
+fn path_mime(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "png"=>"image/png", "jpg"|"jpeg"=>"image/jpeg", "gif"=>"image/gif",
+        "webp"=>"image/webp", "mp4"=>"video/mp4", "webm"=>"video/webm", _=>"",
+    }
 }
 fn paths(body: &Value) -> Result<Vec<String>, &'static str> {
     let Some(last)=body["messages"].as_array().and_then(|m|m.last()).filter(|m|m["role"]=="user") else {return Ok(vec![])};
@@ -60,6 +67,12 @@ fn paths(body: &Value) -> Result<Vec<String>, &'static str> {
         }
     }
     Ok(found)
+}
+/// Planning hint only. Actual uploaded asset ownership/content is still checked
+/// before any helper or video dispatch; an ID alone is not authorization.
+pub(crate) fn has_source_video(body: &Value) -> bool {
+    body["video_asset_ids"].as_array().is_some_and(|a| !a.is_empty())
+        || paths(body).is_ok_and(|a| a.iter().any(|p| path_mime(p).starts_with("video/")))
 }
 fn has_media(body: &Value) -> bool {
     ["image_asset_ids","video_asset_ids","image_urls","video_urls"].iter().any(|k|body[*k].as_array().is_some_and(|a|!a.is_empty()))
@@ -226,8 +239,14 @@ pub(crate) async fn before_chat(state:&Arc<StarlinkRouterState>,p:&Principal,hea
         if record.asset_ids.iter().any(Option::is_none) {return Some(bad("reference_upload_incomplete"));}
         let text=match state.key_vault.decrypt(&context(&id),record.key_version,&record.ciphertext) {Ok(t)=>t,_=>return Some(bad("reference_upload_invalid"))};
         let mut original:Value=match serde_json::from_str(&text) {Ok(v)=>v,Err(_)=>return Some(bad("reference_upload_invalid"))};
+        let declared=match paths(&original) {Ok(v) if v.len()==record.asset_ids.len()=>v,_=>return Some(bad("reference_upload_invalid"))};
+        let mut images=Vec::new();let mut videos=Vec::new();
+        for (path,asset) in declared.iter().zip(&record.asset_ids) {
+            if path_mime(path).starts_with("video/") {videos.push(asset.clone());} else {images.push(asset.clone());}
+        }
         remove_attachment_markup(&mut original);
-        original["image_asset_ids"]=json!(record.asset_ids);
+        original["image_asset_ids"]=json!(images);
+        original["video_asset_ids"]=json!(videos);
         if state.config.work_context_for_key(&p.key_id) {
             match state.store.owned_work_for_conversation(p,&format!("upload:{id}")) {
                 Ok(Some(w))=>original["work_context"]=json!({"work_id":w.work_id}),
@@ -265,9 +284,9 @@ pub(crate) async fn before_chat(state:&Arc<StarlinkRouterState>,p:&Principal,hea
     let config=json!({"id":id,"base":format!("{base}/v1/reference-uploads/{id}"),"authorization":ticket,"paths":paths});
     let mut args=tool.arguments;
     args[tool.command_key]=json!(command(&config,tool.bash));
-    if args.get("description").is_some() {args["description"]=json!("Upload the user-attached reference images before generating video");}
+    if args.get("description").is_some() {args["description"]=json!("Upload the user-attached reference media before generating video");}
     let mut value=json!({"id":format!("chatcmpl-ref-{id}"),"object":"chat.completion","model":"seedance","created":chrono::Utc::now().timestamp(),
-        "choices":[{"index":0,"message":{"role":"assistant","content":"正在通过本机工具上传本次参考图片，上传完成后开始生成视频。此步骤尚未提交视频、未扣视频积分。","tool_calls":[{"id":format!("{PREFIX}{id}"),"type":"function","function":{"name":tool.name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]});
+        "choices":[{"index":0,"message":{"role":"assistant","content":"正在通过本机工具上传本次参考素材，上传完成后开始处理生成请求。此步骤尚未提交视频、未扣视频积分。","tool_calls":[{"id":format!("{PREFIX}{id}"),"type":"function","function":{"name":tool.name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]});
     if state.config.work_context_for_key(&p.key_id) {
         let resolved=match crate::work_context::resolve(state,p,headers,body) {Ok(r)=>r,Err(_)=>return Some(bad("work_context_unavailable"))};
         let (work,version)=match resolved {
@@ -281,7 +300,7 @@ pub(crate) async fn before_chat(state:&Arc<StarlinkRouterState>,p:&Principal,hea
     Some(response(value,body["stream"].as_bool().unwrap_or(false)))
 }
 
-/// This capability permits only one immutable image per predeclared slot. It
+/// This capability permits only one immutable media file per predeclared slot. It
 /// cannot generate videos, inspect balances, download outputs or act as a Key.
 pub(crate) async fn upload(State(state):State<Arc<StarlinkRouterState>>,Path((id,index)):Path<(String,usize)>,request:Request)->Response {
     if !valid_id(&id) {return error(StatusCode::UNAUTHORIZED,"reference_upload_invalid");}
@@ -293,7 +312,17 @@ pub(crate) async fn upload(State(state):State<Arc<StarlinkRouterState>>,Path((id
         Ok(v)=>v,Err(_)=>return error(StatusCode::PAYLOAD_TOO_LARGE,"reference_upload_invalid_image"),
     };
     let result=tokio::task::spawn_blocking(move ||->Response {
-        let parsed=match crate::assets::parse_reference_image(bytes.to_vec()) {Ok(v)=>v,Err(e)=>return crate::assets::response(e)};
+        let declared=state.key_vault.decrypt(&context(&id),record.key_version,&record.ciphertext)
+            .ok().and_then(|s|serde_json::from_str::<Value>(&s).ok()).and_then(|v|paths(&v).ok());
+        let Some(path)=declared.as_ref().and_then(|v|v.get(index)) else {return bad("reference_upload_invalid")};
+        let Some((mime,ext))=crate::assets::detect_format(&bytes) else {return bad("reference_upload_type_mismatch")};
+        let expected=path_mime(path);
+        // Preserve image content sniffing: some clients rename JPEGs image.png.
+        // A video can never occupy an image slot, or change its container type.
+        if !(mime==expected || (mime.starts_with("image/")&&expected.starts_with("image/"))) {return bad("reference_upload_type_mismatch");}
+        let parsed=if mime.starts_with("image/") {
+            match crate::assets::parse_reference_image(bytes.to_vec()) {Ok(v)=>v,Err(e)=>return crate::assets::response(e)}
+        } else {crate::assets::ParsedAssetUpload {filename:format!("reference.{ext}"),declared_mime:Some(mime.into()),bytes:bytes.to_vec()}};
         let _permit=match state.asset_limiter.acquire(&p.key_id,parsed.bytes.len()) {Ok(p)=>p,Err(e)=>return crate::assets::response(e)};
         let sha=hex::encode(Sha256::digest(&parsed.bytes));
         if let Some(existing)=&record.asset_ids[index] {

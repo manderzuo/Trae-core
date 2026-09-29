@@ -18,6 +18,82 @@ fn continue_body(r: &Value) -> Value {
     b
 }
 #[tokio::test]
+async fn natural_language_tail_request_does_not_auto_select_native_extension() {
+    let f=Fixture::with_continuation(true);let(r,_)=base(&f).await;
+    f.bridge.native_capability.store(true,Ordering::SeqCst);
+    let mut b=continue_body(&r);b["messages"][1]["content"]=json!("截取尾帧做参考，续写10秒视频");
+    let child=f.chat("text-tail",&b).await;
+    assert_eq!(child["work_context"]["reference_mode"],"tail_reference");
+    assert!(f.bridge.source_reads.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn uploaded_video_tail_reference_replaces_video_and_replay_never_pays_again() {
+    use starlink_dimension_router::assets;
+    let f=Fixture::with_continuation(true);
+    let bytes=b"\x00\x00\x00\x18ftypmp42source-video".to_vec();
+    let stored=assets::write_asset(&f.dir,&f.owner,assets::ParsedAssetUpload{filename:"source.mp4".into(),declared_mime:Some("video/mp4".into()),bytes}).unwrap();
+    let asset=assets::persist_asset(&f.state.store,&f.owner,&stored).unwrap();
+    let b=json!({"model":"seedance","video_asset_ids":[asset.id],"messages":[{"role":"user","content":"截取上传视频的尾帧做参考，生成5秒视频"}]});
+    let reply=f.chat("upload-tail",&b).await;
+    let v=f.state.store.work_version_for_request(&f.owner,reply["request_id"].as_str().unwrap()).unwrap().unwrap();
+    let s=work_context::read_snapshot(&f.state,&f.owner,&v).unwrap();
+    assert_eq!(s.reference_mode,"tail_reference");
+    let wire=s.dispatch_body.unwrap();
+    assert_eq!(wire["image_asset_ids"].as_array().unwrap().len(),1);
+    assert!(wire["video_asset_ids"].as_array().is_none_or(|v|v.is_empty()));
+    assert_eq!(f.bridge.uploaded_frame_reads.load(Ordering::SeqCst),1);
+    assert_eq!(f.chat("upload-tail",&b).await["request_id"],reply["request_id"]);
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),1);
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);
+    let mut next=revise(&reply,"改成夜景，其他不变");
+    let revision=f.chat("upload-tail-revise",&next).await;
+    let revised=f.state.store.work_version_for_request(&f.owner,revision["request_id"].as_str().unwrap()).unwrap().unwrap();
+    let revised=work_context::read_snapshot(&f.state,&f.owner,&revised).unwrap();
+    assert_eq!(revised.dispatch_body.unwrap()["image_asset_ids"].as_array().unwrap().len(),1,"revision must retain the uploaded tail reference");
+    next=revise(&reply,"截取本次上传的视频尾帧，继续生成5秒视频");
+    next["action"]=json!("continue");next["video_asset_ids"]=b["video_asset_ids"].clone();
+    f.bridge.native_capability.store(true,Ordering::SeqCst);
+    let replaced=f.chat("upload-tail-parent",&next).await;
+    assert_eq!(replaced["work_context"]["reference_mode"],"tail_reference");
+    assert!(f.bridge.source_reads.lock().unwrap().is_empty(),"explicit uploaded source must not use the old parent video");
+}
+#[tokio::test]
+async fn uploaded_video_tail_failure_or_mismatched_proof_never_dispatches_video() {
+    use starlink_dimension_router::assets;
+    for mismatch in [false,true] {
+        let f=Fixture::with_continuation(true);
+        f.bridge.frame_failure.store(!mismatch,Ordering::SeqCst);
+        f.bridge.source_identity_bad.store(mismatch,Ordering::SeqCst);
+        let stored=assets::write_asset(&f.dir,&f.owner,assets::ParsedAssetUpload{filename:"source.mp4".into(),declared_mime:Some("video/mp4".into()),bytes:b"\x00\x00\x00\x18ftypmp42source-video".to_vec()}).unwrap();
+        let asset=assets::persist_asset(&f.state.store,&f.owner,&stored).unwrap();
+        let b=json!({"model":"seedance","video_asset_ids":[asset.id],"messages":[{"role":"user","content":"截取尾帧做参考，生成5秒视频"}]});
+        let r=f.response(&f.key,"failed-tail",&b).await;
+        let text=String::from_utf8(to_bytes(r.into_body(),65536).await.unwrap().to_vec()).unwrap();
+        assert!(text.contains(if mismatch{"frame_identity_invalid"}else{"frame_extraction_unavailable"}),"{text}");
+        assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+    }
+}
+#[tokio::test]
+async fn parent_tail_does_not_reextract_an_inherited_original_video() {
+    use starlink_dimension_router::assets;
+    let f=Fixture::with_continuation(true);
+    let stored=assets::write_asset(&f.dir,&f.owner,assets::ParsedAssetUpload{filename:"original.mp4".into(),declared_mime:Some("video/mp4".into()),bytes:b"\x00\x00\x00\x18ftypmp42original".to_vec()}).unwrap();
+    let asset=assets::persist_asset(&f.state.store,&f.owner,&stored).unwrap();
+    let mut b=create();b["video_asset_ids"]=json!([asset.id]);
+    let first=f.chat("original-video",&b).await;
+    let parent=f.state.store.work_version_for_request(&f.owner,first["request_id"].as_str().unwrap()).unwrap().unwrap();
+    let frame=work_continuation::warm_tail_frame(f.state.clone(),f.owner.clone(),parent).await.unwrap();
+    f.bridge.frame_failure.store(true,Ordering::SeqCst);
+    let mut b=revise(&first,"截取刚生成的视频尾帧做参考，继续5秒");b["action"]=json!("continue");
+    let child=f.chat("parent-tail",&b).await;
+    let version=f.state.store.work_version_for_request(&f.owner,child["request_id"].as_str().unwrap()).unwrap().unwrap();
+    let snapshot=work_context::read_snapshot(&f.state,&f.owner,&version).unwrap();
+    assert_eq!(snapshot.tail_frame_media_id,Some(frame.media_id));
+    let wire=snapshot.dispatch_body.unwrap();
+    assert!(wire["video_asset_ids"].as_array().is_none_or(|v|v.is_empty()));
+    assert_eq!(wire["image_asset_ids"].as_array().unwrap().len(),1);
+}
+#[tokio::test]
 async fn native_auto_uses_exact_parent_video_and_replay_does_not_resubmit() {
     let f=Fixture::with_continuation(true);
     let (r,v)=base(&f).await;

@@ -196,7 +196,6 @@ struct CoreKeyRegistrySnapshot {
 
 impl BridgeClient {
     pub fn last_frame(&self,step:&aiwork_core::BudgetStepView)->Result<FrameDownload,String> {
-        use sha2::{Digest,Sha256};
         if step.kind!=aiwork_core::BudgetStepKind::Video||step.execution_state!=aiwork_core::BudgetExecutionState::Succeeded||step.task_ref.is_none(){return Err("frame_result_not_ready".into());}
         let path=crate::budget_reconciler::request_path(step,"last-frame");
         let headers=BTreeMap::from([("authorization".into(),format!("Bearer {}",self.bridge_secret)),("accept".into(),"image/png".into())]);
@@ -204,6 +203,22 @@ impl BridgeClient {
         if response.status!=200 {return Err(if response.status==429 {"frame_extractor_busy"}else{"frame_extraction_unavailable"}.into());}
         let header=|name:&str|response.headers.iter().find(|(k,_)|k.eq_ignore_ascii_case(name)).map(|(_,v)|v.as_str()).ok_or("frame_identity_invalid");
         for (name,expected) in [("x-aiwork-request-id",&step.request_id),("x-aiwork-budget-id",&step.budget_id),("x-aiwork-core-key-id",&step.core_key_id),("x-aiwork-account-ref",&step.account_ref),("x-aiwork-bridge-instance-id",&step.bridge_instance_id)] {if header(name)?!=expected {return Err("frame_identity_invalid".into());}}
+        Self::decode_frame(response)
+    }
+    pub(crate) fn reference_last_frame(&self,key:&str,bytes:&[u8])->Result<FrameDownload,String> {
+        use sha2::{Digest,Sha256};
+        if bytes.len()>crate::assets::MAX_ASSET_BYTES || crate::assets::detect_format(bytes).map(|v|v.0)!=Some("video/mp4") {return Err("reference_video_format_unsupported".into());}
+        let headers=BTreeMap::from([("authorization".into(),format!("Bearer {}",self.bridge_secret)),("content-type".into(),"video/mp4".into()),("accept".into(),"image/png".into()),("x-aiwork-core-key-id".into(),key.into())]);
+        let response=self.transport.send_stream("POST",&format!("{}/internal/bridge/v2/reference-last-frame",self.base_url),&headers,bytes).map_err(|_|"frame_extraction_unavailable")?;
+        if response.status!=200 {return Err(if response.status==429 {"frame_extractor_busy"}else{"frame_extraction_unavailable"}.into());}
+        if !response.headers.iter().any(|(k,v)|k.eq_ignore_ascii_case("x-aiwork-core-key-id")&&v==key) {return Err("frame_identity_invalid".into());}
+        let frame=Self::decode_frame(response)?;
+        if frame.source_sha256!=format!("{:x}",Sha256::digest(bytes)) {return Err("frame_identity_invalid".into());}
+        Ok(frame)
+    }
+    fn decode_frame(response:BridgeStreamingResponse)->Result<FrameDownload,String> {
+        use sha2::{Digest,Sha256};
+        let header=|name:&str|response.headers.iter().find(|(k,_)|k.eq_ignore_ascii_case(name)).map(|(_,v)|v.as_str()).ok_or("frame_identity_invalid");
         if header("content-type")?!="image/png"{return Err("frame_output_invalid".into());}
         let length=header("content-length")?.parse::<usize>().map_err(|_|"frame_output_invalid")?;
         if length<45||length>8*1024*1024{return Err("frame_output_invalid".into());}

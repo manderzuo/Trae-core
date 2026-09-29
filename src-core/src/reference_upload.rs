@@ -60,7 +60,7 @@ impl CoreStore {
             params![id,principal.key_id,principal.user_id,chrono::Utc::now().timestamp_millis()], |r|r.get(0)).optional()?;
         let mut ids: Vec<Option<String>> = serde_json::from_str(&raw.ok_or_else(invalid)?)?;
         if index >= ids.len() { return Err(invalid()); }
-        let sha: Option<String> = tx.query_row("SELECT sha256 FROM assets WHERE id=?1 AND user_id=?2 AND state='active' AND expires_at_ms>?3 AND mime_type LIKE 'image/%'",
+        let sha: Option<String> = tx.query_row("SELECT sha256 FROM assets WHERE id=?1 AND user_id=?2 AND state='active' AND expires_at_ms>?3 AND (mime_type LIKE 'image/%' OR mime_type IN ('video/mp4','video/webm'))",
             params![asset,principal.user_id,chrono::Utc::now().timestamp_millis()],|r|r.get(0)).optional()?;
         let sha = sha.ok_or_else(invalid)?;
         if let Some(existing) = &ids[index] {

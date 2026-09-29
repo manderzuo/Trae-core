@@ -243,6 +243,23 @@ fn history_without_marker_does_not_guess() {
     assert!(matches!(f.resolve(&json!({"messages":[{"role":"assistant","content":"视频已生成"},{"role":"user","content":"把刚才那段改一下"}]})).unwrap(),WorkResolution::Clarify {..}));
 }
 #[test]
+fn uploaded_source_video_does_not_require_a_stored_parent_version() {
+    let f=Fixture::new();
+    let b=json!({"messages":[{"role":"user","content":"<uploaded_files><file_path>C:\\clips\\source.mp4</file_path></uploaded_files><user_input>使用本次上传的视频，从结尾继续生成10秒720P竖屏视频</user_input>"}]});
+    assert!(matches!(f.resolve(&b).unwrap(),WorkResolution::New));
+    let mut invalid=b.clone();
+    invalid["messages"][0]["content"]=json!("<uploaded_files><file_path>C:\\..\\source.mp4</file_path></uploaded_files><user_input>从结尾继续生成10秒视频</user_input>");
+    assert!(matches!(f.resolve(&invalid).unwrap(),WorkResolution::Clarify{..}));
+    let mut explicit=b.clone();explicit["action"]=json!("continue");
+    assert!(matches!(f.resolve(&explicit).unwrap(),WorkResolution::Clarify{..}));
+    let mut no_video=b.clone();no_video["messages"][0]["content"]=json!("从结尾继续生成10秒视频");
+    assert!(matches!(f.resolve(&no_video).unwrap(),WorkResolution::Clarify{..}));
+    let mut foreign=b;
+    let (w,v,_)=f.version("foreign-source",vec![]);
+    foreign["work_context"]=json!({"work_id":w,"base_version_id":v});
+    assert!(work_context::resolve(&f.state,&f.other,&HeaderMap::new(),&foreign).is_err());
+}
+#[test]
 fn reference_tool_resume_preserves_work() {
     let f = Fixture::new();
     let w = f

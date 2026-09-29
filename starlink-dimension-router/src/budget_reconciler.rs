@@ -66,7 +66,7 @@ pub(crate) fn sync_execution(state: &StarlinkRouterState, client: &BridgeClient,
                 let reply=read(client,step,"result")?;
                 if reply["status"]!="ready" {return Err("terminal helper result unavailable".into());}
                 let decision=reply.pointer("/result/choices/0/message/content").and_then(Value::as_str)
-                    .and_then(|text|serde_json::from_str::<Value>(text.trim()).ok());
+                    .and_then(|text|crate::assistant_json::object(text,16*1024).ok());
                 match decision {
                     Some(value) if value["intent"]=="text" && value["text"].as_str().is_some_and(|s|!s.trim().is_empty() && s.len()<=16*1024)=>Some(Execution::Succeeded),
                     Some(value) if value["intent"]=="video" && value["prompt"].as_str().is_some_and(|s|!s.trim().is_empty() && s.len()<=12*1024)=>None,

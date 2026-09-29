@@ -17,6 +17,7 @@ pub mod assets;
 pub mod work_media;
 pub mod work_context;
 pub mod work_planner;
+pub(crate) mod assistant_json;
 pub mod work_execution;
 pub mod work_continuation;
 pub mod work_routes;

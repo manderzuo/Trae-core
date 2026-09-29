@@ -2,6 +2,104 @@
 mod fixture;
 use fixture::*;
 #[tokio::test]
+async fn fenced_legacy_helper_dispatch_and_replay_keep_one_video_step() {
+    let f=Fixture::with_gray_keys(false,Some(vec!["other-context-key".into()]));
+    assert!(!f.state.config.work_context_for_key(&f.owner.key_id));
+    *f.bridge.helper_raw.lock().unwrap()=Some("```json\n{\"intent\":\"video\",\"prompt\":\"橘猫在草地上散步\"}\n```".into());
+    let b=create();
+    let first=f.chat("fenced-legacy",&b).await;
+    assert_eq!(f.chat("fenced-legacy",&b).await["request_id"],first["request_id"]);
+    let op=f.state.store.budget_operation(first["request_id"].as_str().unwrap()).unwrap().unwrap();
+    assert_eq!(op.execution_state,aiwork_core::BudgetExecutionState::Succeeded);
+    assert_eq!(op.steps.len(),2);
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),1);
+}
+#[tokio::test]
+async fn fenced_read_only_helper_completes_without_video_dispatch() {
+    let f=Fixture::new();
+    *f.bridge.helper_raw.lock().unwrap()=Some("```json\n{\"action\":\"clarify\",\"effective_prompt\":null,\"spec_patch\":null,\"reference_policy\":null,\"clarification\":\"请说明新片段的动作；本次未提交视频。\"}\n```".into());
+    for stream in [false,true] {
+        let mut b=create();b["stream"]=json!(stream);
+        let r=f.chat(if stream{"fenced-read-only-stream"}else{"fenced-read-only-json"},&b).await;
+        let choice=&r["choices"][0];
+        let text=if stream{choice["delta"]["content"].as_str()}else{choice["message"]["content"].as_str()}.unwrap();
+        assert!(text.contains("请说明新片段的动作"));
+    }
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+}
+#[tokio::test]
+async fn fenced_helper_video_plan_dispatches_once_with_original_reference_and_specs() {
+    use starlink_dimension_router::assets::{self,ParsedAssetUpload};
+    let f=Fixture::new();
+    let stored=assets::write_asset(&f.state.config.data_dir,&f.owner,ParsedAssetUpload{filename:"source.mp4".into(),declared_mime:Some("video/mp4".into()),bytes:b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2".to_vec()}).unwrap();
+    let asset=assets::persist_asset(&f.state.store,&f.owner,&stored).unwrap();
+    *f.bridge.helper_raw.lock().unwrap()=Some("```json\n{\"action\":\"create\",\"effective_prompt\":\"从上传视频结尾生成新片段,保留人物与服装\",\"spec_patch\":{\"duration\":10,\"resolution\":\"720p\",\"ratio\":\"9:16\",\"watermark\":false},\"reference_policy\":\"replace\",\"clarification\":null}\n```".into());
+    let b=json!({"model":"seedance","video_asset_ids":[asset.id],"messages":[{"role":"user","content":"使用本次上传的视频作为参考，从它的结尾继续生成一个新片段。总时长10秒720P竖屏9:16，保留人物与服装，无水印。"}]});
+    let response=f.response(&f.key,"fenced-reference-plan",&b).await;
+    let status=response.status();
+    let result:Value=serde_json::from_slice(&to_bytes(response.into_body(),256*1024).await.unwrap()).unwrap();
+    assert_eq!(status,StatusCode::OK,"{result}");
+    assert!(result.get("error").is_none(),"valid fenced planning JSON must not become a provider error: {result}");
+    let request=result["request_id"].as_str().unwrap();
+    let v=f.state.store.work_version_for_request(&f.owner,request).unwrap().unwrap();
+    assert_eq!(v.state,aiwork_core::WorkVersionState::Completed);
+    let snapshot=work_context::read_snapshot(&f.state,&f.owner,&v).unwrap();
+    let wire=snapshot.dispatch_body.unwrap();
+    assert_eq!((wire["duration"].clone(),wire["resolution"].clone(),wire["ratio"].clone()),(json!(10),json!("720p"),json!("9:16")));
+    assert_eq!(wire["video_asset_ids"].as_array().unwrap().len(),1);
+    let media=f.state.store.owned_work_media(&f.owner,&snapshot.user_media_ids[0]).unwrap().unwrap();
+    assert_eq!(media.content_sha256,asset.sha256);
+    assert_eq!(f.chat("fenced-reference-plan",&b).await["request_id"],request);
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),1);
+}
+#[tokio::test]
+async fn helper_null_reference_policy_clarification_completes_without_video_or_generic_error() {
+    let f=Fixture::new();
+    *f.bridge.helper_decision.lock().unwrap()=Some(json!({"action":"clarify","effective_prompt":null,"spec_patch":null,"reference_policy":null,"clarification":"请说明新片段中的动作与时长；本次未提交视频。"}));
+    for stream in [false,true] {
+        let mut b=create();b["stream"]=json!(stream);
+        let r=f.chat(if stream{"null-policy-stream"}else{"null-policy-json"},&b).await;
+        let choice=&r["choices"][0];
+        let text=if stream{choice["delta"]["content"].as_str()}else{choice["message"]["content"].as_str()}.unwrap();
+        assert!(text.contains("请说明新片段中的动作与时长"));
+    }
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),2);
+}
+#[tokio::test]
+async fn video_attachment_without_prior_script_never_dispatches_helper_or_video() {
+    use starlink_dimension_router::assets::{self,ParsedAssetUpload};
+    let f=Fixture::new();
+    let stored=assets::write_asset(&f.state.config.data_dir,&f.owner,ParsedAssetUpload{filename:"source.mp4".into(),declared_mime:Some("video/mp4".into()),bytes:b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2".to_vec()}).unwrap();
+    let asset=assets::persist_asset(&f.state.store,&f.owner,&stored).unwrap();
+    let b=json!({"model":"seedance","video_asset_ids":[asset.id],"messages":[{"role":"user","content":"<system-reminder>Use PowerShell</system-reminder>"}]});
+    let r=f.chat("empty-video-script",&b).await;
+    assert!(r["choices"][0]["message"]["content"].as_str().unwrap().contains("请说明"));
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),0);
+}
+#[tokio::test]
+async fn natural_portrait_specs_reach_paid_wire_once_and_survive_revision() {
+    let f=Fixture::new();
+    *f.bridge.helper_decision.lock().unwrap()=Some(json!({"action":"create","effective_prompt":"普通亚洲女性夜晚独自走在小巷中","spec_patch":{"ratio":"9:16","resolution":"720p","watermark":false},"reference_policy":"replace","clarification":null}));
+    let b=json!({"model":"seedance","messages":[{"role":"user","content":"<user_input>之前生成5秒480P 16:9视频</user_input><user_input>写实电影感夜景人像：一位普通亚洲女性走在小巷中。画面为竖构图，高分辨率，无文字、无水印。</user_input>"}]});
+    let r=f.chat("natural-portrait",&b).await;
+    let version=f.state.store.work_version_for_request(&f.owner,r["request_id"].as_str().unwrap()).unwrap().unwrap();
+    let snapshot=work_context::read_snapshot(&f.state,&f.owner,&version).unwrap();
+    let wire=snapshot.dispatch_body.unwrap();
+    assert_eq!((wire["duration"].clone(),wire["resolution"].clone(),wire["ratio"].clone()),(json!(5),json!("720p"),json!("9:16")));
+    assert_eq!(f.chat("natural-portrait",&b).await["request_id"],r["request_id"]);
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),1);
+    *f.bridge.helper_decision.lock().unwrap()=None;
+    let next=f.chat("natural-portrait-revise",&revise(&r,"动作放慢，其他不变")).await;
+    let version=f.state.store.work_version_for_request(&f.owner,next["request_id"].as_str().unwrap()).unwrap().unwrap();
+    let snapshot=work_context::read_snapshot(&f.state,&f.owner,&version).unwrap();
+    assert_eq!((snapshot.duration,snapshot.resolution.as_str(),snapshot.ratio.as_str()),(5,"720p","9:16"));
+}
+#[tokio::test]
 async fn source_video_extension_preserves_full_asset_without_tail_fallback() {
     use starlink_dimension_router::assets::{self,ParsedAssetUpload};
     let f=Fixture::new();

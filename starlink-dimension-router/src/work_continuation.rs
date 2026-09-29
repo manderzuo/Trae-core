@@ -20,6 +20,17 @@ pub enum ContinuationMode {
     NativeFirstFrame,
     NativeVideoExtend,
 }
+pub(crate) fn requested_mode(input:&Value)->Result<ContinuationMode,String> {
+    let mode=input.get("continuation_mode").filter(|v|!v.is_null())
+        .map(|v|serde_json::from_value::<ContinuationMode>(v.clone())).transpose()
+        .map_err(|_|"continuation_mode_unsupported")?.unwrap_or(ContinuationMode::Auto);
+    if mode!=ContinuationMode::Auto {return Ok(mode);}
+    let text=work_planner::current_text(input);
+    let tail=text.contains("尾帧") || text.contains("最后一帧");
+    let requested=["截取","提取","做参考","作参考","作为参考","参考图"].iter().any(|s|text.contains(s));
+    let negated=["不要截取","不用尾帧","不要尾帧","不使用尾帧","不截取","不提取"].iter().any(|s|text.contains(s));
+    Ok(if tail&&requested&&!negated {ContinuationMode::TailReference}else{mode})
+}
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FrameEvidence {
@@ -245,13 +256,7 @@ pub async fn prepare_continuation(
     if !state.config.work_context_for_key(&p.key_id) || !state.config.continuation_enabled {
         return Err("continuation_disabled".into());
     }
-    let requested = input
-        .get("continuation_mode")
-        .filter(|v| !v.is_null())
-        .map(|v| serde_json::from_value::<ContinuationMode>(v.clone()))
-        .transpose()
-        .map_err(|_| "continuation_mode_unsupported")?
-        .unwrap_or(ContinuationMode::Auto);
+    let requested = requested_mode(&input)?;
     let s = state.clone();
     let caps = tokio::task::spawn_blocking(move || {
         s.bridge_client()

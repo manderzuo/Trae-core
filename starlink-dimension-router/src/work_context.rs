@@ -40,11 +40,7 @@ fn text(message: &Value) -> String {
     }
 }
 fn latest_user(body: &Value) -> String {
-    body["messages"]
-        .as_array()
-        .and_then(|m| m.iter().rev().find(|m| m["role"] == "user"))
-        .map(text)
-        .unwrap_or_default()
+    crate::work_planner::current_text(body)
 }
 fn needs_parent(body: &Value) -> bool {
     matches!(
@@ -301,7 +297,11 @@ pub fn resolve(
     if let Some(r) = explicit.or(history) {
         return Ok(r);
     }
-    Ok(if needs_parent(body) {
+    // A fresh uploaded video is itself the reference, not a guessed stored
+    // parent. Explicit parent actions and all ownership/conflict checks above
+    // still apply; upload/content validation remains mandatory downstream.
+    let uploaded_source=body["action"].is_null() && crate::reference_upload::has_source_video(body);
+    Ok(if needs_parent(body) && !uploaded_source {
         clarify()
     } else {
         WorkResolution::New

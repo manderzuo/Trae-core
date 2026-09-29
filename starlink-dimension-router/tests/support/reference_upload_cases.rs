@@ -5,6 +5,39 @@ use tower::ServiceExt;
 use sha2::Digest;
 
 const PNG: &[u8]=b"\x89PNG\r\n\x1a\nreference-fixture";
+const MP4: &[u8]=b"\x00\x00\x00\x18ftypmp42reference-fixture";
+
+#[tokio::test]
+async fn reference_upload_preserves_image_content_sniffing_for_client_renamed_png() {
+    let f=fixture("https://api.example.test");
+    let (_,cfg)=pending(&f,input(&["C:\\image.png"],false)).await;
+    let jpeg=b"\xff\xd8\xffimage-fixture";
+    assert_eq!(upload(&f,&cfg,0,jpeg).await.status(),StatusCode::OK);
+    let record=f.state.store.reference_upload(cfg["id"].as_str().unwrap()).unwrap().unwrap();
+    let asset=starlink_dimension_router::assets::read_owned(&f.state.store,&f.state.config.data_dir,&f.principal,record.asset_ids[0].as_deref().unwrap()).unwrap();
+    assert_eq!(asset.record.mime_type,"image/jpeg");
+    assert_eq!(f.bridge.sends.load(Ordering::SeqCst),0);
+}
+
+#[tokio::test]
+async fn reference_upload_video_and_image_slots_reject_type_swaps_and_resume_once() {
+    let f=fixture("https://api.example.test");
+    let (call,cfg)=pending(&f,input(&["C:\\clip.mp4","C:\\portrait.png"],false)).await;
+    assert_eq!(upload(&f,&cfg,0,PNG).await.status(),StatusCode::BAD_REQUEST);
+    assert_eq!(upload(&f,&cfg,1,MP4).await.status(),StatusCode::BAD_REQUEST);
+    assert_eq!(f.bridge.sends.load(Ordering::SeqCst),0);
+    assert_eq!(upload(&f,&cfg,0,MP4).await.status(),StatusCode::OK);
+    assert_eq!(upload(&f,&cfg,1,PNG).await.status(),StatusCode::OK);
+    let first=json_response(chat(&f,&f.key,follow(&call)).await).await;
+    assert!(first["request_id"].is_string(),"{first}");
+    let replay=json_response(chat(&f,&f.key,follow(&call)).await).await;
+    assert_eq!(first["request_id"],replay["request_id"]);
+    let claims=f.bridge.claims.lock().unwrap();
+    let videos:Vec<_>=claims.values().filter(|c|c["step_kind"]=="video").collect();
+    assert_eq!(videos.len(),1);
+    assert_eq!(videos[0]["body"]["image_asset_ids"].as_array().unwrap().len(),1);
+    assert_eq!(videos[0]["body"]["video_asset_ids"].as_array().unwrap().len(),1);
+}
 struct Fixture {
     app:axum::Router, state:Arc<StarlinkRouterState>, bridge:Arc<Bridge>, key:String,
     principal:aiwork_core::Principal, dir:Directory,
@@ -40,6 +73,45 @@ async fn pending_reference_upload_returns_stable_owned_work_without_paid_version
     assert_eq!(replayed["choices"][0]["message"]["content"],reply["choices"][0]["message"]["content"]);
     assert!(reply["choices"][0]["message"]["content"].as_str().unwrap().contains("[AIWORK_WORK:"));
     assert_eq!(f.bridge.sends.load(Ordering::SeqCst),0);
+}
+
+#[tokio::test]
+async fn video_and_continuation_script_upload_before_parent_clarification() {
+    let f=fixture_features("https://api.example.test",true);
+    let mut b=input(&["C:\\clips\\source.mp4"],false);
+    b["messages"][0]["content"][1]["text"]=json!("<user_input>使用本次上传的视频作为参考，从结尾继续生成10秒720P竖屏9:16的新片段，感染者扑向镜头。</user_input>");
+    let r=chat(&f,&f.key,b).await;
+    assert_eq!(r.status(),StatusCode::OK);
+    let call=json_response(r).await;
+    assert_eq!(call["choices"][0]["finish_reason"],"tool_calls","fresh source must reach upload, not prior-version clarification");
+    assert!(call["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"].is_string());
+    assert_eq!(f.bridge.sends.load(Ordering::SeqCst),0);
+}
+
+#[tokio::test]
+async fn video_only_followup_preserves_prior_script_across_sealed_upload_and_replay() {
+    let f=fixture_features("https://api.example.test",true);
+    let mut b=input(&["C:\\clips\\source.mp4"],false);
+    b["messages"][0]["content"][1]["text"]=json!("<system-reminder>powershell 5</system-reminder>\nREQUIREMENT:\n- Detect the language XX( such english ,chinese ) of the user's query.All outputs throughout the entire workflow must use the language XX.\n- You MUST NOT spawn more than 3 Explore subagents at the same time");
+    b["messages"].as_array_mut().unwrap().insert(0,json!({"role":"assistant","content":"请明确要续写哪个视频版本；本次未提交视频。"}));
+    b["messages"].as_array_mut().unwrap().insert(0,json!({"role":"user","content":"<user_input>使用本次上传的视频作为参考，从结尾继续生成10秒720P竖屏9:16的新片段，感染者扑向镜头。</user_input>"}));
+    let (call,cfg)=pending(&f,b).await;
+    assert_eq!(upload(&f,&cfg,0,MP4).await.status(),StatusCode::OK);
+    let first=json_response(chat(&f,&f.key,follow(&call)).await).await;
+    assert!(first["request_id"].is_string(),"{first}");
+    let replay=json_response(chat(&f,&f.key,follow(&call)).await).await;
+    assert_eq!(first["request_id"],replay["request_id"]);
+    let claims=f.bridge.claims.lock().unwrap();
+    let assists:Vec<_>=claims.values().filter(|c|c["step_kind"]=="assist").collect();
+    assert_eq!(assists.len(),1);
+    let payload:Value=serde_json::from_str(assists[0]["body"]["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert!(payload["current"].as_str().unwrap().contains("感染者扑向镜头"));
+    assert_eq!(payload["normalized_spec"]["duration"],10);
+    let videos:Vec<_>=claims.values().filter(|c|c["step_kind"]=="video").collect();
+    assert_eq!(videos.len(),1);
+    assert_eq!(videos[0]["body"]["duration"],10);
+    assert_eq!(videos[0]["body"]["ratio"],"9:16");
+    assert_eq!(videos[0]["body"]["video_asset_ids"].as_array().unwrap().len(),1);
 }
 
 #[tokio::test]
@@ -306,8 +378,9 @@ async fn reference_upload_generated_powershell_command_sends_exact_unicode_path_
     let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let f=fixture(&format!("http://{}",listener.local_addr().unwrap()));
     let image=f.dir.path().join("参考'&$.png");std::fs::write(&image,PNG).unwrap();
+    let video=f.dir.path().join("视频'&$.mp4");std::fs::write(&video,MP4).unwrap();
     let app=f.app.clone();let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap()});
-    let (call,cfg)=pending(&f,input(&[image.to_str().unwrap()],false)).await;
+    let (call,cfg)=pending(&f,input(&[image.to_str().unwrap(),video.to_str().unwrap()],false)).await;
     let args:Value=serde_json::from_str(call["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
     let cmd=STANDARD.encode(args["command"].as_str().unwrap().encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
     for shell in ["C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe","pwsh.exe"] {
@@ -324,6 +397,8 @@ async fn reference_upload_generated_powershell_command_sends_exact_unicode_path_
     let record=f.state.store.reference_upload(cfg["id"].as_str().unwrap()).unwrap().unwrap();
     let asset=starlink_dimension_router::assets::read_owned(&f.state.store,&f.state.config.data_dir,&f.principal,record.asset_ids[0].as_deref().unwrap()).unwrap();
     assert_eq!(asset.bytes,PNG);
+    let video=starlink_dimension_router::assets::read_owned(&f.state.store,&f.state.config.data_dir,&f.principal,record.asset_ids[1].as_deref().unwrap()).unwrap();
+    assert_eq!(video.bytes,MP4);
     assert_eq!(f.bridge.claims.lock().unwrap().values().filter(|c|c["step_kind"]=="video").count(),1,"PS5/PS7 receipt replay must use the same generated video");
     server.abort();let _=server.await;
 }

@@ -14,7 +14,7 @@ pub(crate) fn fail(code:&str)->Response {
     let status=match code {
         "frame_extractor_busy"|"key_concurrency_exceeded"|"video_download_busy"|"budget_preparation_busy"|"bridge_workers_busy"|"reference_upload_limited"|"stream_observer_limit"=>StatusCode::TOO_MANY_REQUESTS,
         "quota_insufficient"=>StatusCode::PAYMENT_REQUIRED,
-        "work_parent_unavailable"|"frame_result_not_ready"|"video_not_ready"|"budget_identity_conflict"=>StatusCode::CONFLICT,
+        "work_parent_unavailable"|"frame_result_not_ready"|"video_not_ready"|"budget_identity_conflict"|"video_continuation_not_active"=>StatusCode::CONFLICT,
         "invalid_budget_business_request"|"invalid_chat_image"|"reference_video_metadata_invalid"|
         "reference_video_format_unsupported"|"reference_asset_type_mismatch"|
         "reference_asset_unavailable"|"reference_video_budget_metadata_required"|
@@ -244,7 +244,7 @@ pub(crate) async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Princ
     };
     let result=wait_result(state.clone(),assist).await?;
     let content=result.pointer("/choices/0/message/content").and_then(Value::as_str).ok_or("assist_result_invalid")?;
-    let decision:Value=serde_json::from_str(content.trim()).map_err(|_|"assist_result_invalid")?;
+    let decision=crate::assistant_json::object(content,16*1024).map_err(|_|"assist_result_invalid")?;
     if decision["intent"]=="text" {
         let text=decision["text"].as_str().filter(|s|!s.trim().is_empty() && s.len()<=16*1024).ok_or("assist_result_invalid")?;
         let s=state.clone();let p=principal.clone();let b=original.clone();
@@ -471,10 +471,17 @@ pub(crate) fn finish_definite_failure(state:&StarlinkRouterState,request:&str,co
     if matches!(code,"assist_result_invalid"|"video_execution_failed"|"video_safety_check_failed"|"reference_safety_check_failed"|"prompt_safety_check_failed"|"budget_not_sent"|"video_billing_paused"|
         "quota_insufficient"|"budget_policy_unconfigured"|"budget_policy_expired"|"budget_policy_invalid"|
         "reference_video_budget_metadata_required"|"invalid_budget_business_request"|"reference_image_limit"|
+        "reference_video_metadata_invalid"|"reference_video_format_unsupported"|"reference_asset_type_mismatch"|
         "invalid_image_asset_ids"|"invalid_reference_image"|"video_continuation_not_authorized"|
         "work_parent_required"|"work_decision_invalid"|"work_spec_unsupported"|"continuation_mode_unsupported"|
         "source_video_not_ready"|"source_video_unavailable"|"source_video_invalid"|"source_video_identity_invalid") {
-        let _=state.store.finish_budget_execution(request,aiwork_core::BudgetExecutionState::Failed);
+        // The store CAS refuses unfinished/unknown paid steps and changes only
+        // execution, not finance. A late helper receipt can still settle normally.
+        // Do the same version/media cleanup for background continuations that
+        // have no HTTP observer to reflect the terminal disposition.
+        if state.store.finish_budget_execution(request,aiwork_core::BudgetExecutionState::Failed).is_ok() {
+            crate::work_execution::reflect_failure(state,request,code);
+        }
     }
 }
 pub(crate) async fn resume_checkpoint(state:Arc<StarlinkRouterState>,checkpoint:aiwork_core::BudgetContinuation)->Result<(),String> {

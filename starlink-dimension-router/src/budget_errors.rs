@@ -30,6 +30,7 @@ pub(crate) fn public_code(code:&str)->Option<&'static str> {
         "budget_not_sent"=>"budget_not_sent",
         "budget_execution_wait_timeout"=>"budget_execution_wait_timeout",
         "video_billing_paused"=>"video_billing_paused",
+        "video_continuation_not_active"=>"video_continuation_not_active",
         "video_execution_failed"=>"video_execution_failed",
         "video_safety_check_failed"=>"video_safety_check_failed",
         "reference_safety_check_failed"=>"reference_safety_check_failed",

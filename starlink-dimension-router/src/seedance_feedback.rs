@@ -68,6 +68,12 @@ pub(crate) fn video_failure(result:&Value)->&'static str {
     }
 }
 pub(crate) fn message(code:&str)->&'static str {match code {
+    "work_spec_unsupported"=>"本轮视频规格超出支持范围或存在冲突；时长支持4至15秒，分辨率支持480P或720P，也可用横屏、竖屏、高清等描述。本次未提交视频。",
+    "work_decision_invalid"|"assist_result_invalid"=>"辅助模型返回的规划格式或字段未通过校验；本次未提交视频，请保留请求编号供排查。",
+    "work_parent_required"=>"本次续写或修改没有找到可用的上一版视频，请在原对话继续或指定已有视频版本；本次未提交视频。",
+    "reference_video_format_unsupported"=>"当前视频处理不支持该素材格式；提取尾帧请上传 MP4，本次未提交视频。",
+    "reference_video_metadata_invalid"=>"参考视频的时长或时间信息未通过校验；本次未提交视频，请检查素材文件或重新导出。",
+    "reference_asset_type_mismatch"=>"参考素材的实际类型与请求声明不一致；本次未提交视频，请重新选择对应类型的素材。",
     "source_video_not_ready"=>"父视频尚未确认完成，未提交续写片段。",
     "source_video_unavailable"|"source_video_invalid"|"source_video_identity_invalid"=>"无法读取并核验指定父视频，已停止本次续写；没有改用尾帧或无素材生成，原视频不受影响。",
     "continuation_disabled"=>"续写功能尚未启用；本次未提交新的视频片段。",
@@ -86,6 +92,7 @@ pub(crate) fn message(code:&str)->&'static str {match code {
     "quota_insufficient"=>"当前 Key 可用积分不足，无法提交本次任务。",
     "budget_policy_unconfigured"=>"当前模型缺少计费配置，无法继续提交任务。",
     "video_billing_paused"=>"视频提交目前处于暂停状态。",
+    "video_continuation_not_active"=>"该任务已结束，不能再次提交视频；请查询原任务状态。需要重新生成时请发起新请求。",
     "budget_not_sent"=>"本次任务未发送到视频上游。",
     "stream_observer_limit"=>"系统当前等待连接已达全局上限，请稍后连接同一任务。",
     "budget_preparation_busy"=>"系统正在处理较多任务，请稍后重试。",

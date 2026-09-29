@@ -31,10 +31,13 @@ pub(crate) struct Bridge {
     pub(crate) source_reads: Mutex<Vec<String>>,
     pub(crate) frame_failure: std::sync::atomic::AtomicBool,
     pub(crate) frame_reads: AtomicUsize,
+    pub(crate) uploaded_frame_reads: AtomicUsize,
     pub(crate) billing_final: std::sync::atomic::AtomicBool,
     pub(crate) assist_prepare_failure: std::sync::atomic::AtomicBool,
     pub(crate) assist_prepare_panic: std::sync::atomic::AtomicBool,
     pub(crate) helper_decision: Mutex<Option<Value>>,
+    pub(crate) helper_raw: Mutex<Option<String>>,
+    pub(crate) video_prepare_error: Mutex<Option<(u16, String)>>,
 }
 impl BridgeTransport for Bridge {
     fn send(
@@ -49,20 +52,28 @@ impl BridgeTransport for Bridge {
             Some("Bearer bridge-only")
         );
         let input: Value = serde_json::from_slice(raw).unwrap_or(Value::Null);
+        if url.ends_with("/budgets/prepare") && input["step_kind"] == "video" {
+            if let Some((status, code)) = self.video_prepare_error.lock().unwrap().clone() {
+                return Ok(BridgeResponse { status, headers: BTreeMap::new(), body: serde_json::to_vec(&json!({"error":{"code":code}})).unwrap() });
+            }
+        }
         if url.ends_with("/budgets/prepare") && input["step_kind"]=="assist" && self.assist_prepare_panic.load(Ordering::SeqCst) {panic!("simulated preparation worker interruption");}
         if url.ends_with("/budgets/prepare") && input["step_kind"]=="assist" && self.assist_prepare_failure.load(Ordering::SeqCst) {
             return Ok(BridgeResponse {status:503,headers:BTreeMap::new(),body:serde_json::to_vec(&json!({"error":{"code":"budget_policy_unconfigured"}})).unwrap()});
         }
-        if url.contains("/last-frame?") {
+        if url.contains("/last-frame?") || url.ends_with("/reference-last-frame") {
             if self.frame_failure.load(Ordering::SeqCst) {
                 return Err("frame unavailable".into());
             }
-            self.frame_reads.fetch_add(1, Ordering::SeqCst);
+            if url.ends_with("/reference-last-frame") {self.uploaded_frame_reads.fetch_add(1,Ordering::SeqCst);} else {self.frame_reads.fetch_add(1, Ordering::SeqCst);}
             let claims = self.claims.lock().unwrap();
-            let (id, c) = claims
+            let uploaded=url.ends_with("/reference-last-frame");
+            let owned_key=headers.get("x-aiwork-core-key-id").cloned().unwrap_or_default();
+            let upload_claim=json!({"core_key_id":owned_key});let upload_id="uploaded".to_string();
+            let (id, c) = if uploaded {(&upload_id,&upload_claim)} else {claims
                 .iter()
                 .find(|(id, _)| url.contains(&format!("/requests/{id}/")))
-                .ok_or("missing video claim")?;
+                .ok_or("missing video claim")?};
             use base64::Engine;
             use sha2::{Digest, Sha256};
             let body=base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aVl8AAAAASUVORK5CYII=").unwrap();
@@ -76,7 +87,7 @@ impl BridgeTransport for Bridge {
                     ("x-aiwork-frame-timestamp-ms".into(), "875".into()),
                     (
                         "x-aiwork-source-sha256".into(),
-                        format!("{:x}", Sha256::digest(format!("source-{id}"))),
+                        if uploaded {format!("{:x}",Sha256::digest(if self.source_identity_bad.load(Ordering::SeqCst) {b"wrong"} else {raw}))}else{format!("{:x}", Sha256::digest(format!("source-{id}")))},
                     ),
                     (
                         "x-aiwork-frame-sha256".into(),
@@ -169,7 +180,8 @@ impl BridgeTransport for Bridge {
                         json!({"action":if payload["requested_action"]=="continue"{"continue"}else if parent&&!create{"revise"}else{"create"},"effective_prompt":prompt,"spec_patch":{},"reference_policy":"inherit","clarification":null})
                     };
                     let decision=self.helper_decision.lock().unwrap().clone().unwrap_or(decision);
-                    json!({"choices":[{"message":{"content":decision.to_string()},"finish_reason":"stop"}]})
+                    let content=self.helper_raw.lock().unwrap().clone().unwrap_or_else(||decision.to_string());
+                    json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]})
                 };
             } else if url.contains("/billing?") {
                 if self.billing_final.load(Ordering::SeqCst) {
@@ -210,6 +222,12 @@ impl Fixture {
         Self::with_gray_keys(enabled, None)
     }
     pub(crate) fn with_gray_keys(enabled: bool, gray_keys: Option<Vec<String>>) -> Self {
+        Self::with_options(enabled, gray_keys, 32)
+    }
+    pub(crate) fn with_max_concurrency(limit: i64) -> Self {
+        Self::with_options(false, None, limit)
+    }
+    fn with_options(enabled: bool, gray_keys: Option<Vec<String>>, limit: i64) -> Self {
         let dir = std::env::temp_dir().join(format!("work-execution-{}", rand::random::<u64>()));
         let store = Arc::new(CoreStore::open(&dir).unwrap());
         store.migrate().unwrap();
@@ -224,10 +242,11 @@ impl Fixture {
             )
             .unwrap();
         let k = store
-            .issue_api_key(
+            .issue_api_key_with_max_concurrency(
                 "admin",
                 "test",
                 BTreeSet::from(["admin:*".into()]),
+                limit,
                 "bootstrap",
             )
             .unwrap();
@@ -264,10 +283,13 @@ impl Fixture {
             source_reads: Mutex::new(Vec::new()),
             frame_failure: std::sync::atomic::AtomicBool::new(false),
             frame_reads: AtomicUsize::new(0),
+            uploaded_frame_reads: AtomicUsize::new(0),
             billing_final: std::sync::atomic::AtomicBool::new(false),
             assist_prepare_failure: std::sync::atomic::AtomicBool::new(false),
             assist_prepare_panic: std::sync::atomic::AtomicBool::new(false),
             helper_decision: Mutex::new(None),
+            helper_raw: Mutex::new(None),
+            video_prepare_error: Mutex::new(None),
         });
         let mut config = RouterConfig::defaults(dir.clone());
         config.budget_billing_v2 = true;

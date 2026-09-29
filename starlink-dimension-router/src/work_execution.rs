@@ -330,6 +330,13 @@ fn pin_and_bind(
     }
     let now = chrono::Utc::now().timestamp_millis();
     let mut media_ids = Vec::new();
+    let uploaded_tail=continuation.is_none()
+        && crate::work_continuation::requested_mode(&original)?==crate::work_continuation::ContinuationMode::TailReference
+        && original["video_asset_ids"].as_array().is_some_and(|v|!v.is_empty());
+    if uploaded_tail && (!state.config.continuation_enabled || original["video_asset_ids"].as_array().is_none_or(|v|v.len()!=1)) {
+        return Err("continuation_mode_unsupported".into());
+    }
+    let mut uploaded_frame=None;
     if !work_planner::clear_reference(&work_planner::current_text(&original)) {
         for image in &images {
             let m = crate::work_media::pin(state, p, &work.work_id, image, now)?;
@@ -344,6 +351,13 @@ fn pin_and_bind(
                     id.as_str().ok_or("invalid_reference_context")?,
                 )
                 .map_err(|_| "reference_asset_unavailable")?;
+                if uploaded_tail && field=="video_asset_ids" {
+                    let frame=state.bridge_client().reference_last_frame(&p.key_id,&owned.bytes)?;
+                    let parsed=crate::assets::ParsedAssetUpload {filename:"reference-tail.png".into(),declared_mime:Some("image/png".into()),bytes:frame.bytes};
+                    let m=crate::work_media::pin_kind(state,p,&work.work_id,&parsed,now,Some("tail_frame"))?;
+                    uploaded_frame=Some(m.media_id);
+                    continue;
+                }
                 let parsed = crate::assets::ParsedAssetUpload {
                     filename: owned.record.filename,
                     declared_mime: Some(owned.record.mime_type),
@@ -363,6 +377,15 @@ fn pin_and_bind(
         snapshot.continuation_video_media_id = c.continuation_video_media_id.clone();
         snapshot.effective_prompt = c.effective_prompt.clone();
         snapshot.reference_mode = c.reference_mode.clone();
+    }
+    if let Some(frame)=uploaded_frame {
+        // This frame is the user's durable reference, not an expendable frame
+        // derived from a previous generated version. Later revisions retain it.
+        snapshot.user_media_ids=media_ids;
+        snapshot.user_media_ids.push(frame);
+        snapshot.tail_frame_media_id=None;
+        snapshot.continuation_video_media_id=None;
+        snapshot.reference_mode="tail_reference".into();
     }
     snapshot.parent_version_id = if d.action == WorkIntent::Create {
         None
@@ -387,6 +410,8 @@ fn pin_and_bind(
         // The full immediate parent replaces historical video references;
         // retaining every ancestor would exceed upstream limits and mix motion.
         if snapshot.continuation_video_media_id.is_some() && media.kind=="video" && Some(id)!=snapshot.continuation_video_media_id.as_ref() {continue;}
+        // Explicit tail mode must not also submit an inherited full video.
+        if snapshot.tail_frame_media_id.is_some() && media.kind=="video" {continue;}
         if image_assets.len()+video_assets.len()>=10 {return Err("reference_image_limit".into());}
         let asset = crate::work_media::materialize(state, p, &media, now)?;
         let owned = crate::assets::read_owned(&state.store, &state.config.data_dir, p, &asset.id)
@@ -579,7 +604,9 @@ pub(crate) async fn execute(
                 return Err("work_decision_invalid".into());
             }
         }
-        let continuation = if decision.action == WorkIntent::Continue {
+        let uploaded_tail=crate::work_continuation::requested_mode(&normalized)?==crate::work_continuation::ContinuationMode::TailReference
+            && original["video_asset_ids"].as_array().is_some_and(|v|!v.is_empty());
+        let continuation = if decision.action == WorkIntent::Continue && !uploaded_tail {
             let mut input = normalized.clone();
             input["prompt"] = json!(decision.effective_prompt);
             Some(
