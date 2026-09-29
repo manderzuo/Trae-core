@@ -866,8 +866,14 @@ impl BridgeTransport for HttpBridgeTransport {
         let response = Self::send_request(method, url, headers, body)?;
         let status = response.status() as u16;
         let mut response_headers = BTreeMap::new();
-        if let Some(value) = response.header("content-type") {
-            response_headers.insert("content-type".into(), value.to_string());
+        // Frame identity checks require provenance on the actual HTTP path.
+        // Fake transports already retained these fields and hid this omission.
+        // Never forward credentials, cookies or arbitrary provider headers.
+        for name in ["content-type","content-length","content-disposition","cache-control","retry-after",
+            "x-aiwork-frame-width","x-aiwork-frame-height","x-aiwork-frame-timestamp-ms",
+            "x-aiwork-source-sha256","x-aiwork-frame-sha256","x-aiwork-request-id",
+            "x-aiwork-budget-id","x-aiwork-core-key-id","x-aiwork-account-ref","x-aiwork-bridge-instance-id"] {
+            if let Some(value)=response.header(name) {response_headers.insert(name.into(),value.to_string());}
         }
         Ok(BridgeStreamingResponse {
             status,

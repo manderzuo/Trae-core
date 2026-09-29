@@ -28,3 +28,29 @@ fn last_frame_checks_exact_identity_digest_dimensions_and_size() {
     let mut r=reply();r.body=vec![0;8*1024*1024+1];r.headers.insert("content-length".into(),r.body.len().to_string());assert!(BridgeClient::from_transport("http://bridge","bridge-only",Arc::new(r)).last_frame(&step()).is_err());
     let mut s=step();s.execution_state=BudgetExecutionState::Running;assert!(client.last_frame(&s).is_err());
 }
+
+#[test]
+fn real_http_stream_preserves_authenticated_frame_provenance_headers() {
+    use std::{io::{Read,Write},net::TcpListener,time::Duration};
+    let listener=TcpListener::bind("127.0.0.1:0").unwrap();
+    let base=format!("http://{}",listener.local_addr().unwrap());
+    let expected=reply();
+    let server=std::thread::spawn(move || {
+        let (mut stream,_)=listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut bytes=Vec::new();let mut buffer=[0;1024];
+        while !bytes.windows(4).any(|w|w==b"\r\n\r\n") {
+            let n=stream.read(&mut buffer).unwrap();assert!(n>0);bytes.extend_from_slice(&buffer[..n]);assert!(bytes.len()<8192);
+        }
+        let request=String::from_utf8(bytes).unwrap();
+        assert!(request.starts_with("POST /internal/bridge/v2/requests/request-frame/last-frame?budget_id=budget-frame "));
+        assert!(request.to_ascii_lowercase().contains("authorization: bearer bridge-only"));
+        let mut header=String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");
+        for (k,v) in expected.headers {header.push_str(&format!("{k}: {v}\r\n"));}
+        header.push_str("\r\n");stream.write_all(header.as_bytes()).unwrap();stream.write_all(&expected.body).unwrap();
+    });
+    let result=BridgeClient::new(base,"bridge-only").last_frame(&step());
+    server.join().unwrap();
+    let frame=result.expect("real HTTP transport must preserve frame length and owned provenance, not only content-type");
+    assert_eq!((frame.width,frame.height,frame.timestamp_ms),(1,1,875));
+}
