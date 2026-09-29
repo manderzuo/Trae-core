@@ -12,7 +12,17 @@ impl BridgeTransport for Replies {
         assert_eq!(method, "GET", "recovery must never create a paid task");
         assert_eq!(headers.get("authorization").unwrap(), "Bearer test-bridge-only");
         if let Some(lock)=self.configuration_lock.lock().unwrap().as_ref().and_then(|weak|weak.upgrade()) {
-            if lock.try_lock().is_err() {return Err("network was called while holding shared bridge configuration lock".into());}
+            // Recovery has independent concurrent lanes. A single try_lock
+            // can observe another lane's brief configuration snapshot, not
+            // a lock retained by THIS network call. A blocking probe on a
+            // separate thread distinguishes contention from retained ownership.
+            let (released,seen)=std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let guard=lock.lock().unwrap();
+                drop(guard);
+                let _=released.send(());
+            });
+            if seen.recv_timeout(std::time::Duration::from_secs(1)).is_err() {return Err("network was called while holding shared bridge configuration lock".into());}
         }
         let value = if url.contains("/receipt-events?") {
                 if let Some(gate)=self.event_gate.lock().unwrap().take() {gate.recv().unwrap();}
