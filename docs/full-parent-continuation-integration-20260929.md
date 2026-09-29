@@ -45,3 +45,11 @@ MCP `9e7d5c8` 已推送并安装本机副本，保留现有DPAPI凭据。三个�
 能力证据摘要 `37b507bbf7f9160875e07cdf7c2753085616ec17d91ac3ed1e82129036a8d7e7`；Core仅周Key灰度不变。部署前备份配置和一致性SQLite，验证全Key余额、预占及旧unknown记录不变。重启桥接通过已有恢复协议保留11笔历史未决记录，没有清账解锁。
 
 本轮完成自动取父视频→续写→下载→结算的真实链路；没有额外测试所有桌面客户端UI，也没有开放严格首帧或自动拼接。
+
+## 后续全量开放（2026-09-29）
+
+用户明确要求现有和新增Key全部可用后，公网持久配置的 `work_context_key_ids` 从周Key白名单调整为空数组（代码契约：对所有Key生效），保留 `work_context_enabled=true`、`continuation_enabled=true`。这是功能开放范围变化，不是删除Key的权限、额度或并发校验；停用/删除的Key不会因此恢复有效，也不允许跨Key访问父视频。
+
+变更时数据库共有4个Key且无ready/running任务；配置已备份到 `/var/lib/starlink-dimension-router/backups/20260929-continuation-all-keys/router-before.json`。只修改白名单字段，重启Core后健康检查200，公网MCP doctor鉴权通过，桥接charge_ready=true、完整视频续写能力为true。部署检查确认余额、历史预占、unknown请求、Key状态与并发配置未变。
+
+重新执行配置回归 `work_context_gray_key_isolation_and_global_disable`，1项通过。没有新建Key、没有付费生成，也没有逐个客户端实测；新增Key自动适用源于空白名单对任意Key执行同一判断，无需单独登记。既有灰度阶段记录保留作为历史验收证据，本节为当前开放范围。
