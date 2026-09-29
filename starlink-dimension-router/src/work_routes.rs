@@ -25,7 +25,7 @@ pub async fn get(
     Path(work): Path<String>,
     Extension(p): Extension<Principal>,
 ) -> Response {
-    if !state.config.work_context_enabled {
+    if !state.config.work_context_for_key(&p.key_id) {
         return StatusCode::NOT_FOUND.into_response();
     }
     if aiwork_core::require_scope(&p, "videos:read").is_err() {
@@ -49,7 +49,7 @@ pub async fn continue_work(
     Extension(p): Extension<Principal>,
     body: Bytes,
 ) -> Response {
-    if !state.config.work_context_enabled || !state.config.continuation_enabled {
+    if !state.config.work_context_for_key(&p.key_id) || !state.config.continuation_enabled {
         return crate::budget_flow::fail("continuation_disabled");
     }
     if aiwork_core::require_scope(&p, "videos:submit").is_err() {

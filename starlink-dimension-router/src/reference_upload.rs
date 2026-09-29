@@ -228,7 +228,7 @@ pub(crate) async fn before_chat(state:&Arc<StarlinkRouterState>,p:&Principal,hea
         let mut original:Value=match serde_json::from_str(&text) {Ok(v)=>v,Err(_)=>return Some(bad("reference_upload_invalid"))};
         remove_attachment_markup(&mut original);
         original["image_asset_ids"]=json!(record.asset_ids);
-        if state.config.work_context_enabled {
+        if state.config.work_context_for_key(&p.key_id) {
             match state.store.owned_work_for_conversation(p,&format!("upload:{id}")) {
                 Ok(Some(w))=>original["work_context"]=json!({"work_id":w.work_id}),
                 Ok(None)=>{},Err(_)=>return Some(bad("work_context_unavailable")),
@@ -268,7 +268,7 @@ pub(crate) async fn before_chat(state:&Arc<StarlinkRouterState>,p:&Principal,hea
     if args.get("description").is_some() {args["description"]=json!("Upload the user-attached reference images before generating video");}
     let mut value=json!({"id":format!("chatcmpl-ref-{id}"),"object":"chat.completion","model":"seedance","created":chrono::Utc::now().timestamp(),
         "choices":[{"index":0,"message":{"role":"assistant","content":"正在通过本机工具上传本次参考图片，上传完成后开始生成视频。此步骤尚未提交视频、未扣视频积分。","tool_calls":[{"id":format!("{PREFIX}{id}"),"type":"function","function":{"name":tool.name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]});
-    if state.config.work_context_enabled {
+    if state.config.work_context_for_key(&p.key_id) {
         let resolved=match crate::work_context::resolve(state,p,headers,body) {Ok(r)=>r,Err(_)=>return Some(bad("work_context_unavailable"))};
         let (work,version)=match resolved {
             crate::work_context::WorkResolution::Existing{work,base_version}=>(work,base_version),

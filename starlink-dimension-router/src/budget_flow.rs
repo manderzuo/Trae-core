@@ -133,7 +133,7 @@ pub(crate) fn read_result(state:&StarlinkRouterState,step:&BudgetStepView)->Resu
 pub(crate) async fn video_status(state:Arc<StarlinkRouterState>,principal:Principal,request:String)->Response {
     let result=tokio::task::spawn_blocking(move ||->Result<Option<Value>,String> {
         let Some(step)=owned_video_step(&state,&principal,&request)? else {
-            if state.config.work_context_enabled && state.store.active_principal_for_request(&request).map_err(|_|"work_context_unavailable")?.is_some_and(|p|p.key_id==principal.key_id&&p.user_id==principal.user_id) {
+            if state.config.work_context_for_key(&principal.key_id) && state.store.active_principal_for_request(&request).map_err(|_|"work_context_unavailable")?.is_some_and(|p|p.key_id==principal.key_id&&p.user_id==principal.user_id) {
                 let failed=state.store.budget_operation(&request).map_err(|_|"work_context_unavailable")?.is_some_and(|op|matches!(op.execution_state,aiwork_core::BudgetExecutionState::Failed|aiwork_core::BudgetExecutionState::Canceled)) || state.store.request_state(&request).map_err(|_|"work_context_unavailable")?==aiwork_core::RequestState::Failed;
                 return Ok(Some(json!({"task":{"id":request,"status":if failed {"failed"}else{"queued"}},"request_id":request})));
             }
@@ -151,7 +151,7 @@ pub(crate) async fn video_status(state:Arc<StarlinkRouterState>,principal:Princi
             let code=if result["status"]=="failed_no_charge" {"budget_not_sent"} else {crate::seedance_feedback::video_failure(&result["result"])};
             value["task"]["error"]=failure_feedback(&state,code,&request)["error"].clone();
         }
-        if state.config.work_context_enabled {
+        if state.config.work_context_for_key(&principal.key_id) {
             if status=="completed" {crate::work_execution::complete_version(&state,&principal,&request)?;}
             crate::work_context::decorate_owned_request(&state,&principal,&request,&mut value)?;
         }
@@ -222,7 +222,7 @@ pub(crate) async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Princ
         let result=wait_result(state.clone(),video).await?;
         return completed_video(&state,&principal,&request,&result,&original).await;
     }
-    if state.config.work_context_enabled {return crate::work_execution::execute(state,principal,request,original,fresh,dispatch_only).await;}
+    if state.config.work_context_for_key(&principal.key_id) {return crate::work_execution::execute(state,principal,request,original,fresh,dispatch_only).await;}
     state.seedance_results.progress(&request,Stage::Assistant);
     let assist=if let Some(step)=operation.and_then(|op|op.steps.into_iter().find(|s|s.kind==BudgetStepKind::Assist)) {step} else {
         if !fresh {return Err("budget_preparation_requires_recovery".into());}
@@ -297,7 +297,7 @@ pub(crate) async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Princ
 }
 async fn completed_video(state:&Arc<StarlinkRouterState>,principal:&Principal,request:&str,result:&Value,body:&Value)->Result<Value,String> {
     if result["status"]!="completed" {return Err(crate::seedance_feedback::video_failure(result).into());}
-    if state.config.work_context_enabled {crate::work_execution::complete_version(state,principal,request)?;}
+    if state.config.work_context_for_key(&principal.key_id) {crate::work_execution::complete_version(state,principal,request)?;}
     state.seedance_results.progress(request,crate::seedance_feedback::Stage::Delivery);
     crate::video_delivery::completion(state,principal,request,body).await
 }
@@ -339,7 +339,7 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
     if let Some(response)=crate::reference_upload::before_chat(&state,&principal,&mut headers,&mut body).await {return response;}
     if let Some(response)=crate::video_delivery::follow_up(&state,&principal,&body).await {return response;}
     let s=state.clone();let p=principal.clone();
-    if !state.config.work_context_enabled {body=match tokio::task::spawn_blocking(move ||->Result<Value,(&'static str,Value)> {
+    if !state.config.work_context_for_key(&principal.key_id) {body=match tokio::task::spawn_blocking(move ||->Result<Value,(&'static str,Value)> {
         crate::reference_context::recover(&s,&p,&mut body)
             .map_err(|code|(code,crate::reference_diagnostics::summarize(&body)))?;Ok(body)
     }).await {
@@ -370,6 +370,7 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
     let stream=body["stream"].as_bool().unwrap_or(false);
     if let Some(publisher)=publisher {
         let rid=request.clone();let state=state.clone();
+        let work_enabled=state.config.work_context_for_key(&principal.key_id);
         tokio::spawn(async move {
             // Exactly one HTTP leader also coordinates with background recovery.
             // Subscribers never prepare/dispatch or re-run delivery selection.
@@ -391,7 +392,7 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
             };
             if let Err(code)=&outcome {
                 finish_definite_failure(&state,&rid,code);
-                if state.config.work_context_enabled {crate::work_execution::reflect_failure(&state,&rid,code);}
+                if work_enabled {crate::work_execution::reflect_failure(&state,&rid,code);}
                 if fresh {let _=state.store.finish_unadmitted_request(&rid);}
             }
             publisher.complete(outcome);

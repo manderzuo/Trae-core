@@ -2,6 +2,8 @@
 
 Core `work_context_enabled` 默认关闭。开启后，每次付费生成绑定独立 request/budget 与不可变加密版本快照；同作业可以从明确父版本改版或形成并发分支。状态、下载和工具回执不创建新版本。没有可靠父版本时澄清，不猜当前 Key 的最近视频。
 
+灰度设置 `work_context_key_ids` 为明确 Key ID 列表：只有入选 Key 进入新作业流程、上下文接口和提帧后台任务，其他 Key 维持旧生成路径；空列表代表全量。全局开关关闭优先于列表。
+
 返回 `work_context` 以及文本 `[AIWORK_WORK:…]` 句柄。句柄不是凭据，读取仍要求原 Key 认证。API 可明确传 `work_context.work_id/base_version_id`；客户端保留历史标记也可以续接。新请求当前显式规格优先，未指定规格继承，新的用户素材默认替换旧素材。永久 Key、JWT、ticket 和终端输出不进入辅助模型上下文。
 
 `GET /v1/video-works/:work_id` 只读版本状态，不返回加密快照。

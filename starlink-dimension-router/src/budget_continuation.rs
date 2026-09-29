@@ -9,7 +9,7 @@ pub(crate) fn save_with_headers(state:&StarlinkRouterState,principal:&aiwork_cor
     }
     let fingerprint=state.store.request_fingerprint_for_billing(request).map_err(|_|"checkpoint request missing")?;
     let context=format!("budget-continuation-v1:{request}:{}:{fingerprint}",principal.key_id);
-    let stored=if state.config.work_context_enabled {
+    let stored=if state.config.work_context_for_key(&principal.key_id) {
         let mut binding=crate::work_execution::freeze_context(state,principal,headers,body)?;
         if body.get("messages").is_none() && body["prompt"].as_str().is_some_and(|s|!s.trim().is_empty()) && binding.work_id.is_none() && binding.clarification.is_none() {
             binding.work_id=Some(state.store.create_video_work(principal,&binding.association).map_err(|_|"work_context_unavailable")?.work_id);

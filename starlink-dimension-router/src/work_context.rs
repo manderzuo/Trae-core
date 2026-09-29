@@ -200,7 +200,7 @@ pub fn resolve(
     headers: &HeaderMap,
     body: &Value,
 ) -> Result<WorkResolution, String> {
-    if !state.config.work_context_enabled {
+    if !state.config.work_context_for_key(&p.key_id) {
         return Ok(WorkResolution::New);
     }
     // Explicit independent creation must never inherit references or a marker.
@@ -314,7 +314,7 @@ pub fn decorate_owned_request(
     request: &str,
     reply: &mut Value,
 ) -> Result<(), String> {
-    if !state.config.work_context_enabled {
+    if !state.config.work_context_for_key(&p.key_id) {
         return Ok(());
     }
     if let Some(v) = state

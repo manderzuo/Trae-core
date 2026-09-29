@@ -182,6 +182,9 @@ impl Fixture {
         Self::with_continuation(false)
     }
     pub(crate) fn with_continuation(enabled: bool) -> Self {
+        Self::with_gray_keys(enabled, None)
+    }
+    pub(crate) fn with_gray_keys(enabled: bool, gray_keys: Option<Vec<String>>) -> Self {
         let dir = std::env::temp_dir().join(format!("work-execution-{}", rand::random::<u64>()));
         let store = Arc::new(CoreStore::open(&dir).unwrap());
         store.migrate().unwrap();
@@ -237,6 +240,11 @@ impl Fixture {
         let mut config = RouterConfig::defaults(dir.clone());
         config.budget_billing_v2 = true;
         config.work_context_enabled = true;
+        if let Some(keys) = gray_keys {
+            let mut value = serde_json::to_value(&config).unwrap();
+            value["work_context_key_ids"] = json!(keys);
+            config = serde_json::from_value(value).unwrap();
+        }
         config.continuation_enabled = enabled;
         config.seedance_assistant_model = "glm-5.3-flash".into();
         config.public_base_url = "https://api.example.test".into();

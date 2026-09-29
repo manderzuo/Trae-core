@@ -22,6 +22,9 @@ pub struct RouterConfig {
     pub budget_billing_v2: bool,
     #[serde(default)]
     pub work_context_enabled: bool,
+    /// Empty means all Keys; a nonempty list stages work context for these Keys only.
+    #[serde(default)]
+    pub work_context_key_ids: Vec<String>,
     #[serde(default)]
     pub continuation_enabled: bool,
     /// Short-lived, explicit test-Key exception for pending tail_reference acceptance only.
@@ -58,6 +61,7 @@ impl RouterConfig {
             public_base_url: String::new(),
             budget_billing_v2: false,
             work_context_enabled: false,
+            work_context_key_ids: Vec::new(),
             continuation_enabled: false,
             continuation_test_key_ids: Vec::new(),
             continuation_test_expires_at_ms: 0,
@@ -69,6 +73,11 @@ impl RouterConfig {
     }
 
     pub const fn default_port() -> u16 { 7865 }
+
+    pub fn work_context_for_key(&self, key: &str) -> bool {
+        self.work_context_enabled && (self.work_context_key_ids.is_empty()
+            || self.work_context_key_ids.iter().any(|id| id == key))
+    }
 
     pub fn load(data_dir: impl Into<PathBuf>) -> Result<Self, String> {
         let data_dir_override = env::var_os("STARLINK_ROUTER_DATA_DIR").map(PathBuf::from);
@@ -148,6 +157,18 @@ fn seedance_assistant_model() -> String { "glm-5.3-flash".into() }
 #[cfg(test)]
 mod tests {
     use super::RouterConfig;
+    #[test]
+    fn work_context_gray_key_isolation_and_global_disable() {
+        let mut config=RouterConfig::defaults(std::env::temp_dir());
+        assert!(!config.work_context_for_key("key_gray"));
+        config.work_context_enabled=true;
+        assert!(config.work_context_for_key("key_gray"));
+        config.work_context_key_ids=vec!["key_gray".into()];
+        assert!(config.work_context_for_key("key_gray"));
+        assert!(!config.work_context_for_key("key_other"));
+        config.work_context_enabled=false;
+        assert!(!config.work_context_for_key("key_gray"));
+    }
     use std::{
         env,
         ffi::OsString,

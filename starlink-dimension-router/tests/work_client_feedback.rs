@@ -3,6 +3,15 @@ mod fixture;
 use fixture::*;
 
 #[tokio::test]
+async fn non_gray_key_keeps_legacy_generation_without_work_version() {
+    let f = Fixture::with_gray_keys(true, Some(vec!["key_some_other_key".into()]));
+    let first = f.chat("non-gray", &create()).await;
+    assert!(first["work_context"].is_null(), "non-gray Key entered new work flow: {first}");
+    assert!(f.state.store.work_version_for_request(&f.owner, first["request_id"].as_str().unwrap()).unwrap().is_none());
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn stream_and_nonstream_context_roundtrip_with_truthful_unique_progress() {
     let f = Fixture::new();
     let first = f.chat("first", &create()).await;

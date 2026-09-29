@@ -119,7 +119,7 @@ pub async fn warm_tail_frame(
     p: Principal,
     version: VideoWorkVersion,
 ) -> Result<WorkMediaRef, String> {
-    if !state.config.work_context_enabled || !state.config.continuation_enabled {
+    if !state.config.work_context_for_key(&p.key_id) || !state.config.continuation_enabled {
         return Err("continuation_disabled".into());
     }
     aiwork_core::require_scope(&p, "videos:read").map_err(|_| "insufficient_scope")?;
@@ -241,7 +241,7 @@ pub async fn prepare_continuation(
     base: VideoWorkVersion,
     input: Value,
 ) -> Result<VideoWorkSnapshot, String> {
-    if !state.config.continuation_enabled {
+    if !state.config.work_context_for_key(&p.key_id) || !state.config.continuation_enabled {
         return Err("continuation_disabled".into());
     }
     let requested = input
@@ -321,7 +321,7 @@ pub(crate) fn schedule(
     p: &Principal,
     version: &VideoWorkVersion,
 ) {
-    if !state.config.work_context_enabled
+    if !state.config.work_context_for_key(&p.key_id)
         || !state.config.continuation_enabled
         || version.frame_state == "ready"
         || version.frame_state == "failed"
