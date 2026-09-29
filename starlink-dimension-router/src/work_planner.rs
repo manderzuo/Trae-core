@@ -359,7 +359,16 @@ pub fn merge_snapshot(
     // A helper patch must not invent a specification absent from this turn.
     for (k, v) in d.spec_patch.as_object().ok_or_else(invalid)? {
         if text.get(k).or_else(|| explicit.get(k)).is_none() {
-            return Err(invalid());
+            // The helper may echo the effective watermark default. This is
+            // a no-op, not permission to change an unspecified setting.
+            let effective_watermark = if d.action == WorkIntent::Create {
+                false
+            } else {
+                base.is_some_and(|s| s.watermark)
+            };
+            if k != "watermark" || v.as_bool() != Some(effective_watermark) {
+                return Err(invalid());
+            }
         }
         validate_spec(&json!({k:v}))?;
     }

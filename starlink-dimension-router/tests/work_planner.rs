@@ -30,6 +30,18 @@ fn body(text: &str) -> Value {
     json!({"messages":[{"role":"user","content":text}]})
 }
 #[test]
+fn helper_may_echo_effective_watermark_but_cannot_change_it() {
+    let mut d=decision(WorkIntent::Create,"replace");
+    d.spec_patch=json!({"watermark":false});
+    assert!(!work_planner::merge_snapshot(None,&d,&body("延长视频")).unwrap().watermark);
+    d.spec_patch=json!({"watermark":true});
+    assert!(work_planner::merge_snapshot(None,&d,&body("延长视频")).is_err());
+    let mut parent=base();parent.watermark=true;d.action=WorkIntent::Revise;
+    assert!(work_planner::merge_snapshot(Some(&parent),&d,&body("动作放慢")).unwrap().watermark);
+    d.spec_patch=json!({"watermark":false});
+    assert!(work_planner::merge_snapshot(Some(&parent),&d,&body("动作放慢")).is_err());
+}
+#[test]
 fn uploaded_video_extension_uses_owned_source_instead_of_guessing_parent() {
     let raw=json!({"action":"continue","effective_prompt":"延长上传的视频，保留前5秒，再续拍5秒","spec_patch":{"duration":10},"reference_policy":"replace","clarification":null});
     let mut d=work_planner::parse_decision(&raw.to_string()).unwrap();

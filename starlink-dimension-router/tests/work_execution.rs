@@ -7,7 +7,7 @@ async fn source_video_extension_preserves_full_asset_without_tail_fallback() {
     let f=Fixture::new();
     let stored=assets::write_asset(&f.state.config.data_dir,&f.owner,ParsedAssetUpload{filename:"source.mp4".into(),declared_mime:Some("video/mp4".into()),bytes:b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2".to_vec()}).unwrap();
     let asset=assets::persist_asset(&f.state.store,&f.owner,&stored).unwrap();
-    *f.bridge.helper_decision.lock().unwrap()=Some(json!({"action":"continue","effective_prompt":"保留原视频前5秒，再向后延长5秒","spec_patch":{"duration":10},"reference_policy":"replace","clarification":null}));
+    *f.bridge.helper_decision.lock().unwrap()=Some(json!({"action":"continue","effective_prompt":"保留原视频前5秒，再向后延长5秒","spec_patch":{"duration":10,"resolution":"480p","ratio":"16:9","watermark":false},"reference_policy":"replace","clarification":null}));
     let b=json!({"model":"seedance","duration":10,"resolution":"480p","ratio":"16:9","video_asset_ids":[asset.id],"messages":[{"role":"user","content":"向后延长上传视频"}]});
     let result=f.chat("source-video-extend",&b).await;
     let version=f.state.store.work_version_for_request(&f.owner,result["request_id"].as_str().unwrap()).unwrap().unwrap();
