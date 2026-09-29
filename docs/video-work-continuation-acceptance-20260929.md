@@ -28,9 +28,19 @@ C1系统 Downloads 文件 `aiwork-seedance-20260929-101743-request_vxaGh0i2QQhr6
 
 本轮三个新视频及两次只付辅助的失败尝试共168.92积分；周可用余额6667.582→6498.662，差值一致。原11笔1433积分未决预占及1个未知执行保持不变。包含之前基线及未派发准备，保守普通请求计数7/9，严格原生0/1；不再新增付费验收请求。
 
-已安装真实验收证据与摘要绑定的能力配置；provider trae_native、编译适配器IDE_VERSION0.1.50、插件1.0.1、契约tail-reference-v1。桥接返回tail_reference=true、两个native=false。灰度测试例外已清空，周Key走正常证据校验；公网health200、重启前后余额/占用/unknown完全一致。仍保留周灰度范围，不等于所有Key或TRAE/DSH界面验收通过。三个对应仓库的推送状态以最终Git远端校验记录为准。
+已安装真实验收证据与摘要绑定的能力配置；provider trae_native、编译适配器IDE_VERSION0.1.50、插件1.0.1、契约tail-reference-v1。桥接返回tail_reference=true、两个native=false。灰度测试例外已清空，周Key走正常证据校验；公网health200、重启前后余额/占用/unknown完全一致。仍保留周灰度范围，不等于所有Key或TRAE/DSH界面验收通过。
 
 重启后的真实MCP work-status显示V2/C1仍completed且尾帧ready，API历史标记恢复、doctor鉴权与19模型目录再检查通过。MCP下载成功以本机工具路径、文件大小及摘要为证据；服务端版本的delivery_state仍pending，因为本轮没有发送客户端本地保存确认，不能把该字段当成已经观测的下载失败。主代理完成最终代码审阅，未调用独立审查者；未发现本次已验证路径的剩余阻断问题。
+
+### 发布核对
+
+三个仓库均通过10808代理正常fast-forward推送main及各自修复分支，`git ls-remote`核对两分支同SHA成功，没有强推或提交凭据：
+
+- Core：Trae-core，代码6bc7f5d，第一次验收文档发布65976ed；本条发布记录是后续纯文档提交。公网实际二进制仍对应6bc7f5d，不因文档提交重新构建。
+- AI Work：trae-maker，main/fix分支fd8d6e6dcbde41e28fcc9c24da2378edaa09fe08；实际本机二进制对应4133b37，后续仅文档改变。
+- MCP：trae-maker-MCP，main/fix分支4e90932d7fa37d9dbd0372ede6d0af42e498c091；实际服务源码67abb25，后续仅README改变。本机技能源码已经更新，正在运行的Codex宿主需重载MCP才能看到新增9工具目录。
+
+最终上线范围：仅周Key新上下文/尾帧参考，其他Key旧路径；AI Work仍在本机。可信提帧配置、能力证据及校准预算在持久数据目录，不包含在Git凭据中。保持一致性备份和schema30兼容回滚包；不覆盖原有账本。
 
 ## 早期审计记录（以下未安装/未部署等状态已被上述续测更新取代）
 
