@@ -2,6 +2,30 @@
 mod fixture;
 use fixture::*;
 
+#[tokio::test]
+async fn malformed_helper_stream_finishes_with_specific_reason_and_replays_without_paying_again() {
+    let f=Fixture::new();
+    *f.bridge.helper_raw.lock().unwrap()=Some(r#"{"action":"create","effective_prompt":"猫说:"你好。"","spec_patch":{},"reference_policy":"inherit","clarification":null}"#.into());
+    let mut b=create();b["stream"]=json!(true);
+    for _ in 0..2 {
+        let response=f.response(&f.key,"json-syntax-stream",&b).await;
+        assert_eq!(response.status(),StatusCode::OK);
+        let raw=to_bytes(response.into_body(),65536).await.unwrap();
+        let events:Vec<Value>=std::str::from_utf8(&raw).unwrap().lines().filter_map(|l|l.strip_prefix("data: ")).filter_map(|l|serde_json::from_str(l).ok()).collect();
+        let last=events.last().unwrap();
+        assert_eq!(last["error"]["code"],"assistant_json_invalid");
+        assert_eq!(last["choices"][0]["finish_reason"],"stop");
+        let text=last["choices"][0]["delta"]["content"].as_str().unwrap();
+        assert!(text.contains("JSON 语法不合法") && text.contains("未提交视频"),"{text}");
+        assert!(!text.contains("服务器错误"));
+        let op=f.state.store.budget_operation(last["request_id"].as_str().unwrap()).unwrap().unwrap();
+        assert_eq!(op.execution_state,aiwork_core::BudgetExecutionState::Failed);
+        assert_eq!(f.state.store.active_execution_count_for_key(&f.owner.key_id).unwrap(),0);
+    }
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+}
+
 async fn failed_reply(f: &Fixture, id: &str, body: &Value) -> Value {
     let response = f.response(&f.key, id, body).await;
     let stream = body["stream"] == true;
@@ -173,7 +197,7 @@ async fn invalid_fenced_helper_reports_format_error_without_video_or_running_par
         let r:Value=if stream {
             std::str::from_utf8(&raw).unwrap().lines().filter_map(|l|l.strip_prefix("data: ")).filter_map(|l|serde_json::from_str(l).ok()).last().unwrap()
         } else {serde_json::from_slice(&raw).unwrap()};
-        assert_eq!(r["error"]["code"],"work_decision_invalid");
+        assert_eq!(r["error"]["code"],"assistant_schema_invalid");
         let message=r["error"]["message"].as_str().unwrap();
         assert!(message.contains("格式或字段") && message.contains("未提交视频"));
         let op=f.state.store.budget_operation(r["request_id"].as_str().unwrap()).unwrap().unwrap();

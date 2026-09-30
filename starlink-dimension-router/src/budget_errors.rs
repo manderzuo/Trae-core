@@ -1,5 +1,6 @@
 //! Public v2 machine codes only. Never forward provider text, SQL, URLs or keys.
 pub(crate) fn public_code(code:&str)->Option<&'static str> {
+    if let Some(code)=crate::assistant_json::public_code(code) {return Some(code);}
     Some(match code {
         "budget_policy_unconfigured"=>"budget_policy_unconfigured",
         "budget_policy_expired"=>"budget_policy_expired",

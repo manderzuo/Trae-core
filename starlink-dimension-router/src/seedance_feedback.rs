@@ -86,6 +86,16 @@ impl Failure {
     }
 }
 pub(crate) fn message(code:&str)->&'static str {match code {
+    "assistant_json_invalid"=>"辅助模型返回的 JSON 语法不合法（如台词引号未转义或多余内容）；本次未提交视频，请保留请求编号供排查。",
+    "assistant_json_duplicate_key"=>"辅助模型返回了重复的 JSON 字段，无法确定唯一规划；本次未提交视频。",
+    "assistant_json_invalid_escape"=>"辅助模型返回的 JSON 含非法转义或损坏的 Unicode 编码；本次未提交视频。",
+    "assistant_json_control_character"=>"辅助模型返回的 JSON 字符串含未转义的换行或控制字符；本次未提交视频。",
+    "assistant_json_not_object"=>"辅助模型返回的 JSON 不是规定的单一对象；本次未提交视频。",
+    "assistant_output_truncated"=>"辅助模型输出被截断或未完整结束，无法安全读取规划；本次未提交视频。",
+    "assistant_output_too_large"=>"辅助模型返回的规划超过允许长度；本次未提交视频。",
+    "assistant_output_blocked"=>"辅助模型输出被内容过滤阻止；本次未提交视频，这不是视频生成阶段的安全检查结果。",
+    "assistant_output_invalid"=>"辅助模型未返回唯一、正常结束的文本规划（可能返回了工具调用或拒绝）；本次未提交视频。",
+    "assistant_schema_invalid"=>"辅助模型返回的 JSON 格式或字段不符合规定结构，可能缺少字段、类型错误或出现未允许字段；本次未提交视频。",
     "work_spec_unsupported"=>"本轮视频规格超出支持范围或存在冲突；时长支持4至15秒，分辨率支持480P或720P，也可用横屏、竖屏、高清等描述。本次未提交视频。",
     "work_decision_invalid"|"assist_result_invalid"=>"辅助模型返回的规划格式或字段未通过校验；本次未提交视频，请保留请求编号供排查。",
     "assist_execution_failed"=>"辅助模型执行失败；本次尚未提交视频。积分仍按该辅助步骤的真实账单核对。",

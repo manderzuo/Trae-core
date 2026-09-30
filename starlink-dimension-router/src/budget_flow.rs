@@ -12,7 +12,7 @@ struct Prepared {
     wire_version:u8,authorization:BudgetAuthorization,dispatch_token:String,evidence_level:String,prepared_at_ms:i64,revision:i64,
 }
 pub(crate) fn fail(code:&str)->Response {
-    let status=match code {
+    let status=if crate::assistant_json::public_code(code).is_some() {StatusCode::BAD_GATEWAY} else {match code {
         "frame_extractor_busy"|"key_concurrency_exceeded"|"video_download_busy"|"budget_preparation_busy"|"bridge_workers_busy"|"reference_upload_limited"|"stream_observer_limit"=>StatusCode::TOO_MANY_REQUESTS,
         "quota_insufficient"=>StatusCode::PAYMENT_REQUIRED,
         "work_parent_unavailable"|"frame_result_not_ready"|"video_not_ready"|"budget_identity_conflict"|"video_continuation_not_active"=>StatusCode::CONFLICT,
@@ -27,7 +27,7 @@ pub(crate) fn fail(code:&str)->Response {
         "work_context_unavailable"|"work_decision_invalid"|"work_spec_unsupported"|"work_parent_required"|"reference_image_missing"|"invalid_reference_context"|"reference_image_limit"|"invalid_reference_image"|"reference_requires_inline_image_or_owned_asset"|"continuation_mode_unsupported"=>StatusCode::BAD_REQUEST,
         "insufficient_scope"=>StatusCode::FORBIDDEN,
         _=>StatusCode::SERVICE_UNAVAILABLE,
-    };
+    }};
     let mut response=(status,Json(json!({"error":{"type":"billing_error","code":code,"message":code}}))).into_response();
     if status==StatusCode::TOO_MANY_REQUESTS {response.headers_mut().insert("retry-after","1".parse().unwrap());}
     response
@@ -251,11 +251,13 @@ pub(crate) async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Princ
     state.seedance_results.progress(&request,Stage::Assistant);
     let assist=if let Some(step)=operation.and_then(|op|op.steps.into_iter().find(|s|s.kind==BudgetStepKind::Assist)) {step} else {
         if !fresh {return Err("budget_preparation_requires_recovery".into());}
-        let prompt=crate::user_routes::normalize_video_spec_text(&crate::user_routes::extract_seedance_prompt(&original).map_err(|_|"invalid_seedance_prompt")?);
+        let prompt=crate::user_routes::extract_seedance_prompt(&original).map_err(|_|"invalid_seedance_prompt")?;
         let model=state.config.seedance_assistant_model.clone();
-        let body=json!({"model":model,"stream":false,"max_tokens":1024,"temperature":0.2,"messages":[
+        let mut body=json!({"model":model,"stream":false,"max_tokens":1024,"temperature":0.2,"messages":[
             {"role":"system","content":"你是视频请求调度和提示词整理助手。只输出严格 JSON。用户明确要求生成、制作视频时输出 {\"intent\":\"video\",\"prompt\":\"视频提示词\"}；普通问候、连接测试、非视频问题输出 {\"intent\":\"text\",\"text\":\"简短回答\"}。纠正规格中的全角数字、字母、冒号和多余空格，例如９：１６整理为9:16；保持用户指定的时长、分辨率、画幅、主体、动作和场景，不得擅自修改规格或新增剧情。不要把 hello 或测试连接转换成视频。不要虚构已经生成的视频。"},
             {"role":"user","content":prompt}]});
+        let instruction=body["messages"][0]["content"].as_str().ok_or("assist_result_invalid")?;
+        body["messages"][0]["content"]=json!(format!("{instruction} 仅允许intent和对应的prompt或text两个字段。{}",crate::assistant_json::ENCODING_RULES));
         let child=match state.store.begin_budget_assist_request(&request,BeginRequestInput {user_id:principal.user_id.clone(),api_key_id:principal.key_id.clone(),protocol:"openai".into(),endpoint:"chat".into(),model:model.clone(),idempotency_key:format!("budget-assist:{request}"),body:body.clone()}).map_err(|e|e.to_string())? {
             BeginRequest::Created(r)|BeginRequest::Existing(r)=>r.id,BeginRequest::Conflict=>return Err("assist_identity_conflict".into()),
         };
@@ -265,9 +267,9 @@ pub(crate) async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Princ
             Err(error)=>{abort_preparation_failure(&state,&request,&error);return Err(error.into());},
         }
     };
+    let helper_request=assist.request_id.clone();
     let result=wait_result(state.clone(),assist).await?;
-    let content=result.pointer("/choices/0/message/content").and_then(Value::as_str).ok_or("assist_result_invalid")?;
-    let decision=crate::assistant_json::object(content,16*1024).map_err(|_|"assist_result_invalid")?;
+    let decision=crate::assistant_json::legacy_result(&result).map_err(|e|e.report(&request,&helper_request))?;
     if decision["intent"]=="text" {
         let text=decision["text"].as_str().filter(|s|!s.trim().is_empty() && s.len()<=16*1024).ok_or("assist_result_invalid")?;
         let s=state.clone();let p=principal.clone();let b=original.clone();
@@ -286,7 +288,7 @@ pub(crate) async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Princ
         .is_none_or(|op|matches!(op.execution_state,BudgetExecutionState::Failed|BudgetExecutionState::Canceled|BudgetExecutionState::Succeeded)) {
         return Err("video_continuation_not_active".into());
     }
-    let prompt=crate::user_routes::normalize_video_spec_text(decision["prompt"].as_str().filter(|s|!s.trim().is_empty() && s.len()<=12*1024).ok_or("assist_result_invalid")?);
+    let prompt=decision["prompt"].as_str().filter(|s|!s.trim().is_empty() && s.len()<=12*1024).ok_or("assist_result_invalid")?.to_owned();
     crate::user_routes::require_video_admission(&state,&principal,"seedance",&original).map_err(|_|"video_billing_paused")?;
     crate::user_routes::infer_video_parameters_from_prompt(&mut original);
     let mut body=json!({"model":"seedance","prompt":prompt});
@@ -511,6 +513,7 @@ pub(crate) fn finish_definite_failure(state:&StarlinkRouterState,request:&str,co
     }
 }
 fn definite_failure_code(code:&str)->bool {
+    if crate::assistant_json::public_code(code).is_some() {return true;}
     matches!(code,"assist_result_invalid"|"assist_execution_failed"|"video_execution_failed"|"video_safety_check_failed"|"reference_safety_check_failed"|"prompt_safety_check_failed"|"budget_not_sent"|"video_billing_paused"|
         "quota_insufficient"|"budget_policy_unconfigured"|"budget_policy_expired"|"budget_policy_invalid"|
         "reference_video_budget_metadata_required"|"invalid_budget_business_request"|"reference_image_limit"|

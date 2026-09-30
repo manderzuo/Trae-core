@@ -37,6 +37,7 @@ pub(crate) struct Bridge {
     pub(crate) assist_prepare_panic: std::sync::atomic::AtomicBool,
     pub(crate) helper_decision: Mutex<Option<Value>>,
     pub(crate) helper_raw: Mutex<Option<String>>,
+    pub(crate) helper_finish_reason: Mutex<Option<String>>,
     pub(crate) video_prepare_error: Mutex<Option<(u16, String)>>,
 }
 impl BridgeTransport for Bridge {
@@ -187,7 +188,8 @@ impl BridgeTransport for Bridge {
                     };
                     let decision=self.helper_decision.lock().unwrap().clone().unwrap_or(decision);
                     let content=self.helper_raw.lock().unwrap().clone().unwrap_or_else(||decision.to_string());
-                    json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]})
+                    let finish=self.helper_finish_reason.lock().unwrap().clone().unwrap_or_else(||"stop".into());
+                    json!({"choices":[{"message":{"content":content},"finish_reason":finish}]})
                 };
             } else if url.contains("/billing?") {
                 if self.billing_final.load(Ordering::SeqCst) {
@@ -295,6 +297,7 @@ impl Fixture {
             assist_prepare_panic: std::sync::atomic::AtomicBool::new(false),
             helper_decision: Mutex::new(None),
             helper_raw: Mutex::new(None),
+            helper_finish_reason: Mutex::new(None),
             video_prepare_error: Mutex::new(None),
         });
         let mut config = RouterConfig::defaults(dir.clone());

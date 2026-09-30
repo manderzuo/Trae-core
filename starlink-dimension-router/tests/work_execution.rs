@@ -2,6 +2,111 @@
 mod fixture;
 use fixture::*;
 #[tokio::test]
+async fn malformed_helper_json_reports_cause_and_releases_slot_without_resubmission() {
+    let cases=[
+        (r#"{"action":"create","effective_prompt":"猫说:"你好。"","spec_patch":{},"reference_policy":"inherit","clarification":null}"#,None,"assistant_json_invalid"),
+        (r#"{"action":"create","action":"continue","effective_prompt":"橘猫散步","spec_patch":{},"reference_policy":"inherit","clarification":null}"#,None,"assistant_json_duplicate_key"),
+        (r#"{"action":"create","effective_prompt":"橘猫散步","spec_patch":{},"reference_policy":"inherit","clarification":null}"#,Some("length"),"assistant_output_truncated"),
+        (r#"{"action":"create","effective_prompt":"bad\q","spec_patch":{},"reference_policy":"inherit","clarification":null}"#,None,"assistant_json_invalid_escape"),
+        ("{\"action\":\"create\",\"effective_prompt\":\"bad\ntext\",\"spec_patch\":{},\"reference_policy\":\"inherit\",\"clarification\":null}",None,"assistant_json_control_character"),
+        (r#"{"action":"create","effective_prompt":"橘猫散步","spec_patch":{},"reference_policy":"inherit","clarification":null,"charge":0}"#,None,"assistant_schema_invalid"),
+        (r#"{"action":"create","effective_prompt":"橘猫散步","spec_patch":{},"reference_policy":"inherit","clarification":null}"#,Some("content_filter"),"assistant_output_blocked"),
+    ];
+    for (i,(raw,finish,code)) in cases.into_iter().enumerate() {
+        let f=Fixture::new();
+        *f.bridge.helper_raw.lock().unwrap()=Some(raw.into());
+        *f.bridge.helper_finish_reason.lock().unwrap()=finish.map(str::to_owned);
+        let key=format!("malformed-json-{i}");let b=create();
+        let response=f.response(&f.key,&key,&b).await;
+        assert_eq!(response.status(),StatusCode::BAD_GATEWAY,"invalid helper output is not a user input error");
+        let result:Value=serde_json::from_slice(&to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+        assert_eq!(result["error"]["code"],code,"{result}");
+        assert!(result["error"]["message"].as_str().unwrap().contains("未提交视频"));
+        let rid=result["request_id"].as_str().unwrap();
+        let before=f.state.store.budget_operation(rid).unwrap().unwrap();
+        assert_eq!(before.execution_state,aiwork_core::BudgetExecutionState::Failed);
+        assert_eq!(before.steps.len(),1);
+        assert_eq!(before.steps[0].financial_state,aiwork_core::BudgetFinancialState::Held,"a model format error cannot invent a zero bill");
+        assert_eq!(f.state.store.active_execution_count_for_key(&f.owner.key_id).unwrap(),0);
+        let replay=f.response(&f.key,&key,&b).await;
+        let replay:Value=serde_json::from_slice(&to_bytes(replay.into_body(),65536).await.unwrap()).unwrap();
+        assert_eq!(replay["error"]["code"],code,"replay must retain first cause");
+        assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);
+        assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+        let after=f.state.store.budget_operation(rid).unwrap().unwrap();
+        assert_eq!(after.steps[0].actual_credits,before.steps[0].actual_credits);
+    }
+}
+#[tokio::test]
+async fn escaped_dialogue_reaches_video_once_and_is_not_rewritten_or_lost() {
+    let f=Fixture::new();
+    let prompt="猫说：\"你好。\"\n窗外显示路径 C:\\clips\\猫.mp4，背景标签９：１６。";
+    *f.bridge.helper_decision.lock().unwrap()=Some(json!({"action":"create","effective_prompt":prompt,"spec_patch":{},"reference_policy":"inherit","clarification":null}));
+    let b=create();let result=f.chat("valid-dialogue",&b).await;
+    let rid=result["request_id"].as_str().unwrap();
+    let version=f.state.store.work_version_for_request(&f.owner,rid).unwrap().unwrap();
+    let snapshot=work_context::read_snapshot(&f.state,&f.owner,&version).unwrap();
+    assert_eq!(snapshot.effective_prompt,prompt);
+    assert_eq!(snapshot.dispatch_body.unwrap()["prompt"],prompt);
+    assert_eq!(f.chat("valid-dialogue",&b).await["request_id"],rid);
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),1);
+}
+#[tokio::test]
+async fn legacy_helper_keeps_dialogue_punctuation_outside_spec_normalization() {
+    let f=Fixture::with_gray_keys(false,Some(vec!["other-context-key".into()]));
+    let prompt="猫说：\"你好。\"，停顿后继续。";
+    *f.bridge.helper_decision.lock().unwrap()=Some(json!({"intent":"video","prompt":prompt}));
+    let b=create();let result=f.chat("legacy-dialogue",&b).await;
+    assert!(result.get("error").is_none(),"{result}");
+    let claims=f.bridge.claims.lock().unwrap();
+    let video=claims.values().find(|c|c["step_kind"]=="video").unwrap();
+    assert_eq!(video["body"]["prompt"],prompt);
+}
+#[tokio::test]
+async fn temporary_video_preparation_error_keeps_work_recoverable_without_repaying_helper() {
+    let f=Fixture::new();let b=create();
+    *f.bridge.video_prepare_error.lock().unwrap()=Some((429,"bridge_workers_busy".into()));
+    let response=f.response(&f.key,"temporary-prepare",&b).await;
+    let _=to_bytes(response.into_body(),256*1024).await.unwrap();
+    let request=f.bridge.claims.lock().unwrap().values().find(|v|v["step_kind"]=="assist").unwrap()["parent_request_id"].as_str().unwrap().to_owned();
+    let version=f.state.store.work_version_for_request(&f.owner,&request).unwrap().unwrap();
+    assert_ne!(version.state,aiwork_core::WorkVersionState::Failed,"a temporary capacity error is not a permanent work failure");
+    assert_eq!(f.state.store.active_execution_count_for_key(&f.owner.key_id).unwrap(),1);
+    *f.bridge.video_prepare_error.lock().unwrap()=None;
+    let response=f.chat("temporary-prepare",&b).await;
+    assert_eq!(response["request_id"],request);
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),1);
+    assert_eq!(f.state.store.active_execution_count_for_key(&f.owner.key_id).unwrap(),0);
+}
+#[tokio::test]
+async fn failed_work_with_orphan_parent_releases_execution_without_repaying_helper() {
+    let f=Fixture::new();let b=create();
+    *f.bridge.video_prepare_error.lock().unwrap()=Some((400,"invalid_budget_business_request".into()));
+    let initial=f.response(&f.key,"orphan-failed-work",&b).await;
+    let _=to_bytes(initial.into_body(),256*1024).await.unwrap();
+    let request=f.bridge.claims.lock().unwrap().values().find(|v|v["step_kind"]=="assist").unwrap()["parent_request_id"].as_str().unwrap().to_owned();
+    let version=f.state.store.work_version_for_request(&f.owner,&request).unwrap().unwrap();
+    assert_eq!(version.state,aiwork_core::WorkVersionState::Failed);
+    let before=f.state.store.budget_operation(&request).unwrap().unwrap().steps;
+    let db=rusqlite::Connection::open(f.dir.join("data/core.sqlite3")).unwrap();
+    // Reproduce the historical split: work failed, helper ended, parent did not.
+    db.execute("UPDATE budget_operations SET execution_state='running',execution_finished_at_ms=NULL WHERE parent_request_id=?1",[&request]).unwrap();
+    db.execute("UPDATE requests SET state='unknown',error_code=NULL,result_status=NULL WHERE id=?1",[&request]).unwrap();drop(db);
+    assert_eq!(f.state.store.active_execution_count_for_key(&f.owner.key_id).unwrap(),1);
+    let replay=f.response(&f.key,"orphan-failed-work",&b).await;
+    let text=String::from_utf8(to_bytes(replay.into_body(),256*1024).await.unwrap().to_vec()).unwrap();
+    assert!(text.contains("video_continuation_not_active"),"{text}");
+    assert_eq!(f.state.store.active_execution_count_for_key(&f.owner.key_id).unwrap(),0);
+    let after=f.state.store.budget_operation(&request).unwrap().unwrap();
+    assert_eq!(after.execution_state,aiwork_core::BudgetExecutionState::Failed);
+    assert_eq!(after.steps[0].financial_state,before[0].financial_state);
+    assert_eq!(after.steps[0].actual_credits,before[0].actual_credits);
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+}
+#[tokio::test]
 async fn fenced_legacy_helper_dispatch_and_replay_keep_one_video_step() {
     let f=Fixture::with_gray_keys(false,Some(vec!["other-context-key".into()]));
     assert!(!f.state.config.work_context_for_key(&f.owner.key_id));
@@ -118,7 +223,7 @@ async fn source_video_extension_preserves_full_asset_without_tail_fallback() {
     assert_eq!(media.content_sha256,asset.sha256);
     let wire=snapshot.dispatch_body.unwrap();
     assert_eq!(wire["duration"],10);
-    assert_eq!(wire["prompt"],"保留原视频前5秒,再向后延长5秒");
+    assert_eq!(wire["prompt"],"保留原视频前5秒，再向后延长5秒");
     assert_eq!(wire["video_asset_ids"].as_array().unwrap().len(),1);
     assert!(wire["image_asset_ids"].is_null());
     assert_eq!(f.bridge.frame_reads.load(Ordering::SeqCst),0);

@@ -7,22 +7,44 @@ use crate::{bridge_client::BridgeClient, state::StarlinkRouterState};
 #[derive(Clone,Copy,PartialEq,Eq)]
 enum HelperDecision { Text, Video }
 
-fn helper_decision(result:&Value,work_context:bool)->Result<HelperDecision,&'static str> {
-    let code=if work_context {"work_decision_invalid"} else {"assist_result_invalid"};
-    let content=result.pointer("/choices/0/message/content").and_then(Value::as_str).ok_or(code)?;
-    let value=crate::assistant_json::object(content,16*1024).map_err(|_|code)?;
-    if value["intent"]=="text" && value["text"].as_str().is_some_and(|s|!s.trim().is_empty() && s.len()<=16*1024) {
-        return Ok(HelperDecision::Text);
+#[cfg(test)]
+mod helper_validation_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn recovery_rejects_truncated_result_even_if_content_is_complete_json() {
+        let result=json!({"choices":[{"finish_reason":"length","message":{"content":"{\"action\":\"clarify\",\"effective_prompt\":null,\"spec_patch\":{},\"reference_policy\":\"inherit\",\"clarification\":\"请说明\"}"}}]});
+        assert_eq!(helper_decision(&result,true).err().map(|e|e.code),Some("assistant_output_truncated"));
     }
-    if value["intent"]=="video" && value["prompt"].as_str().is_some_and(|s|!s.trim().is_empty() && s.len()<=12*1024) {
-        return Ok(HelperDecision::Video);
+    #[test]
+    fn work_context_cannot_bypass_schema_with_legacy_text_reply() {
+        let result=json!({"choices":[{"finish_reason":"stop","message":{"content":"{\"intent\":\"text\",\"text\":\"请说明\"}"}}]});
+        assert_eq!(helper_decision(&result,true).err().map(|e|e.code),Some("assistant_schema_invalid"));
+        assert!(matches!(helper_decision(&result,false),Ok(HelperDecision::Text)));
     }
+    #[test]
+    fn live_and_recovery_keep_identical_root_cause() {
+        for (content,finish) in [
+            (r#"{"action":"create","action":"continue"}"#,"stop"),
+            (r#"{"action":"create","effective_prompt":"猫说:"你好。""}"#,"stop"),
+            (r#"{"action":"create","effective_prompt":"x\q"}"#,"stop"),
+            ("{}","length"),("{}","content_filter"),("{}","stop"),
+        ] {
+            let result=json!({"choices":[{"finish_reason":finish,"message":{"content":content}}]});
+            let live=crate::work_planner::parse_helper_result(&result).unwrap_err();
+            let recovery=helper_decision(&result,true).err().unwrap();
+            assert_eq!(live,recovery);
+        }
+    }
+}
+
+fn helper_decision(result:&Value,work_context:bool)->Result<HelperDecision,crate::assistant_json::Diagnostic> {
     if work_context {
-        return crate::work_planner::parse_decision(&value.to_string())
-            .map(|d|if d.paid_action().is_some(){HelperDecision::Video}else{HelperDecision::Text})
-            .map_err(|_|code);
+        return crate::work_planner::parse_helper_result(result)
+            .map(|d|if d.paid_action().is_some(){HelperDecision::Video}else{HelperDecision::Text});
     }
-    Err(code)
+    let value=crate::assistant_json::legacy_result(result)?;
+    Ok(if value["intent"]=="video" {HelperDecision::Video} else {HelperDecision::Text})
 }
 
 fn terminal_failure_code(kind:BudgetStepKind,result:&Value)->&'static str {
@@ -103,12 +125,13 @@ pub(crate) fn sync_execution(state: &StarlinkRouterState, client: &BridgeClient,
                 match helper_decision(&reply["result"],state.config.work_context_for_key(&operation.api_key_id)) {
                     Ok(HelperDecision::Text)=>(Some(Execution::Succeeded),None),
                     Ok(HelperDecision::Video)=>(None,None),
-                    Err(code)=>(Some(Execution::Failed),Some(code)),
+                    Err(error)=>(Some(Execution::Failed),Some(error.report(&step.parent_request_id,&step.request_id))),
                 }
             };
             if let Some(finish)=finish {
                 let result=failure_code.and_then(crate::budget_flow::public_failure_result);
                 state.store.finish_budget_execution_with_result(&step.parent_request_id,finish,result).map_err(|e|e.to_string())?;
+                if let Some(code)=failure_code {crate::work_execution::reflect_failure(state,&step.parent_request_id,code);}
             }
         }
     }
@@ -277,8 +300,8 @@ mod tests {
     }
     #[test]
     fn invalid_helper_result_is_a_definite_failure_not_an_anonymous_terminal() {
-        let result=serde_json::json!({"choices":[{"message":{"content":"not json"}}]});
-        assert_eq!(helper_decision(&result,false).err(),Some("assist_result_invalid"));
+        let result=serde_json::json!({"choices":[{"finish_reason":"stop","message":{"content":"not json"}}]});
+        assert_eq!(helper_decision(&result,false).err().map(|e|e.code),Some("assistant_json_invalid"));
     }
     #[test]
     fn slow_bridge_read_does_not_block_another_keys_reconciliation() {

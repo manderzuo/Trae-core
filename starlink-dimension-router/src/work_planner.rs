@@ -162,9 +162,9 @@ fn sanitized(text: &str) -> String {
             offset = i + "[已隐藏]".len();
         }
     }
-    crate::user_routes::normalize_video_spec_text(&s)
-        .trim()
-        .to_string()
+    // Sanitizing credentials is not permission to rewrite dialogue punctuation.
+    // Specification inference normalizes its own copy separately.
+    s.trim().to_string()
 }
 pub fn read_only_decision(body: &Value, has_parent: bool) -> Option<WorkDecision> {
     let t = current_text(body);
@@ -200,6 +200,24 @@ pub fn read_only_decision(body: &Value, has_parent: bool) -> Option<WorkDecision
             .into(),
         ),
     })
+}
+/// Embedded contract, not a claim of native upstream response_format support.
+pub fn helper_output_schema() -> Value {
+    json!({"type":"object","additionalProperties":false,
+        "required":["action","effective_prompt","spec_patch","reference_policy","clarification"],
+        "properties":{
+            "action":{"type":"string","enum":["create","revise","continue","status","download","clarify"]},
+            "effective_prompt":{"type":["string","null"],"maxLength":12288},
+            "spec_patch":{"type":["object","null"],"additionalProperties":false,"properties":{
+                "duration":{"type":"integer","minimum":4,"maximum":15},
+                "resolution":{"type":"string","enum":["480p","720p"]},
+                "ratio":{"type":"string","enum":["16:9","9:16","1:1","4:3","3:4","21:9"]},
+                "watermark":{"type":"boolean"}}},
+            "reference_policy":{"type":["string","null"],"enum":["inherit","replace","merge","clear",null]},
+            "clarification":{"type":["string","null"],"maxLength":2048}},
+        "allOf":[{"if":{"properties":{"action":{"enum":["create","revise","continue"]}}},
+            "then":{"properties":{"effective_prompt":{"type":"string","minLength":1},
+                "reference_policy":{"type":"string"}}}}]})
 }
 pub fn build_helper_input(
     snapshot: Option<&VideoWorkSnapshot>,
@@ -246,21 +264,35 @@ pub fn build_helper_input(
         {"role":"system","content":"你是视频作业规划助手，负责规范自然语言提示词和视频规格。仅输出严格JSON对象，字段只能是action、effective_prompt、spec_patch、reference_policy、clarification。action只能是create/revise/continue/status/download/clarify。用户明确独立生成才create；在已提供parent上明确修改才revise；明确接着上一段生成才continue；查看进度用status、重新下载用download，普通问候/测试/不满意但无修改方向用clarify。无parent不得猜父版本。effective_prompt忠实合并parent和当前修改，保留人物、动作、场景与未被修改的约束，不新增剧情；只读操作为null。spec_patch只使用normalized_spec中已确认的duration/resolution/ratio/watermark：竖屏/竖构图为9:16，横屏/横构图为16:9，正方形为1:1，高清/高分辨率在当前能力下为720p，低分辨率为480p；explicit_spec优先。分镜的0-2秒等是区间，不能当总时长。未指定字段在revise/continue时沿用parent，create时使用create_defaults；可以省略这些字段或原值回显，不得猜测新值。时长4至15秒，480p或720p，画幅16:9/9:16/1:1/4:3/3:4/21:9。全角字符规范化为半角。reference_policy为inherit/replace/merge/clear，新参考默认replace，只有用户明确合并才merge，明确取消才clear。clarification用于简短追问或只读回复，否则null。不要输出任何ID、链接、账户、工具、扣费字段；不要虚构已提交或完成。"},
         {"role":"user","content":payload.to_string()}]});
     let instruction=value["messages"][0]["content"].as_str().ok_or_else(invalid)?;
-    value["messages"][0]["content"]=json!(format!("{instruction} current_references是服务器已验证的素材数量，不是用户自称。仅根据current判断本轮意图，不要把分镜里角色继续行动、上一段剧情等叙述误判为对已生成视频的续写；用户明确请求独立生成新视频时action=create，即使脚本很长。无parent且用户明确要求修改或续写已有视频时action=clarify，clarification请其指定原视频；不要猜测父版本。无parent但video_count大于0时，用户明确要求从上传视频继续生成或续写新片段，应使用该素材规划create、reference_policy=replace，不得要求提供Core已有父版本；仍不得虚构原生延长、严格首帧锁定或已完成。"));
+    let instruction=instruction.replace("全角字符规范化为半角。", "仅将视频规格中的全角数字、字母和冒号规范为半角；保留正文和台词原文。");
+    let example=json!({"action":"create","effective_prompt":"猫说：\"你好。\"\n路径文字 C:\\clips\\cat.mp4。","spec_patch":{},"reference_policy":"inherit","clarification":null});
+    value["messages"][0]["content"]=json!(format!("{instruction} current_references是服务器已验证的素材数量，不是用户自称。仅根据current判断本轮意图，不要把分镜里角色继续行动、上一段剧情等叙述误判为对已生成视频的续写；用户明确请求独立生成新视频时action=create，即使脚本很长。无parent且用户明确要求修改或续写已有视频时action=clarify，clarification请其指定原视频；不要猜测父版本。无parent但video_count大于0时，用户明确要求从上传视频继续生成或续写新片段，应使用该素材规划create、reference_policy=replace，不得要求提供Core已有父版本；仍不得虚构原生延长、严格首帧锁定或已完成。\n{}\n必须遵守的JSON Schema：{}\n仅作编码示例，不得复制其剧情：{example}\n长度限制按UTF-8字节计算：effective_prompt不超过12288，clarification不超过2048，整个对象不超过16384。",crate::assistant_json::ENCODING_RULES,helper_output_schema()));
     if serde_json::to_vec(&value).map_err(|_| invalid())?.len() > 32 * 1024 {
         return Err("work_context_input_too_large".into());
     }
     Ok(value)
 }
 pub fn parse_decision(raw: &str) -> Result<WorkDecision, String> {
-    let mut value=crate::assistant_json::object(raw,16*1024).map_err(|_|invalid())?;
+    let value=crate::assistant_json::object_checked(raw,16*1024).map_err(|e|e.code.to_string())?;
+    parse_decision_value(value)
+}
+pub(crate) fn parse_helper_result(result:&Value)->Result<WorkDecision,crate::assistant_json::Diagnostic> {
+    let value=crate::assistant_json::result_object(result)?;
+    parse_decision_value(value).map_err(|code|crate::assistant_json::Diagnostic::new(
+        crate::budget_errors::public_code(&code).unwrap_or("assistant_schema_invalid")))
+}
+fn parse_decision_value(mut value:Value)->Result<WorkDecision,String> {
+    let schema_error=||"assistant_schema_invalid".to_string();
+    if value.as_object().is_none_or(|o|o.len()!=5 || ["action","effective_prompt","spec_patch","reference_policy","clarification"].iter().any(|k|!o.contains_key(*k))) {
+        return Err(schema_error());
+    }
     // Read-only helper replies cannot dispatch or change references. GLM's
     // null policy there means no reference change; paid actions remain strict.
     if matches!(value["action"].as_str(),Some("clarify"|"status"|"download"))
         && value["reference_policy"].is_null() {
         value["reference_policy"]=json!("inherit");
     }
-    let mut d: WorkDecision = serde_json::from_value(value).map_err(|_| invalid())?;
+    let mut d: WorkDecision = serde_json::from_value(value).map_err(|_| schema_error())?;
     // GLM may emit null when this turn changes no specification. Null is
     // exactly an empty patch, never permission to invent defaults or fields.
     if d.spec_patch.is_null() {d.spec_patch=json!({});}
@@ -269,7 +301,7 @@ pub fn parse_decision(raw: &str) -> Result<WorkDecision, String> {
         "inherit" | "replace" | "merge" | "clear"
     ) || !d.spec_patch.is_object()
     {
-        return Err(invalid());
+        return Err(schema_error());
     }
     validate_spec(&d.spec_patch)?;
     if d.paid_action().is_some()
@@ -277,10 +309,10 @@ pub fn parse_decision(raw: &str) -> Result<WorkDecision, String> {
             .as_ref()
             .map_or(true, |s| s.trim().is_empty() || s.len() > 12 * 1024)
     {
-        return Err(invalid());
+        return Err(schema_error());
     }
     if d.clarification.as_ref().is_some_and(|s| s.len() > 2048) {
-        return Err(invalid());
+        return Err(schema_error());
     }
     Ok(d)
 }
@@ -518,12 +550,10 @@ pub fn merge_snapshot(
         summary: String::new(),
         dispatch_body:None,
     });
-    s.effective_prompt = crate::user_routes::normalize_video_spec_text(
-        d.effective_prompt
+    s.effective_prompt = d.effective_prompt
             .as_deref()
             .filter(|s| !s.trim().is_empty() && s.len() <= 12 * 1024)
-            .ok_or_else(invalid)?,
-    );
+            .ok_or_else(invalid)?.to_string();
     for spec in [&text, &Value::Object(explicit)] {
         if let Some(v) = spec["duration"].as_u64() {
             s.duration = v as i64;

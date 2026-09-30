@@ -1,5 +1,34 @@
 use aiwork_core::VideoWorkSnapshot;
 use serde_json::{json, Value};
+#[test]
+fn helper_contract_includes_schema_and_escaping_without_rewriting_dialogue() {
+    let b=json!({"messages":[{"role":"user","content":"生成５秒７２０Ｐ９：１６视频，猫说：\"你好。\""}]});
+    let input=work_planner::build_helper_input(None,&b,"glm-5.3-flash").unwrap();
+    let system=input["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains("\"additionalProperties\":false"));
+    assert!(system.contains("字符串内的双引号必须编码"));
+    assert!(!system.contains("全角字符规范化为半角。"));
+    let payload:Value=serde_json::from_str(input["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["current"],b["messages"][0]["content"],"document text must stay data, only specification fields are normalized");
+}
+#[test]
+fn helper_schema_rejects_missing_unknown_and_wrong_types_but_preserves_valid_text() {
+    let prompt="猫说：\"你好。\"\nC:\\clips\\猫.mp4";
+    let base=json!({"action":"create","effective_prompt":prompt,"spec_patch":{},"reference_policy":"inherit","clarification":null});
+    assert_eq!(work_planner::parse_decision(&base.to_string()).unwrap().effective_prompt.as_deref(),Some(prompt));
+    for field in ["action","effective_prompt","spec_patch","reference_policy","clarification"] {
+        let mut value=base.clone();value.as_object_mut().unwrap().remove(field);
+        assert_eq!(work_planner::parse_decision(&value.to_string()).unwrap_err(),"assistant_schema_invalid");
+    }
+    for (field,value) in [("action",json!("generate")),("effective_prompt",json!({"text":"x"})),("spec_patch",json!([])),("reference_policy",json!(true)),("clarification",json!(1)),("charge",json!(0))] {
+        let mut bad=base.clone();bad[field]=value;
+        assert_eq!(work_planner::parse_decision(&bad.to_string()).unwrap_err(),"assistant_schema_invalid");
+    }
+    for patch in [json!({"duration":"15"}),json!({"duration":15.0}),json!({"duration":16}),json!({"watermark":"false"}),json!({"account_ref":"invented"})] {
+        let mut bad=base.clone();bad["spec_patch"]=patch;
+        assert_eq!(work_planner::parse_decision(&bad.to_string()).unwrap_err(),"work_spec_unsupported");
+    }
+}
 use starlink_dimension_router::work_planner::{self, WorkDecision, WorkIntent};
 fn base() -> VideoWorkSnapshot {
     VideoWorkSnapshot {

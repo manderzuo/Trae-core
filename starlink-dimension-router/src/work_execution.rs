@@ -492,6 +492,11 @@ pub(crate) async fn execute(
         .work_version_for_request(&p, &request)
         .map_err(|_| "work_context_unavailable")?;
     let version = if let Some(v) = bound {
+        // The persisted work disposition is definite; a storage/read failure is
+        // not. Never reopen a failed version while repairing its orphan parent.
+        if v.state==WorkVersionState::Failed {
+            return Err("video_continuation_not_active".into());
+        }
         v
     } else {
         let binding = load_binding(&state, &p, &request, &original)?;
@@ -576,20 +581,10 @@ pub(crate) async fn execute(
                 }
             }
         };
+        let helper_request=assist.request_id.clone();
         let result = crate::budget_flow::wait_result(state.clone(), assist).await?;
-        if result
-            .pointer("/choices/0/finish_reason")
-            .and_then(Value::as_str)
-            != Some("stop")
-        {
-            return Err("work_decision_invalid".into());
-        }
-        let mut decision = work_planner::parse_decision(
-            result
-                .pointer("/choices/0/message/content")
-                .and_then(Value::as_str)
-                .ok_or("work_decision_invalid")?,
-        )?;
+        let mut decision = work_planner::parse_helper_result(&result)
+            .map_err(|e|e.report(&request,&helper_request))?;
         work_planner::resolve_uploaded_video_action(&mut decision, parent.is_some(), &normalized);
         if decision.paid_action().is_none() {
             return read_only(&state, &p, &request, parent.as_ref(), &decision, &original).await.map_err(Into::into);
@@ -748,16 +743,12 @@ pub(crate) fn reflect_failure(state: &StarlinkRouterState, request: &str, _code:
     else {
         return;
     };
-    let video = state
-        .store
-        .budget_operation(request)
-        .ok()
-        .flatten()
-        .and_then(|op| {
-            op.steps
-                .into_iter()
-                .find(|s| s.kind == BudgetStepKind::Video)
-        });
+    let Ok(Some(operation))=state.store.budget_operation(request) else {return;};
+    // A delivery/read/preparation error must not turn an already successful
+    // video, or a recoverable pre-video operation, into a failed work version.
+    if operation.execution_state==BudgetExecutionState::Succeeded {return;}
+    let ended=matches!(operation.execution_state,BudgetExecutionState::Failed|BudgetExecutionState::Canceled);
+    let video=operation.steps.iter().find(|s|s.kind==BudgetStepKind::Video);
     let unknown = video.as_ref().is_some_and(|s| {
         s.dispatch_attempted
             && !matches!(
@@ -767,6 +758,7 @@ pub(crate) fn reflect_failure(state: &StarlinkRouterState, request: &str, _code:
                     | BudgetExecutionState::Succeeded
             )
     });
+    if !ended && !unknown && !video.is_some_and(|s|matches!(s.execution_state,BudgetExecutionState::Failed|BudgetExecutionState::Canceled)) {return;}
     if state
         .store
         .work_version_for_request(&p, request)
