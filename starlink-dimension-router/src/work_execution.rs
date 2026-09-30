@@ -594,6 +594,9 @@ pub(crate) async fn execute(
         if decision.paid_action().is_none() {
             return read_only(&state, &p, &request, parent.as_ref(), &decision, &original).await.map_err(Into::into);
         }
+        if parent.is_none() && matches!(decision.action,WorkIntent::Revise|WorkIntent::Continue) {
+            return Err("work_parent_required".into());
+        }
         if let Some(explicit) = original["action"].as_str() {
             if serde_json::to_value(decision.action)
                 .map_err(|_| "work_decision_invalid")?

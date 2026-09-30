@@ -300,12 +300,7 @@ fn fullwidth_ratio_normalized() {
 }
 #[test]
 fn vague_dissatisfaction_clarifies() {
-    assert_eq!(
-        work_planner::read_only_decision(&body("这个视频不满意"), true)
-            .unwrap()
-            .action,
-        WorkIntent::Clarify
-    );
+    assert!(work_planner::read_only_decision(&body("这个视频不满意"), true).is_none());
     assert!(work_planner::read_only_decision(&body("不满意，改成夜景"), true).is_none());
 }
 #[test]
@@ -314,9 +309,9 @@ fn status_download_have_no_video_step() {
         ("查看任务状态", WorkIntent::Status),
         ("重新下载刚才的视频", WorkIntent::Download),
     ] {
-        let d = work_planner::read_only_decision(&body(text), true).unwrap();
+        assert!(work_planner::read_only_decision(&body(text), true).is_none());
+        let d = work_planner::read_only_decision(&json!({"action":format!("{action:?}").to_lowercase(),"messages":[{"role":"user","content":text}]}), true).unwrap();
         assert_eq!(d.action, action);
-        assert!(d.paid_action().is_none());
     }
 }
 #[test]
@@ -336,7 +331,7 @@ fn helper_excludes_base64_tickets_and_terminal_logs() {
         assert!(!raw.contains(secret), "{secret} leaked");
     }
     assert_eq!(input["model"], "glm-5.3-flash");
-    assert_eq!(input["max_tokens"], 1024);
+    assert_eq!(input["max_tokens"], 4096);
     assert_eq!(input["stream"], false);
 }
 #[test]

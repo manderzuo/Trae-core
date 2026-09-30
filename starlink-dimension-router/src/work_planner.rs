@@ -177,15 +177,6 @@ pub fn read_only_decision(body: &Value, has_parent: bool) -> Option<WorkDecision
         Some("create" | "revise" | "continue") => return None,
         Some(_) => WorkIntent::Clarify,
         None if t.is_empty() => WorkIntent::Clarify,
-        None if ["不满意", "不好", "不行", "重新做"].contains(&t)
-            || ["这个视频不满意", "视频不满意"].contains(&t) =>
-        {
-            WorkIntent::Clarify
-        }
-        None if t == "查看任务状态" || t == "生成好了没" || t == "现在进度怎么样" => {
-            WorkIntent::Status
-        }
-        None if t == "重新下载刚才的视频" || t == "重新下载" => WorkIntent::Download,
         _ => return None,
     };
     let action = if !has_parent && matches!(action, WorkIntent::Status | WorkIntent::Download) {
@@ -251,11 +242,11 @@ pub fn build_helper_input(
         "image_count":body["image_asset_ids"].as_array().map_or(0,Vec::len)});
     let payload = json!({"parent":parent,"history":history,"current":current,"explicit_spec":explicit,"current_references":current_references,
         "normalized_spec":normalized,"create_defaults":create_defaults(),"requested_action":body["action"].as_str()});
-    let mut value = json!({"model":model,"stream":false,"max_tokens":1024,"temperature":0.2,"messages":[
+    let mut value = json!({"model":model,"stream":false,"max_tokens":4096,"temperature":0.2,"messages":[
         {"role":"system","content":"你是视频作业规划助手，负责规范自然语言提示词和视频规格。仅输出严格JSON对象，字段只能是action、effective_prompt、spec_patch、reference_policy、clarification。action只能是create/revise/continue/status/download/clarify。用户明确独立生成才create；在已提供parent上明确修改才revise；明确接着上一段生成才continue；查看进度用status、重新下载用download，普通问候/测试/不满意但无修改方向用clarify。无parent不得猜父版本。effective_prompt忠实合并parent和当前修改，保留人物、动作、场景与未被修改的约束，不新增剧情；只读操作为null。spec_patch只使用normalized_spec中已确认的duration/resolution/ratio/watermark：竖屏/竖构图为9:16，横屏/横构图为16:9，正方形为1:1，高清/高分辨率在当前能力下为720p，低分辨率为480p；explicit_spec优先。分镜的0-2秒等是区间，不能当总时长。未指定字段在revise/continue时沿用parent，create时使用create_defaults；可以省略这些字段或原值回显，不得猜测新值。时长4至15秒，480p或720p，画幅16:9/9:16/1:1/4:3/3:4/21:9。全角字符规范化为半角。reference_policy为inherit/replace/merge/clear，新参考默认replace，只有用户明确合并才merge，明确取消才clear。clarification用于简短追问或只读回复，否则null。不要输出任何ID、链接、账户、工具、扣费字段；不要虚构已提交或完成。"},
         {"role":"user","content":payload.to_string()}]});
     let instruction=value["messages"][0]["content"].as_str().ok_or_else(invalid)?;
-    value["messages"][0]["content"]=json!(format!("{instruction} current_references是服务器已验证的素材数量，不是用户自称。无parent但video_count大于0时，用户明确要求从上传视频继续生成或续写新片段，应使用该素材规划create、reference_policy=replace，不得要求提供Core已有父版本；仍不得虚构原生延长、严格首帧锁定或已完成。"));
+    value["messages"][0]["content"]=json!(format!("{instruction} current_references是服务器已验证的素材数量，不是用户自称。仅根据current判断本轮意图，不要把分镜里角色继续行动、上一段剧情等叙述误判为对已生成视频的续写；用户明确请求独立生成新视频时action=create，即使脚本很长。无parent且用户明确要求修改或续写已有视频时action=clarify，clarification请其指定原视频；不要猜测父版本。无parent但video_count大于0时，用户明确要求从上传视频继续生成或续写新片段，应使用该素材规划create、reference_policy=replace，不得要求提供Core已有父版本；仍不得虚构原生延长、严格首帧锁定或已完成。"));
     if serde_json::to_vec(&value).map_err(|_| invalid())?.len() > 32 * 1024 {
         return Err("work_context_input_too_large".into());
     }

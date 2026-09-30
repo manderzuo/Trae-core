@@ -43,20 +43,26 @@ fn latest_user(body: &Value) -> String {
     crate::work_planner::current_text(body)
 }
 fn needs_parent(body: &Value) -> bool {
-    matches!(
-        body["action"].as_str(),
-        Some("revise" | "continue" | "status" | "download")
-    ) || [
-        "刚才",
-        "上一段",
-        "上一版",
-        "上一个视频",
-        "继续生成",
-        "接着生成",
-        "不满意",
-    ]
-    .iter()
-    .any(|w| latest_user(body).contains(w))
+    // The helper classifies natural language. Core only enforces an explicit
+    // API action that cannot run without an owned parent version.
+    matches!(body["action"].as_str(),Some("revise"|"continue"|"status"|"download"))
+}
+
+#[cfg(test)]
+mod intent_tests {
+    use super::*;
+    #[test]
+    fn detailed_new_video_story_is_not_a_parent_request() {
+        let prompt="帮我生成一个15秒竖屏720P的新视频。情侣在房间里嬉闹，镜头依次记录表情和动作。第一段完成后角色继续生成丰富的互动表情，场景不变。";
+        assert!(!needs_parent(&json!({"model":"seedance","messages":[{"role":"user","content":prompt}]})));
+    }
+    #[test]
+    fn natural_follow_up_reaches_helper_but_explicit_action_requires_parent() {
+        for prompt in ["刚才的视频不满意，改成夜景", "从上一帧继续生成一个新片段", "接着上一段视频续写"] {
+            assert!(!needs_parent(&json!({"messages":[{"role":"user","content":prompt}]})),"自然语言意图必须由辅助模型判定：{prompt}");
+        }
+        assert!(needs_parent(&json!({"action":"continue","messages":[{"role":"user","content":"任意内容"}]})));
+    }
 }
 fn existing(
     state: &StarlinkRouterState,

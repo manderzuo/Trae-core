@@ -16,6 +16,27 @@ async fn failed_reply(f: &Fixture, id: &str, body: &Value) -> Value {
 }
 
 #[tokio::test]
+async fn long_new_video_story_with_continue_in_scene_still_submits_as_create() {
+    let f=Fixture::new();
+    let mut body=create();
+    body["messages"][0]["content"]=json!("帮我生成一个15秒竖屏720P的新视频。情侣在房间里嬉闹，镜头依次记录表情和动作。第一段完成后角色继续生成丰富的互动表情，场景不变。");
+    let response=f.chat("new-story-with-continuing-action",&body).await;
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),1);
+    assert!(response["work_context"]["base_version_id"].is_string());
+}
+
+#[tokio::test]
+async fn missing_parent_follow_up_is_classified_by_helper_without_video_dispatch() {
+    let f=Fixture::new();
+    let mut body=create();
+    body["messages"][0]["content"]=json!("刚才的视频不满意，请续写一个更明亮的结尾");
+    let response=f.chat("missing-parent-model-decision",&body).await;
+    assert!(response["choices"][0]["message"]["content"].as_str().unwrap().contains("原视频"));
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+}
+
+#[tokio::test]
 async fn reference_prepare_rejection_releases_slot_without_refunding_paid_helper() {
     use aiwork_core::{BudgetExecutionState as E, BudgetFinancialState as F, BudgetReceiptInput};
     use starlink_dimension_router::assets::{self, ParsedAssetUpload};

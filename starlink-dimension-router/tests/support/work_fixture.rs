@@ -163,7 +163,7 @@ impl BridgeTransport for Bridge {
                         serde_json::from_str(c["body"]["messages"][1]["content"].as_str().unwrap())
                             .unwrap_or(Value::Null);
                     assert_eq!(c["body"]["model"], "glm-5.3-flash");
-                    assert_eq!(c["body"]["max_tokens"], 1024);
+                    assert_eq!(c["body"]["max_tokens"], if payload.is_null() { 1024 } else { 4096 });
                     let parent = !payload["parent"].is_null();
                     let create = payload["requested_action"] == "create"
                         || payload["current"]
@@ -176,6 +176,12 @@ impl BridgeTransport for Bridge {
                     };
                     let decision = if payload.is_null() {
                         json!({"intent":"video","prompt":prompt})
+                    } else if payload["current"].as_str().is_some_and(|s|s=="查看任务状态") {
+                        json!({"action":"status","effective_prompt":null,"spec_patch":{},"reference_policy":"inherit","clarification":"正在查询任务状态。"})
+                    } else if payload["current"].as_str().is_some_and(|s|s=="这个视频不满意") {
+                        json!({"action":"clarify","effective_prompt":null,"spec_patch":{},"reference_policy":"inherit","clarification":"请说明希望修改哪些内容。"})
+                    } else if !parent && payload["current"].as_str().is_some_and(|s|s.contains("刚才的视频")) {
+                        json!({"action":"clarify","effective_prompt":null,"spec_patch":{},"reference_policy":"inherit","clarification":"请指定要续写的原视频。"})
                     } else {
                         json!({"action":if payload["requested_action"]=="continue"{"continue"}else if parent&&!create{"revise"}else{"create"},"effective_prompt":prompt,"spec_patch":{},"reference_policy":"inherit","clarification":null})
                     };

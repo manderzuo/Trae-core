@@ -39,6 +39,8 @@ pub(crate) fn public_code(code:&str)->Option<&'static str> {
         "reference_upload_limited"=>"reference_upload_limited",
         "reference_materialization_failed"=>"reference_materialization_failed",
         "assist_result_invalid"=>"assist_result_invalid",
+        "assist_execution_failed"=>"assist_execution_failed",
+        "assist_result_unconfirmed"=>"assist_result_unconfirmed",
         "work_context_unavailable"=>"work_context_unavailable",
         "work_decision_invalid"=>"work_decision_invalid",
         "work_spec_unsupported"=>"work_spec_unsupported",

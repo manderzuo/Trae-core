@@ -237,10 +237,10 @@ fn conflicting_parent_markers_clarify() {
     ));
 }
 #[test]
-fn history_without_marker_does_not_guess() {
+fn history_without_marker_reaches_helper_without_guessing_parent() {
     let f = Fixture::new();
     f.version("old", vec![]);
-    assert!(matches!(f.resolve(&json!({"messages":[{"role":"assistant","content":"视频已生成"},{"role":"user","content":"把刚才那段改一下"}]})).unwrap(),WorkResolution::Clarify {..}));
+    assert!(matches!(f.resolve(&json!({"messages":[{"role":"assistant","content":"视频已生成"},{"role":"user","content":"把刚才那段改一下"}]})).unwrap(),WorkResolution::New));
 }
 #[test]
 fn uploaded_source_video_does_not_require_a_stored_parent_version() {
@@ -249,11 +249,11 @@ fn uploaded_source_video_does_not_require_a_stored_parent_version() {
     assert!(matches!(f.resolve(&b).unwrap(),WorkResolution::New));
     let mut invalid=b.clone();
     invalid["messages"][0]["content"]=json!("<uploaded_files><file_path>C:\\..\\source.mp4</file_path></uploaded_files><user_input>从结尾继续生成10秒视频</user_input>");
-    assert!(matches!(f.resolve(&invalid).unwrap(),WorkResolution::Clarify{..}));
+    assert!(matches!(f.resolve(&invalid).unwrap(),WorkResolution::New));
     let mut explicit=b.clone();explicit["action"]=json!("continue");
     assert!(matches!(f.resolve(&explicit).unwrap(),WorkResolution::Clarify{..}));
     let mut no_video=b.clone();no_video["messages"][0]["content"]=json!("从结尾继续生成10秒视频");
-    assert!(matches!(f.resolve(&no_video).unwrap(),WorkResolution::Clarify{..}));
+    assert!(matches!(f.resolve(&no_video).unwrap(),WorkResolution::New));
     let mut foreign=b;
     let (w,v,_)=f.version("foreign-source",vec![]);
     foreign["work_context"]=json!({"work_id":w,"base_version_id":v});
@@ -378,13 +378,13 @@ fn verified_client_conversation_is_key_and_namespace_scoped() {
     }
     assert!(matches!(
         work_context::resolve(&f.state, &f.other, &HeaderMap::new(), &b).unwrap(),
-        WorkResolution::Clarify { .. }
+        WorkResolution::New
     ));
     let mut another = b.clone();
     another["client_namespace"] = json!("dsh");
     assert!(matches!(
         f.resolve(&another).unwrap(),
-        WorkResolution::Clarify { .. }
+        WorkResolution::New
     ));
     assert!(!association.contains("chat-123"));
 }

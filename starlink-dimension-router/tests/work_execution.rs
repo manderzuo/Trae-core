@@ -303,7 +303,7 @@ async fn status_and_clarification_do_not_prepare_or_dispatch_paid_work() {
         let result = f.chat(id, &revise(&first, text)).await;
         assert_eq!(result["work_context"], first["work_context"]);
     }
-    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst), before);
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst), before+2, "natural-language status and dissatisfaction should be classified by the helper");
     assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst), 1);
 }
 

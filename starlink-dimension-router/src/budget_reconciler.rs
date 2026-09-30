@@ -4,6 +4,32 @@ use aiwork_core::{BudgetStepView, BudgetStepKind, BudgetExecutionState as Execut
 use serde_json::Value;
 use crate::{bridge_client::BridgeClient, state::StarlinkRouterState};
 
+#[derive(Clone,Copy,PartialEq,Eq)]
+enum HelperDecision { Text, Video }
+
+fn helper_decision(result:&Value,work_context:bool)->Result<HelperDecision,&'static str> {
+    let code=if work_context {"work_decision_invalid"} else {"assist_result_invalid"};
+    let content=result.pointer("/choices/0/message/content").and_then(Value::as_str).ok_or(code)?;
+    let value=crate::assistant_json::object(content,16*1024).map_err(|_|code)?;
+    if value["intent"]=="text" && value["text"].as_str().is_some_and(|s|!s.trim().is_empty() && s.len()<=16*1024) {
+        return Ok(HelperDecision::Text);
+    }
+    if value["intent"]=="video" && value["prompt"].as_str().is_some_and(|s|!s.trim().is_empty() && s.len()<=12*1024) {
+        return Ok(HelperDecision::Video);
+    }
+    if work_context {
+        return crate::work_planner::parse_decision(&value.to_string())
+            .map(|d|if d.paid_action().is_some(){HelperDecision::Video}else{HelperDecision::Text})
+            .map_err(|_|code);
+    }
+    Err(code)
+}
+
+fn terminal_failure_code(kind:BudgetStepKind,result:&Value)->&'static str {
+    if kind==BudgetStepKind::Video {crate::seedance_feedback::video_failure(result)}
+    else {"assist_execution_failed"}
+}
+
 pub(crate) fn identity(value: &Value, step: &BudgetStepView) -> Result<(), String> {
     for (name, expected) in [("request_id", &step.request_id), ("core_key_id", &step.core_key_id),
         ("budget_id", &step.budget_id), ("account_ref", &step.account_ref), ("bridge_instance_id", &step.bridge_instance_id)] {
@@ -53,32 +79,37 @@ pub(crate) fn sync_execution(state: &StarlinkRouterState, client: &BridgeClient,
     }
     // A successful helper alone must NOT finish a parent still awaiting video preparation.
     if terminal && step.kind!=BudgetStepKind::Assist && step.request_id==step.parent_request_id {
-        state.store.finish_budget_execution(&step.parent_request_id,next).map_err(|e|e.to_string())?;
+        let result=if next==Execution::Failed {
+            let reply=read(client,step,"result")?;
+            if reply["status"]!="ready" {return Err("terminal result unavailable".into());}
+            if step.kind==BudgetStepKind::Video {
+                let expected=execution["task_ref"].as_str().or(step.task_ref.as_deref()).ok_or("video result task binding missing")?;
+                if reply["result"]["id"].as_str()!=Some(expected) {return Err("video result task binding mismatch".into());}
+            }
+            crate::budget_flow::public_failure_result(terminal_failure_code(step.kind,&reply["result"]))
+        } else {None};
+        state.store.finish_budget_execution_with_result(&step.parent_request_id,next,result).map_err(|e|e.to_string())?;
     }
     if terminal && step.kind==BudgetStepKind::Assist {
         let operation=state.store.budget_operation(&step.parent_request_id).map_err(|e|e.to_string())?.ok_or("helper parent missing")?;
         if !matches!(operation.execution_state,Execution::Succeeded|Execution::Failed|Execution::Canceled)
             && !operation.steps.iter().any(|s|s.kind==BudgetStepKind::Video) {
-            let finish=if next==Execution::Failed {Some(Execution::Failed)} else {
+            let (finish,failure_code)=if next==Execution::Failed {(Some(Execution::Failed),Some("assist_execution_failed"))} else {
                 // A durable helper result can finish a text-only probe even if
                 // its original HTTP observer/process is gone. Video intent is
                 // not terminal: it still needs the separate continuation path.
                 let reply=read(client,step,"result")?;
                 if reply["status"]!="ready" {return Err("terminal helper result unavailable".into());}
-                let decision=reply.pointer("/result/choices/0/message/content").and_then(Value::as_str)
-                    .and_then(|text|crate::assistant_json::object(text,16*1024).ok());
-                match decision {
-                    Some(value) if value["intent"]=="text" && value["text"].as_str().is_some_and(|s|!s.trim().is_empty() && s.len()<=16*1024)=>Some(Execution::Succeeded),
-                    Some(value) if value["intent"]=="video" && value["prompt"].as_str().is_some_and(|s|!s.trim().is_empty() && s.len()<=12*1024)=>None,
-                    Some(value) if state.config.work_context_for_key(&operation.api_key_id)=>match crate::work_planner::parse_decision(&value.to_string()) {
-                        Ok(d) if d.paid_action().is_some()=>None,
-                        Ok(_)=>Some(Execution::Succeeded),
-                        Err(_)=>Some(Execution::Failed),
-                    },
-                    _=>Some(Execution::Failed),
+                match helper_decision(&reply["result"],state.config.work_context_for_key(&operation.api_key_id)) {
+                    Ok(HelperDecision::Text)=>(Some(Execution::Succeeded),None),
+                    Ok(HelperDecision::Video)=>(None,None),
+                    Err(code)=>(Some(Execution::Failed),Some(code)),
                 }
             };
-            if let Some(finish)=finish {state.store.finish_budget_execution(&step.parent_request_id,finish).map_err(|e|e.to_string())?;}
+            if let Some(finish)=finish {
+                let result=failure_code.and_then(crate::budget_flow::public_failure_result);
+                state.store.finish_budget_execution_with_result(&step.parent_request_id,finish,result).map_err(|e|e.to_string())?;
+            }
         }
     }
     Ok(())
@@ -239,6 +270,16 @@ fn for_each_bounded<T: Sync>(items: &[T], action: impl Fn(&T) + Sync) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn terminal_video_failure_keeps_verified_upstream_reason() {
+        let result=serde_json::json!({"status":"failed","error":{"message":"video security check failed"}});
+        assert_eq!(terminal_failure_code(BudgetStepKind::Video,&result),"video_safety_check_failed");
+    }
+    #[test]
+    fn invalid_helper_result_is_a_definite_failure_not_an_anonymous_terminal() {
+        let result=serde_json::json!({"choices":[{"message":{"content":"not json"}}]});
+        assert_eq!(helper_decision(&result,false).err(),Some("assist_result_invalid"));
+    }
     #[test]
     fn slow_bridge_read_does_not_block_another_keys_reconciliation() {
         use std::{sync::{Arc,Mutex,mpsc},time::Duration};

@@ -21,6 +21,7 @@ pub(crate) fn fail(code:&str)->Response {
         "reference_asset_unavailable"|"reference_video_budget_metadata_required"|
         "video_safety_check_failed"|"reference_safety_check_failed"|"prompt_safety_check_failed"=>StatusCode::BAD_REQUEST,
         "video_execution_failed"=>StatusCode::UNPROCESSABLE_ENTITY,
+        "assist_execution_failed"=>StatusCode::BAD_GATEWAY,
         "budget_chat_input_too_large"=>StatusCode::PAYLOAD_TOO_LARGE,
         "work_context_input_too_large"=>StatusCode::PAYLOAD_TOO_LARGE,
         "work_context_unavailable"|"work_decision_invalid"|"work_spec_unsupported"|"work_parent_required"|"reference_image_missing"|"invalid_reference_context"|"reference_image_limit"|"invalid_reference_image"|"reference_requires_inline_image_or_owned_asset"|"continuation_mode_unsupported"=>StatusCode::BAD_REQUEST,
@@ -33,6 +34,13 @@ pub(crate) fn fail(code:&str)->Response {
 }
 #[cfg(test)]
 mod error_tests {
+    #[test]
+    fn ended_continuation_is_a_definite_failure_but_unknown_billing_is_not() {
+        assert!(super::definite_failure_code("video_continuation_not_active"));
+        assert!(!super::definite_failure_code("budget_execution_wait_timeout"));
+        assert!(!super::definite_failure_code("assist_result_unconfirmed"));
+        assert_eq!(crate::budget_errors::public_code("assist_result_unconfirmed"),Some("assist_result_unconfirmed"));
+    }
     #[test]
     fn busy_invalid_and_missing_policy_are_not_the_same_503() {
         use super::*;
@@ -136,8 +144,14 @@ pub(crate) async fn video_status(state:Arc<StarlinkRouterState>,principal:Princi
     let result=tokio::task::spawn_blocking(move ||->Result<Option<Value>,String> {
         let Some(step)=owned_video_step(&state,&principal,&request)? else {
             if state.config.work_context_for_key(&principal.key_id) && state.store.active_principal_for_request(&request).map_err(|_|"work_context_unavailable")?.is_some_and(|p|p.key_id==principal.key_id&&p.user_id==principal.user_id) {
-                let failed=state.store.budget_operation(&request).map_err(|_|"work_context_unavailable")?.is_some_and(|op|matches!(op.execution_state,aiwork_core::BudgetExecutionState::Failed|aiwork_core::BudgetExecutionState::Canceled)) || state.store.request_state(&request).map_err(|_|"work_context_unavailable")?==aiwork_core::RequestState::Failed;
-                let mut reply=json!({"task":{"id":request,"status":if failed {"failed"}else{"queued"}},"request_id":request});
+                let operation=state.store.budget_operation(&request).map_err(|_|"work_context_unavailable")?;
+                let failed=operation.as_ref().is_some_and(|op|matches!(op.execution_state,aiwork_core::BudgetExecutionState::Failed|aiwork_core::BudgetExecutionState::Canceled)) || state.store.request_state(&request).map_err(|_|"work_context_unavailable")?==aiwork_core::RequestState::Failed;
+                let unconfirmed_assist=operation.as_ref().is_some_and(|op|op.steps.iter().any(|s|s.kind==BudgetStepKind::Assist && s.execution_state==aiwork_core::BudgetExecutionState::Unknown));
+                let mut reply=json!({"task":{"id":request,"status":if failed {"failed"}else if unconfirmed_assist {"processing"}else{"queued"}},"request_id":request});
+                if !failed && unconfirmed_assist {
+                    reply["task"]["stage"]=json!("assistant_reconciliation");
+                    reply["task"]["notice"]=json!({"code":"assist_result_unconfirmed","message":crate::seedance_feedback::message("assist_result_unconfirmed"),"billing_state":"pending"});
+                }
                 if failed {
                     let result=state.store.request_result(&request).map_err(|_|"work_context_unavailable")?;
                     let code=result.as_ref().and_then(|r|r.error_code.as_deref()).and_then(crate::budget_errors::public_code).unwrap_or("budget_failure_reason_unavailable");
@@ -173,7 +187,9 @@ pub(crate) async fn wait_result(state:Arc<StarlinkRouterState>,step:BudgetStepVi
     use crate::seedance_feedback::Stage;
     let started=std::time::Instant::now();
     loop {
-        if started.elapsed()>std::time::Duration::from_secs(14*60) {return Err("budget_execution_wait_timeout".into());}
+        if started.elapsed()>std::time::Duration::from_secs(14*60) {
+            return Err(if step.kind==BudgetStepKind::Assist {"assist_result_unconfirmed"} else {"budget_execution_wait_timeout"}.into());
+        }
         let s=state.clone();let b=step.clone();
         let reply=match tokio::task::spawn_blocking(move ||read_result(&s,&b)).await.map_err(|_|"result worker unavailable")? {
             Ok(reply)=>reply,
@@ -484,13 +500,7 @@ fn request_failure(state:&StarlinkRouterState,failure:&Failure,request:&str)->Re
 
 pub(crate) fn finish_definite_failure(state:&StarlinkRouterState,request:&str,code:&str) {
     // Transport/storage/read errors are not evidence the workflow has ended.
-    if matches!(code,"assist_result_invalid"|"video_execution_failed"|"video_safety_check_failed"|"reference_safety_check_failed"|"prompt_safety_check_failed"|"budget_not_sent"|"video_billing_paused"|
-        "quota_insufficient"|"budget_policy_unconfigured"|"budget_policy_expired"|"budget_policy_invalid"|
-        "reference_video_budget_metadata_required"|"invalid_budget_business_request"|"reference_image_limit"|
-        "reference_video_metadata_invalid"|"reference_video_format_unsupported"|"reference_asset_type_mismatch"|
-        "invalid_image_asset_ids"|"invalid_reference_image"|"video_continuation_not_authorized"|
-        "work_parent_required"|"work_decision_invalid"|"work_spec_unsupported"|"continuation_mode_unsupported"|
-        "source_video_not_ready"|"source_video_unavailable"|"source_video_invalid"|"source_video_identity_invalid") {
+    if definite_failure_code(code) {
         // The store CAS refuses unfinished/unknown paid steps and changes only
         // execution, not finance. A late helper receipt can still settle normally.
         // Do the same version/media cleanup for background continuations that
@@ -500,7 +510,16 @@ pub(crate) fn finish_definite_failure(state:&StarlinkRouterState,request:&str,co
         }
     }
 }
-fn public_failure_result(code:&str)->Option<aiwork_core::RequestResult> {
+fn definite_failure_code(code:&str)->bool {
+    matches!(code,"assist_result_invalid"|"assist_execution_failed"|"video_execution_failed"|"video_safety_check_failed"|"reference_safety_check_failed"|"prompt_safety_check_failed"|"budget_not_sent"|"video_billing_paused"|
+        "quota_insufficient"|"budget_policy_unconfigured"|"budget_policy_expired"|"budget_policy_invalid"|
+        "reference_video_budget_metadata_required"|"invalid_budget_business_request"|"reference_image_limit"|
+        "reference_video_metadata_invalid"|"reference_video_format_unsupported"|"reference_asset_type_mismatch"|
+        "invalid_image_asset_ids"|"invalid_reference_image"|"video_continuation_not_authorized"|"video_continuation_not_active"|
+        "work_parent_required"|"work_decision_invalid"|"work_spec_unsupported"|"continuation_mode_unsupported"|
+        "source_video_not_ready"|"source_video_unavailable"|"source_video_invalid"|"source_video_identity_invalid")
+}
+pub(crate) fn public_failure_result(code:&str)->Option<aiwork_core::RequestResult> {
     crate::budget_errors::public_code(code).map(|safe|aiwork_core::RequestResult {status:Some(i64::from(fail(safe).status().as_u16())),error_code:Some(safe.into())})
 }
 pub(crate) fn abort_preparation_failure(state:&StarlinkRouterState,request:&str,code:&str) {

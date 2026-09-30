@@ -88,6 +88,8 @@ impl Failure {
 pub(crate) fn message(code:&str)->&'static str {match code {
     "work_spec_unsupported"=>"本轮视频规格超出支持范围或存在冲突；时长支持4至15秒，分辨率支持480P或720P，也可用横屏、竖屏、高清等描述。本次未提交视频。",
     "work_decision_invalid"|"assist_result_invalid"=>"辅助模型返回的规划格式或字段未通过校验；本次未提交视频，请保留请求编号供排查。",
+    "assist_execution_failed"=>"辅助模型执行失败；本次尚未提交视频。积分仍按该辅助步骤的真实账单核对。",
+    "assist_result_unconfirmed"=>"辅助模型的执行结果尚未确认，视频尚未提交；系统保留原请求与积分预占继续核对，不会自动重发付费请求。",
     "work_parent_required"=>"本次续写或修改没有找到可用的上一版视频，请在原对话继续或指定已有视频版本；本次未提交视频。",
     "reference_video_format_unsupported"=>"当前视频处理不支持该素材格式；提取尾帧请上传 MP4，本次未提交视频。",
     "reference_video_metadata_invalid"=>"参考视频的时长或时间信息未通过校验；本次未提交视频，请检查素材文件或重新导出。",
