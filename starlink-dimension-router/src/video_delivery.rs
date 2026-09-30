@@ -207,6 +207,9 @@ pub(crate) async fn follow_up(state: &Arc<StarlinkRouterState>, p: &Principal, b
         let mut v=chat(request,&format!("视频已生成，但本地下载未完成。{}",fallback["choices"][0]["message"]["content"].as_str().unwrap()));
         v["video_delivery"]=json!({"status":"download_failed"});v
     };
+    if state.store.set_work_delivery_state(p,request,value["video_delivery"]["status"].as_str().unwrap()).is_err() {
+        return Some(error(StatusCode::SERVICE_UNAVAILABLE,"delivery_receipt_persistence_failed"));
+    }
     value["video_task"]=json!({"id":request,"status":"completed","content_url":format!("{}/v1/videos/{request}/content",state.config.public_base_url.trim_end_matches('/'))});
     if crate::work_context::decorate_owned_request(state,p,request,&mut value).is_err() {return Some(error(StatusCode::SERVICE_UNAVAILABLE,"work_context_unavailable"));}
     Some(response(value,body["stream"].as_bool().unwrap_or(false)))

@@ -435,6 +435,36 @@ impl CoreStore {
         tx.commit()?;
         Ok(())
     }
+    /// Records a validated client receipt for this exact owned request, not
+    /// the latest work version. Legacy requests without a work are a no-op.
+    pub fn set_work_delivery_state(
+        &self,
+        p: &Principal,
+        request: &str,
+        state: &str,
+    ) -> Result<(), CoreError> {
+        if !matches!(state, "saved" | "download_failed") {
+            return Err(invalid("invalid delivery state"));
+        }
+        let mut con = self.connection.lock().expect("core store mutex poisoned");
+        let tx = con.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_owner(&tx, p)?;
+        if let Some(v) = version_by(&tx, p, "operation_request_id", request)? {
+            if v.state != WorkVersionState::Completed {
+                return Err(invalid("source version is incomplete"));
+            }
+            // A delayed failure or repeated receipt cannot undo a confirmed
+            // save, nor repeatedly change the version's modification time.
+            if v.delivery_state != "saved" && v.delivery_state != state {
+                tx.execute(
+                    "UPDATE video_work_versions SET delivery_state=?2,updated_at_ms=?3 WHERE version_id=?1",
+                    params![v.version_id, state, chrono::Utc::now().timestamp_millis()],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
     pub fn set_work_frame(
         &self,
         p: &Principal,
