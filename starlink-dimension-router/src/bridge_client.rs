@@ -195,12 +195,33 @@ struct CoreKeyRegistrySnapshot {
 }
 
 impl BridgeClient {
+    pub(crate) fn frame_extractor_health(&self)->Result<(),String> {
+        let headers=BTreeMap::from([("authorization".into(),format!("Bearer {}",self.bridge_secret)),("accept".into(),"application/json".into())]);
+        let response=self.transport.send_stream("GET",&format!("{}/internal/bridge/v2/frame-extractor/health",self.base_url),&headers,&[]).map_err(|_|"frame_extraction_unavailable")?;
+        if response.status!=200 {return Err(Self::frame_error(response));}
+        let bytes=read_bounded_response(response.body,8192).map_err(|_|"frame_extraction_unavailable")?;
+        let value:Value=serde_json::from_slice(&bytes).map_err(|_|"frame_extraction_unavailable")?;
+        if value["status"]!="ready" {return Err("frame_extraction_unavailable".into());}Ok(())
+    }
+    fn frame_error(response:BridgeStreamingResponse)->String {
+        if response.status==429 {return "frame_extractor_busy".into();}
+        // A network/proxy 503 is not proof of a local tool failure. Only accept
+        // bounded, known codes from the authenticated bridge's error envelope.
+        if response.status==503 {
+            if let Ok(bytes)=read_bounded_response(response.body,8192) {
+                if let Ok(value)=serde_json::from_slice::<Value>(&bytes) {
+                    if let Some(code)=value["error"]["code"].as_str().filter(|code|matches!(*code,"frame_extractor_unconfigured"|"frame_extractor_unavailable"|"frame_extractor_digest_mismatch")) {return code.into();}
+                }
+            }
+        }
+        "frame_extraction_unavailable".into()
+    }
     pub fn last_frame(&self,step:&aiwork_core::BudgetStepView)->Result<FrameDownload,String> {
         if step.kind!=aiwork_core::BudgetStepKind::Video||step.execution_state!=aiwork_core::BudgetExecutionState::Succeeded||step.task_ref.is_none(){return Err("frame_result_not_ready".into());}
         let path=crate::budget_reconciler::request_path(step,"last-frame");
         let headers=BTreeMap::from([("authorization".into(),format!("Bearer {}",self.bridge_secret)),("accept".into(),"image/png".into())]);
         let response=self.transport.send_stream("POST",&format!("{}{path}",self.base_url),&headers,&[])?;
-        if response.status!=200 {return Err(if response.status==429 {"frame_extractor_busy"}else{"frame_extraction_unavailable"}.into());}
+        if response.status!=200 {return Err(Self::frame_error(response));}
         let header=|name:&str|response.headers.iter().find(|(k,_)|k.eq_ignore_ascii_case(name)).map(|(_,v)|v.as_str()).ok_or("frame_identity_invalid");
         for (name,expected) in [("x-aiwork-request-id",&step.request_id),("x-aiwork-budget-id",&step.budget_id),("x-aiwork-core-key-id",&step.core_key_id),("x-aiwork-account-ref",&step.account_ref),("x-aiwork-bridge-instance-id",&step.bridge_instance_id)] {if header(name)?!=expected {return Err("frame_identity_invalid".into());}}
         Self::decode_frame(response)
@@ -210,7 +231,7 @@ impl BridgeClient {
         if bytes.len()>crate::assets::MAX_ASSET_BYTES || crate::assets::detect_format(bytes).map(|v|v.0)!=Some("video/mp4") {return Err("reference_video_format_unsupported".into());}
         let headers=BTreeMap::from([("authorization".into(),format!("Bearer {}",self.bridge_secret)),("content-type".into(),"video/mp4".into()),("accept".into(),"image/png".into()),("x-aiwork-core-key-id".into(),key.into())]);
         let response=self.transport.send_stream("POST",&format!("{}/internal/bridge/v2/reference-last-frame",self.base_url),&headers,bytes).map_err(|_|"frame_extraction_unavailable")?;
-        if response.status!=200 {return Err(if response.status==429 {"frame_extractor_busy"}else{"frame_extraction_unavailable"}.into());}
+        if response.status!=200 {return Err(Self::frame_error(response));}
         if !response.headers.iter().any(|(k,v)|k.eq_ignore_ascii_case("x-aiwork-core-key-id")&&v==key) {return Err("frame_identity_invalid".into());}
         let frame=Self::decode_frame(response)?;
         if frame.source_sha256!=format!("{:x}",Sha256::digest(bytes)) {return Err("frame_identity_invalid".into());}

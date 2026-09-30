@@ -35,6 +35,15 @@ pub(crate) fn fail(code:&str)->Response {
 #[cfg(test)]
 mod error_tests {
     #[test]
+    fn confirmed_frame_tool_failures_are_terminal_but_transport_failures_are_not() {
+        for code in ["frame_extractor_unconfigured","frame_extractor_unavailable","frame_extractor_digest_mismatch"] {
+            assert!(super::definite_failure_code(code),"{code}");
+            assert_eq!(crate::budget_errors::public_code(code),Some(code));
+            assert!(crate::seedance_feedback::message(code).contains("未提交"));
+        }
+        for code in ["frame_extraction_unavailable","frame_extractor_busy"] {assert!(!super::definite_failure_code(code));}
+    }
+    #[test]
     fn ended_continuation_is_a_definite_failure_but_unknown_billing_is_not() {
         assert!(super::definite_failure_code("video_continuation_not_active"));
         assert!(!super::definite_failure_code("budget_execution_wait_timeout"));
@@ -247,6 +256,9 @@ pub(crate) async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Princ
         let result=wait_result(state.clone(),video).await?;
         return completed_video(&state,&principal,&request,&result,&original).await;
     }
+    // Durable pre-video failures remain final across process restarts and tool
+    // repairs. Do not re-extract assets or buy another helper on their replay.
+    if let Some(code)=stored_failure_code(&state,&request) {return Err(code.into());}
     if state.config.work_context_for_key(&principal.key_id) {return crate::work_execution::execute(state,principal,request,original,fresh,dispatch_only).await;}
     state.seedance_results.progress(&request,Stage::Assistant);
     let assist=if let Some(step)=operation.and_then(|op|op.steps.into_iter().find(|s|s.kind==BudgetStepKind::Assist)) {step} else {
@@ -520,7 +532,8 @@ fn definite_failure_code(code:&str)->bool {
         "reference_video_metadata_invalid"|"reference_video_format_unsupported"|"reference_asset_type_mismatch"|
         "invalid_image_asset_ids"|"invalid_reference_image"|"video_continuation_not_authorized"|"video_continuation_not_active"|
         "work_parent_required"|"work_decision_invalid"|"work_spec_unsupported"|"continuation_mode_unsupported"|
-        "source_video_not_ready"|"source_video_unavailable"|"source_video_invalid"|"source_video_identity_invalid")
+        "source_video_not_ready"|"source_video_unavailable"|"source_video_invalid"|"source_video_identity_invalid"|
+        "frame_extractor_unconfigured"|"frame_extractor_unavailable"|"frame_extractor_digest_mismatch")
 }
 pub(crate) fn public_failure_result(code:&str)->Option<aiwork_core::RequestResult> {
     crate::budget_errors::public_code(code).map(|safe|aiwork_core::RequestResult {status:Some(i64::from(fail(safe).status().as_u16())),error_code:Some(safe.into())})

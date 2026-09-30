@@ -522,6 +522,12 @@ pub(crate) async fn execute(
         })
         .await
         .map_err(|_| "reference_worker_unavailable")??;
+        // An explicitly selected tail flow requires the local decoder before
+        // buying a helper step. Re-check during extraction for later changes.
+        if crate::work_continuation::requested_mode(&normalized)?==crate::work_continuation::ContinuationMode::TailReference
+            && normalized["video_asset_ids"].as_array().is_some_and(|v|!v.is_empty()) {
+            let s=state.clone();tokio::task::spawn_blocking(move||s.bridge_client().frame_extractor_health()).await.map_err(|_|"frame_extraction_unavailable")??;
+        }
         let model = state.config.seedance_assistant_model.clone();
         state.seedance_results.progress(&request, Stage::Assistant);
         let assist = if let Some(step) = operation

@@ -30,6 +30,8 @@ pub(crate) struct Bridge {
     pub(crate) source_identity_bad: std::sync::atomic::AtomicBool,
     pub(crate) source_reads: Mutex<Vec<String>>,
     pub(crate) frame_failure: std::sync::atomic::AtomicBool,
+    pub(crate) frame_tool_error: Mutex<Option<String>>,
+    pub(crate) frame_health_error: Mutex<Option<String>>,
     pub(crate) frame_reads: AtomicUsize,
     pub(crate) uploaded_frame_reads: AtomicUsize,
     pub(crate) billing_final: std::sync::atomic::AtomicBool,
@@ -53,6 +55,10 @@ impl BridgeTransport for Bridge {
             Some("Bearer bridge-only")
         );
         let input: Value = serde_json::from_slice(raw).unwrap_or(Value::Null);
+        if url.ends_with("/frame-extractor/health") {
+            let error=self.frame_health_error.lock().unwrap().clone();
+            return Ok(BridgeResponse {status:if error.is_some(){503}else{200},headers:BTreeMap::new(),body:serde_json::to_vec(&match error {Some(code)=>json!({"error":{"code":code}}),None=>json!({"status":"ready"})}).unwrap()});
+        }
         if url.ends_with("/budgets/prepare") && input["step_kind"] == "video" {
             if let Some((status, code)) = self.video_prepare_error.lock().unwrap().clone() {
                 return Ok(BridgeResponse { status, headers: BTreeMap::new(), body: serde_json::to_vec(&json!({"error":{"code":code}})).unwrap() });
@@ -63,6 +69,7 @@ impl BridgeTransport for Bridge {
             return Ok(BridgeResponse {status:503,headers:BTreeMap::new(),body:serde_json::to_vec(&json!({"error":{"code":"budget_policy_unconfigured"}})).unwrap()});
         }
         if url.contains("/last-frame?") || url.ends_with("/reference-last-frame") {
+            if let Some(code)=self.frame_tool_error.lock().unwrap().clone() {return Ok(BridgeResponse {status:503,headers:BTreeMap::new(),body:serde_json::to_vec(&json!({"error":{"code":code}})).unwrap()});}
             if self.frame_failure.load(Ordering::SeqCst) {
                 return Err("frame unavailable".into());
             }
@@ -290,6 +297,8 @@ impl Fixture {
             source_identity_bad: std::sync::atomic::AtomicBool::new(false),
             source_reads: Mutex::new(Vec::new()),
             frame_failure: std::sync::atomic::AtomicBool::new(false),
+            frame_tool_error: Mutex::new(None),
+            frame_health_error: Mutex::new(None),
             frame_reads: AtomicUsize::new(0),
             uploaded_frame_reads: AtomicUsize::new(0),
             billing_final: std::sync::atomic::AtomicBool::new(false),

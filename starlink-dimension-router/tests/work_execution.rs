@@ -1,6 +1,48 @@
 #[path = "support/work_fixture.rs"]
 mod fixture;
 use fixture::*;
+
+fn uploaded_tail(f:&Fixture)->Value {
+    use starlink_dimension_router::assets::{self,ParsedAssetUpload};
+    let stored=assets::write_asset(&f.state.config.data_dir,&f.owner,ParsedAssetUpload {filename:"source.mp4".into(),declared_mime:Some("video/mp4".into()),bytes:b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2".to_vec()}).unwrap();
+    let asset=assets::persist_asset(&f.state.store,&f.owner,&stored).unwrap();
+    let mut body=create();body["video_asset_ids"]=json!([asset.id]);body["continuation_mode"]=json!("tail_reference");body
+}
+#[tokio::test]
+async fn unavailable_frame_tool_is_rejected_before_helper_payment() {
+    let f=Fixture::with_continuation(true);let body=uploaded_tail(&f);
+    *f.bridge.frame_health_error.lock().unwrap()=Some("frame_extractor_unconfigured".into());
+    let response=f.response(&f.key,"tool-preflight",&body).await;
+    let value:Value=serde_json::from_slice(&to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+    assert_eq!(value["error"]["code"],"frame_extractor_unconfigured","{value}");
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),0);
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+    assert_eq!(f.state.store.active_execution_count_for_key(&f.owner.key_id).unwrap(),0);
+    let replay=f.response(&f.key,"tool-preflight",&body).await;
+    let replay:Value=serde_json::from_slice(&to_bytes(replay.into_body(),65536).await.unwrap()).unwrap();
+    assert_eq!(replay["error"]["code"],"frame_extractor_unconfigured");
+}
+#[tokio::test]
+async fn changed_frame_tool_ends_execution_without_erasing_helper_bill_or_replaying_video() {
+    let f=Fixture::with_continuation(true);let body=uploaded_tail(&f);
+    *f.bridge.frame_tool_error.lock().unwrap()=Some("frame_extractor_digest_mismatch".into());
+    let response=f.response(&f.key,"changed-tool",&body).await;
+    let value:Value=serde_json::from_slice(&to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+    assert_eq!(value["error"]["code"],"frame_extractor_digest_mismatch","{value}");
+    let request=value["request_id"].as_str().unwrap();
+    let op=f.state.store.budget_operation(request).unwrap().unwrap();
+    assert_eq!(op.execution_state,aiwork_core::BudgetExecutionState::Failed);
+    assert_eq!(op.steps.len(),1);assert_eq!(op.steps[0].financial_state,aiwork_core::BudgetFinancialState::Held);
+    assert_eq!(f.state.store.active_execution_count_for_key(&f.owner.key_id).unwrap(),0);
+    *f.bridge.frame_tool_error.lock().unwrap()=None;
+    let replay=f.response(&f.key,"changed-tool",&body).await;
+    let replay:Value=serde_json::from_slice(&to_bytes(replay.into_body(),65536).await.unwrap()).unwrap();
+    assert_eq!(replay["error"]["code"],"frame_extractor_digest_mismatch");
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+    assert_eq!(f.state.store.budget_operation(request).unwrap().unwrap().steps[0].actual_credits,op.steps[0].actual_credits);
+    assert_eq!(f.bridge.uploaded_frame_reads.load(Ordering::SeqCst),0,"repairing the tool must not revive a definitively failed request");
+    assert!(f.state.store.work_version_for_request(&f.owner,request).unwrap().is_none());
+}
 #[tokio::test]
 async fn malformed_helper_json_reports_cause_and_releases_slot_without_resubmission() {
     let cases=[

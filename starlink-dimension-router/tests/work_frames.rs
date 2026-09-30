@@ -57,6 +57,40 @@ fn reply()->Reply {
         ("x-aiwork-source-sha256".into(),"ab".repeat(32)),("x-aiwork-frame-sha256".into(),format!("{:x}",Sha256::digest(&body))),
         ("x-aiwork-request-id".into(),"request-frame".into()),("x-aiwork-budget-id".into(),"budget-frame".into()),("x-aiwork-core-key-id".into(),"key-frame".into()),("x-aiwork-account-ref".into(),"account-frame".into()),("x-aiwork-bridge-instance-id".into(),"bridge-frame".into())]);Reply{body,headers}
 }
+
+struct ToolFailure {status:u16,body:Vec<u8>}
+impl BridgeTransport for ToolFailure {
+    fn send(&self,_:&str,_:&str,headers:&BTreeMap<String,String>,_:&[u8])->Result<BridgeResponse,String> {
+        assert_eq!(headers["authorization"],"Bearer bridge-only");
+        Ok(BridgeResponse {status:self.status,headers:BTreeMap::new(),body:self.body.clone()})
+    }
+}
+#[test]
+fn frame_tool_errors_preserve_only_bounded_known_codes() {
+    for code in ["frame_extractor_unconfigured","frame_extractor_unavailable","frame_extractor_digest_mismatch"] {
+        let client=BridgeClient::from_transport("http://bridge","bridge-only",Arc::new(ToolFailure {status:503,body:serde_json::to_vec(&serde_json::json!({"error":{"code":code}})).unwrap()}));
+        assert_eq!(client.last_frame(&step()).unwrap_err(),code);
+    }
+    for body in [b"not json".to_vec(),serde_json::to_vec(&serde_json::json!({"error":{"code":"private-key-and-path"}})).unwrap(),vec![b' ';8193]] {
+        let client=BridgeClient::from_transport("http://bridge","bridge-only",Arc::new(ToolFailure {status:503,body}));
+        assert_eq!(client.last_frame(&step()).unwrap_err(),"frame_extraction_unavailable");
+    }
+}
+#[test]
+fn real_http_tool_failure_keeps_the_exact_safe_reason() {
+    use std::{io::{Read,Write},net::TcpListener,time::Duration};
+    let listener=TcpListener::bind("127.0.0.1:0").unwrap();let base=format!("http://{}",listener.local_addr().unwrap());
+    let server=std::thread::spawn(move|| {
+        let (mut stream,_)=listener.accept().unwrap();stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut bytes=Vec::new();let mut buffer=[0;1024];
+        while !bytes.windows(4).any(|w|w==b"\r\n\r\n") {let n=stream.read(&mut buffer).unwrap();assert!(n>0);bytes.extend_from_slice(&buffer[..n]);assert!(bytes.len()<8192);}
+        assert!(String::from_utf8(bytes).unwrap().to_ascii_lowercase().contains("authorization: bearer bridge-only"));
+        let body=br#"{"error":{"code":"frame_extractor_digest_mismatch","type":"bridge_error"}}"#;
+        stream.write_all(format!("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).unwrap();stream.write_all(body).unwrap();
+    });
+    let result=BridgeClient::new(base,"bridge-only").last_frame(&step());server.join().unwrap();
+    assert_eq!(result.unwrap_err(),"frame_extractor_digest_mismatch");
+}
 #[test]
 fn last_frame_checks_exact_identity_digest_dimensions_and_size() {
     let client=BridgeClient::from_transport("http://bridge","bridge-only",Arc::new(reply()));let frame=client.last_frame(&step()).unwrap();assert_eq!((frame.width,frame.height,frame.timestamp_ms),(1,1,875));
