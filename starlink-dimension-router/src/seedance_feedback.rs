@@ -75,17 +75,56 @@ pub(crate) fn video_failure(result:&Value)->&'static str {
 pub(crate) struct Failure {
     pub code: &'static str,
     pub upstream: Option<aiwork_core::UpstreamFailure>,
+    pub stage: Option<&'static str>,
 }
 impl From<&str> for Failure {
-    fn from(code:&str)->Self {Self {code:crate::budget_errors::public_code(code).unwrap_or("seedance_budget_execution_failed"),upstream:None}}
+    fn from(code:&str)->Self {Self {code:crate::budget_errors::public_code(code).unwrap_or("seedance_budget_execution_failed"),upstream:None,stage:None}}
 }
 impl From<String> for Failure {fn from(code:String)->Self {Self::from(code.as_str())}}
 impl Failure {
     pub fn video(result:&Value)->Self {
-        Self {code:video_failure(result),upstream:Some(aiwork_core::UpstreamFailure::from_value(result))}
+        Self {code:video_failure(result),upstream:Some(aiwork_core::UpstreamFailure::from_value(result)),stage:Some("video_execution")}
+    }
+    pub fn diagnostic(value:&Value)->Self {
+        let mut failure=Self::from(value["code"].as_str().unwrap_or("assist_result_unconfirmed"));
+        failure.stage=match value["stage"].as_str() {
+            Some("assistant_connection")=>Some("assistant_connection"),
+            Some("assistant_http")=>Some("assistant_http"),
+            Some("assistant_stream")=>Some("assistant_stream"),
+            _=>None,
+        };
+        if value["upstream_error"].is_object() {failure.upstream=Some(aiwork_core::UpstreamFailure::from_value(value));}
+        failure
+    }
+    pub fn assistant(result:&Value)->Self {
+        if result["error"].is_object() {
+            let mut diagnostic=result["error"].clone();
+            if result["upstream_error"].is_object() {diagnostic["upstream_error"]=result["upstream_error"].clone();}
+            Self::diagnostic(&diagnostic)
+        } else {Self::from("assist_execution_failed")}
     }
 }
 pub(crate) fn message(code:&str)->&'static str {match code {
+    "chat_upstream_error"=>"文字模型上游明确返回错误，本轮文字模型执行未完成；不会自动重发付费请求。",
+    "chat_connection_timeout"=>"请求文字模型上游时网络超时（连接、写入或等待响应阶段），未取得有效响应；本轮结果尚未确认。",
+    "chat_dns_failed"=>"文字模型上游域名解析失败，未取得有效响应；本轮结果尚未确认。",
+    "chat_tls_failed"=>"连接文字模型上游时 TLS 校验失败，未取得有效响应；本轮结果尚未确认。",
+    "chat_transport_failed"=>"与文字模型上游通信失败，未取得最终结果。",
+    "chat_stream_read_timeout"=>"文字模型响应流读取超时，未收到完整结束信号；不能据此判定上游未执行或未扣费。",
+    "chat_stream_read_failed"=>"文字模型响应流中断，未收到完整结果；不能据此判定上游未执行或未扣费。",
+    "chat_stream_incomplete"=>"文字模型响应流已结束，但没有完整结束信号；结果尚未确认。",
+    "chat_stream_invalid_event"=>"文字模型上游返回了无法解析的流事件，未取得完整结果。",
+    "chat_stream_too_large"=>"文字模型响应超过安全处理长度，未取得可核验的完整结果。",
+    "chat_stream_progress_timeout"=>"文字模型长时间没有新增有效内容，已停止本轮等待；执行和扣费仍待核对，不会自动重发。",
+    "chat_stream_total_timeout"=>"文字模型响应超过本轮总时限，已停止等待；执行和扣费仍待核对，不会自动重发。",
+    "chat_execution_unknown"=>"文字模型响应流已关闭，但完整执行结果尚未确认；积分保留待核对，不会自动重发。",
+    "chat_stream_unavailable"|"chat_result_unavailable"=>"暂时无法读取文字模型响应或执行结果；这是查询链路异常，不代表上游任务未执行。",
+    "chat_stream_invalid_page"|"chat_stream_cursor_unavailable"=>"文字模型响应流的读取位置或数据未通过校验；本轮已停止输出，执行和扣费仍待核对。",
+    "chat_result_invalid"=>"文字模型返回的执行结果未通过格式校验；不会将不完整结果当成成功。",
+    "chat_invalid_tool_calls"|"chat_invalid_tool_index"|"chat_tool_limit"|"chat_invalid_tool_function"|
+    "chat_invalid_tool_identity"|"chat_tool_identity_conflict"|"chat_invalid_tool_arguments"|"chat_incomplete_tool_identity"=>
+        "文字模型上游返回的工具调用格式、标识或参数未通过校验；未执行这些工具，执行和扣费仍待核对。",
+    "chat_output_after_completion"=>"文字模型上游在结束信号后仍返回输出，响应未通过完整性校验。",
     "assistant_json_invalid"=>"辅助模型返回的 JSON 语法不合法（如台词引号未转义或多余内容）；本次未提交视频，请保留请求编号供排查。",
     "assistant_json_duplicate_key"=>"辅助模型返回了重复的 JSON 字段，无法确定唯一规划；本次未提交视频。",
     "assistant_json_invalid_escape"=>"辅助模型返回的 JSON 含非法转义或损坏的 Unicode 编码；本次未提交视频。",
@@ -147,6 +186,14 @@ pub(crate) fn failure_value(request:&str,failure:&Failure,settled:bool)->Value {
         "request_id":request,"error":{"type":"api_error","code":code,"message":text,"request_id":request,"billing_state":if settled {"settled"} else {"pending"}},
         "choices":[{"index":0,"delta":{"role":"assistant","content":text},"finish_reason":"stop"}]});
     if let Some(detail)=&failure.upstream {value["error"]["upstream"]=json!(detail);}
+    if let Some(stage)=failure.stage {value["error"]["stage"]=json!(stage);}
+    value
+}
+
+/// Once SSE is open, provider failures are application results, not broken
+/// OpenAI protocol frames. Clients often discard content in a top-level error.
+pub(crate) fn readable_failure(mut value:Value)->Value {
+    if let Some(error)=value.as_object_mut().and_then(|v|v.remove("error")) {value["task_error"]=error;}
     value
 }
 

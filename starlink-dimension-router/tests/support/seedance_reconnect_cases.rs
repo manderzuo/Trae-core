@@ -66,7 +66,13 @@ async fn read_stream(response:axum::response::Response)->Value {
     assert_eq!(response.status(),StatusCode::OK,"a retry must attach to the running result, not return budget_observer_busy");
     let bytes=tokio::time::timeout(Duration::from_secs(8),axum::body::to_bytes(response.into_body(),128*1024)).await.expect("result must arrive").unwrap();
     let wire=std::str::from_utf8(&bytes).unwrap();assert!(wire.ends_with("data: [DONE]\n\n"));
-    wire.lines().filter_map(|l|l.strip_prefix("data: ")).filter_map(|s|serde_json::from_str::<Value>(s).ok()).last().unwrap()
+    let mut value=wire.lines().filter_map(|l|l.strip_prefix("data: ")).filter_map(|s|serde_json::from_str::<Value>(s).ok()).last().unwrap();
+    if let Some(error)=value.get("task_error").cloned() {
+        assert!(value.get("error").is_none(),"a top-level error would hide client-visible text");
+        assert_eq!(value["choices"][0]["finish_reason"],"stop");
+        value["error"]=error;
+    }
+    value
 }
 
 #[tokio::test(flavor="multi_thread",worker_threads=4)]

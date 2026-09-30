@@ -98,7 +98,9 @@ pub(crate) async fn completion(state:&Arc<StarlinkRouterState>,p:&Principal,requ
     let usable=state.config.public_base_url.starts_with("https://") || state.config.public_base_url.starts_with("http://");
     if usable {
         let tools=crate::delivery_assist::tools(body);
-        let selected=crate::delivery_assist::select(state,p,request,&tools).await;
+        let (selected,planner_error)=match crate::delivery_assist::select(state,p,request,&tools).await {
+            Ok(selected)=>(selected,None),Err(error)=>(None,Some(error)),
+        };
         if let Some(tool)=selected.as_deref().and_then(|name|tools.iter().find(|t|t.name==name)).or_else(||tools.first()) {
             let mut args=tool.arguments.clone();
             args[tool.command_key]=json!(if tool.bash {bash_command(request,&download_url,None)} else {download_command(request,&download_url,None)});
@@ -109,6 +111,11 @@ pub(crate) async fn completion(state:&Arc<StarlinkRouterState>,p:&Principal,requ
                 "id":format!("{CALL_PREFIX}{request}"),"type":"function","function":{"name":tool.name,"arguments":args.to_string()}}]});
             value["choices"][0]["finish_reason"]=json!("tool_calls");
             value["video_delivery"]=json!({"status":"download_requested","tool":tool.name});
+            if let Some(error)=planner_error {
+                let reason=error["message"].as_str().unwrap_or("下载调度结果尚未确认。");
+                value["choices"][0]["message"]["content"]=json!(format!("视频已生成。下载调度的文字模型出现问题：{reason}\n已改用已验证的本机下载适配器，正在保存到系统 Downloads；不会重新生成视频。"));
+                value["video_delivery"]["planner_error"]=error;
+            }
             value["video_task"]["delivery_model"]=json!(state.config.seedance_assistant_model);
             value["video_task"]["delivery_planner"]=json!(if selected.is_some(){"assistant"}else{"validated_adapter_fallback"});
         } else {

@@ -89,8 +89,8 @@ pub(crate) fn tools(body: &Value) -> Vec<DeliveryTool> {
     }).take(32).collect()
 }
 
-pub(crate) async fn select(state: &Arc<StarlinkRouterState>, p: &Principal, request: &str, tools: &[DeliveryTool]) -> Option<String> {
-    if tools.is_empty() {return None;}
+pub(crate) async fn select(state: &Arc<StarlinkRouterState>, p: &Principal, request: &str, tools: &[DeliveryTool]) -> Result<Option<String>,Value> {
+    if tools.is_empty() {return Ok(None);}
     let body=json!({"model":state.config.seedance_assistant_model,"stream":false,"max_tokens":512,"temperature":0.1,
         "parallel_tool_calls":false,"tool_choice":"required","tools":tools.iter().map(|t|json!({"type":"function","function":t.function})).collect::<Vec<_>>(),
         "messages":[{"role":"system","content":"你负责已完成视频的本地交付。只调用一个已提供的下载工具，参数只能使用 schema 中的枚举值。视频已经生成，不得重新生成，不得安装 MCP/Skill/接收器。默认系统 Downloads。工具命令占位符由 Core 替换成受审核的下载命令。不要宣称文件已经保存。"},
@@ -99,11 +99,26 @@ pub(crate) async fn select(state: &Arc<StarlinkRouterState>, p: &Principal, requ
     // reuses the durable planner output without paying for another helper call.
     let digest=hex::encode(aiwork_core::canonical_json_hash(&body));
     let mut headers=HeaderMap::new();
-    headers.insert("idempotency-key",format!("seedance-delivery:{request}:{digest}").parse().ok()?);
-    let response=tokio::time::timeout(std::time::Duration::from_secs(60),crate::budget_chat::chat(state.clone(),p.clone(),headers,body,state.config.seedance_assistant_model.clone())).await.ok()?;
-    if !response.status().is_success() {return None;}
-    let bytes=axum::body::to_bytes(response.into_body(),64*1024).await.ok()?;
-    let output:Value=serde_json::from_slice(&bytes).ok()?;
+    headers.insert("idempotency-key",format!("seedance-delivery:{request}:{digest}").parse().map_err(|_|planner_error("delivery_planner_invalid","下载调度请求未通过校验。"))?);
+    let response=tokio::time::timeout(std::time::Duration::from_secs(60),crate::budget_chat::chat(state.clone(),p.clone(),headers,body,state.config.seedance_assistant_model.clone())).await
+        .map_err(|_|planner_error("delivery_planner_wait_timeout","下载调度的文字模型等待超时，执行及扣费仍待核对；视频已经完成。"))?;
+    let successful=response.status().is_success();
+    let bytes=axum::body::to_bytes(response.into_body(),64*1024).await.map_err(|_|planner_error("delivery_planner_result_unavailable","无法读取下载调度的文字模型结果。"))?;
+    let output:Value=serde_json::from_slice(&bytes).map_err(|_|planner_error("delivery_planner_result_invalid","下载调度的文字模型结果无法解析。"))?;
+    if !successful {
+        let error=&output["error"];
+        let code=error["code"].as_str().and_then(crate::budget_errors::public_code).unwrap_or("delivery_planner_failed");
+        let detail=aiwork_core::UpstreamFailure::from_value(&json!({"upstream_error":error["upstream"]}));
+        let reason=if error["upstream"].is_object() {format!("{} 上游说明：{}。",crate::seedance_feedback::message(code),detail.description())}
+            else {crate::seedance_feedback::message(code).into()};
+        let mut value=planner_error(code,&reason);
+        if error["upstream"].is_object() {value["upstream"]=json!(detail);}
+        return Err(value);
+    }
+    Ok(selected_tool(&output,tools))
+}
+fn planner_error(code:&str,message:&str)->Value {json!({"code":code,"message":message,"stage":"delivery_planner","billing_state":"pending"})}
+fn selected_tool(output:&Value,tools:&[DeliveryTool])->Option<String> {
     let calls=output.pointer("/choices/0/message/tool_calls")?.as_array()?;
     if calls.len()!=1 || calls[0]["type"]!="function" {return None;}
     let name=calls[0].pointer("/function/name")?.as_str()?;

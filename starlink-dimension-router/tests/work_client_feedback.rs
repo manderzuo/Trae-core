@@ -3,6 +3,92 @@ mod fixture;
 use fixture::*;
 
 #[tokio::test]
+async fn failed_stream_is_readable_completion_not_top_level_protocol_error() {
+    let f=Fixture::new();
+    *f.bridge.helper_raw.lock().unwrap()=Some("malformed".into());
+    let mut body=create();body["stream"]=json!(true);
+    let response=f.response(&f.key,"readable-failure-stream",&body).await;
+    assert_eq!(response.status(),StatusCode::OK);
+    let raw=to_bytes(response.into_body(),65536).await.unwrap();
+    let text=std::str::from_utf8(&raw).unwrap();
+    let events:Vec<Value>=text.lines().filter_map(|l|l.strip_prefix("data: ")).filter_map(|l|serde_json::from_str(l).ok()).collect();
+    assert!(events.iter().all(|v|v.get("error").is_none()),"client error branch hides explanation: {text}");
+    let last=events.last().unwrap();
+    assert_eq!(last["task_error"]["code"],"assistant_json_invalid");
+    assert!(last["choices"][0]["delta"]["content"].as_str().unwrap().contains("未提交视频"));
+    assert_eq!(last["choices"][0]["finish_reason"],"stop");
+    assert!(text.ends_with("data: [DONE]\n\n"));
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+}
+
+fn last_event(raw:&[u8])->Value {
+    std::str::from_utf8(raw).unwrap().lines().filter_map(|l|l.strip_prefix("data: ")).filter_map(|l|serde_json::from_str(l).ok()).last().unwrap()
+}
+#[tokio::test]
+async fn download_adapter_fallback_discloses_planner_error_without_failing_completed_video() {
+    let f=Fixture::new();
+    *f.bridge.delivery_failure.lock().unwrap()=Some(json!({"error":{"code":"chat_upstream_error","stage":"assistant_http","outcome_known":true},"upstream_error":{"code":"MODEL_BUSY","http_status":429,"message":"Model overloaded"}}));
+    let mut body=create();body["stream"]=json!(true);
+    body["tools"]=json!([{"type":"function","function":{"name":"RunCommand","description":"Execute PowerShell commands","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]);
+    let response=f.response(&f.key,"delivery-provider-rejection",&body).await;
+    let value=last_event(&to_bytes(response.into_body(),65536).await.unwrap());
+    assert_eq!(value["video_task"]["status"],"completed");
+    assert_eq!(value["choices"][0]["finish_reason"],"tool_calls");
+    assert_eq!(value["video_delivery"]["planner_error"]["upstream"]["code"],"MODEL_BUSY");
+    assert!(value["choices"][0]["delta"]["content"].as_str().unwrap().contains("Model overloaded"));
+    assert!(value.get("error").is_none());
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),1);
+}
+#[tokio::test]
+async fn upstream_helper_rejection_survives_stream_replay_and_status_without_refund() {
+    let f=Fixture::new();
+    *f.bridge.helper_failure.lock().unwrap()=Some(json!({"error":{"code":"chat_upstream_error","stage":"assistant_http","outcome_known":true},"upstream_error":{"code":"MODEL_BUSY","http_status":429,"message":"Model overloaded; token=private-token"}}));
+    let mut body=create();body["stream"]=json!(true);
+    let mut rid=String::new();
+    for _ in 0..2 {
+        let reply=f.response(&f.key,"provider-rejection",&body).await;
+        let last=last_event(&to_bytes(reply.into_body(),65536).await.unwrap());
+        rid=last["request_id"].as_str().unwrap().into();
+        assert!(last.get("error").is_none());
+        assert_eq!(last["task_error"]["upstream"]["code"],"MODEL_BUSY");
+        assert_eq!(last["task_error"]["upstream"]["http_status"],429);
+        assert!(!last.to_string().contains("private-token"));
+        assert!(last["choices"][0]["delta"]["content"].as_str().unwrap().contains("Model overloaded"));
+        let op=f.state.store.budget_operation(&rid).unwrap().unwrap();
+        assert_eq!(op.steps[0].financial_state,aiwork_core::BudgetFinancialState::Held);
+        assert_eq!(op.steps[0].actual_credits,None);
+    }
+    let response=f.app.clone().oneshot(Request::get(format!("/v1/videos/{rid}")).header("authorization",format!("Bearer {}",f.key)).body(Body::empty()).unwrap()).await.unwrap();
+    let value:Value=serde_json::from_slice(&to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+    assert_eq!(value["task"]["error"]["upstream"]["code"],"MODEL_BUSY");
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+}
+#[tokio::test]
+async fn helper_stream_timeout_reports_uncertainty_and_retains_hold_and_dispatch_identity() {
+    let f=Fixture::new();
+    *f.bridge.helper_diagnostic.lock().unwrap()=Some(json!({"code":"chat_stream_read_timeout","stage":"assistant_stream","outcome_known":false}));
+    let mut body=create();body["stream"]=json!(true);
+    let response=f.response(&f.key,"helper-timeout",&body).await;
+    let last=last_event(&to_bytes(response.into_body(),65536).await.unwrap());
+    assert_eq!(last["task_error"]["code"],"chat_stream_read_timeout");
+    assert_eq!(last["task_error"]["stage"],"assistant_stream");
+    assert_eq!(last["task_error"]["billing_state"],"pending");
+    let rid=last["request_id"].as_str().unwrap();
+    let op=f.state.store.budget_operation(rid).unwrap().unwrap();
+    assert_eq!(op.execution_state,aiwork_core::BudgetExecutionState::Unknown);
+    assert_eq!(op.steps[0].execution_state,aiwork_core::BudgetExecutionState::Unknown);
+    assert_eq!(op.steps[0].financial_state,aiwork_core::BudgetFinancialState::Held);
+    assert_eq!(op.steps[0].actual_credits,None);
+    let response=f.app.clone().oneshot(Request::get(format!("/v1/videos/{rid}")).header("authorization",format!("Bearer {}",f.key)).body(Body::empty()).unwrap()).await.unwrap();
+    let value:Value=serde_json::from_slice(&to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+    assert_eq!(value["task"]["status"],"processing");
+    assert_eq!(value["task"]["notice"]["code"],"chat_stream_read_timeout");
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+}
+
+#[tokio::test]
 async fn malformed_helper_stream_finishes_with_specific_reason_and_replays_without_paying_again() {
     let f=Fixture::new();
     *f.bridge.helper_raw.lock().unwrap()=Some(r#"{"action":"create","effective_prompt":"猫说:"你好。"","spec_patch":{},"reference_policy":"inherit","clarification":null}"#.into());
@@ -13,7 +99,7 @@ async fn malformed_helper_stream_finishes_with_specific_reason_and_replays_witho
         let raw=to_bytes(response.into_body(),65536).await.unwrap();
         let events:Vec<Value>=std::str::from_utf8(&raw).unwrap().lines().filter_map(|l|l.strip_prefix("data: ")).filter_map(|l|serde_json::from_str(l).ok()).collect();
         let last=events.last().unwrap();
-        assert_eq!(last["error"]["code"],"assistant_json_invalid");
+        assert_eq!(last["task_error"]["code"],"assistant_json_invalid");
         assert_eq!(last["choices"][0]["finish_reason"],"stop");
         let text=last["choices"][0]["delta"]["content"].as_str().unwrap();
         assert!(text.contains("JSON 语法不合法") && text.contains("未提交视频"),"{text}");
@@ -33,9 +119,10 @@ async fn failed_reply(f: &Fixture, id: &str, body: &Value) -> Value {
     let raw = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
     assert_eq!(status, if stream { StatusCode::OK } else { StatusCode::BAD_REQUEST }, "{}", String::from_utf8_lossy(&raw));
     if stream {
-        std::str::from_utf8(&raw).unwrap().lines()
+        let mut value:Value=std::str::from_utf8(&raw).unwrap().lines()
             .filter_map(|line| line.strip_prefix("data: "))
-            .filter_map(|line| serde_json::from_str(line).ok()).last().unwrap()
+            .filter_map(|line| serde_json::from_str(line).ok()).last().unwrap();
+        value["error"]=value["task_error"].clone();value
     } else { serde_json::from_slice(&raw).unwrap() }
 }
 
@@ -98,7 +185,7 @@ async fn reference_prepare_rejection_releases_slot_without_refunding_paid_helper
                     .filter_map(|l| serde_json::from_str(l).ok()).last().unwrap()
             } else { serde_json::from_slice(&replay_raw).unwrap() };
             assert_eq!(replay["request_id"], rid);
-            assert_eq!(replay["error"]["code"], code);
+            assert_eq!(replay[if stream{"task_error"}else{"error"}]["code"], code);
             let query=f.app.clone().oneshot(Request::get(format!("/v1/videos/{rid}")).header("authorization",format!("Bearer {}",f.key)).body(Body::empty()).unwrap()).await.unwrap();
             let query:Value=serde_json::from_slice(&to_bytes(query.into_body(),65536).await.unwrap()).unwrap();
             assert_eq!(query["task"]["error"]["code"],code);
@@ -197,8 +284,9 @@ async fn invalid_fenced_helper_reports_format_error_without_video_or_running_par
         let r:Value=if stream {
             std::str::from_utf8(&raw).unwrap().lines().filter_map(|l|l.strip_prefix("data: ")).filter_map(|l|serde_json::from_str(l).ok()).last().unwrap()
         } else {serde_json::from_slice(&raw).unwrap()};
-        assert_eq!(r["error"]["code"],"assistant_schema_invalid");
-        let message=r["error"]["message"].as_str().unwrap();
+        let error=&r[if stream{"task_error"}else{"error"}];
+        assert_eq!(error["code"],"assistant_schema_invalid");
+        let message=error["message"].as_str().unwrap();
         assert!(message.contains("格式或字段") && message.contains("未提交视频"));
         let op=f.state.store.budget_operation(r["request_id"].as_str().unwrap()).unwrap().unwrap();
         assert_eq!(op.execution_state,aiwork_core::BudgetExecutionState::Failed);

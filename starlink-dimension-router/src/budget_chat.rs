@@ -56,14 +56,16 @@ pub(crate) async fn chat(state:Arc<StarlinkRouterState>,principal:Principal,head
     };
     if !original["stream"].as_bool().unwrap_or(false) {
         let _observer=observer;
-        return match wait_result(state,step).await {Ok(mut v)=>{v["request_id"]=json!(request);Json(v).into_response()},Err(_)=>fail("chat_budget_result_unavailable")};
+        return match wait_result(state.clone(),step).await {Ok(mut v)=>{v["request_id"]=json!(request);Json(v).into_response()},Err(failure)=>crate::budget_flow::request_failure(&state,&failure,&request)};
     }
     let (send,recv)=tokio::sync::mpsc::channel::<Result<Bytes,std::io::Error>>(8);
     tokio::spawn(async move {
         let _observer=observer;
         let result=deliver(&state,&step,&request,&model,&send).await;
-        if let Err(code)=result {
-            let _=send_frame(&send,format!("data: {}\n\ndata: [DONE]\n\n",json!({"error":{"code":code,"message":code,"type":"api_error"},"request_id":request}))).await;
+        if let Err(failure)=result {
+            let mut value=crate::seedance_feedback::readable_failure(crate::budget_flow::failure_feedback(&state,&failure,&request));
+            value["model"]=json!(model);
+            let _=send_frame(&send,format!("data: {value}\n\ndata: [DONE]\n\n")).await;
         }
     });
     Response::builder().header("content-type","text/event-stream").header("cache-control","no-cache").header("x-accel-buffering","no")
@@ -95,12 +97,12 @@ mod tests {
         assert_eq!(delta["tool_calls"][1]["function"]["name"],"check");assert!(original["tool_calls"][0].get("index").is_none());
     }
 }
-async fn deliver(state:&Arc<StarlinkRouterState>,step:&BudgetStepView,request:&str,model:&str,send:&tokio::sync::mpsc::Sender<Result<Bytes,std::io::Error>>)->Result<(),&'static str> {
+async fn deliver(state:&Arc<StarlinkRouterState>,step:&BudgetStepView,request:&str,model:&str,send:&tokio::sync::mpsc::Sender<Result<Bytes,std::io::Error>>)->Result<(),crate::seedance_feedback::Failure> {
     send_frame(send,frame(request,model,json!({"role":"assistant"}),Value::Null,None)).await?;
     let mut after=0u64;let start=Instant::now();let mut heartbeat=Instant::now();
     loop {
-        if start.elapsed()>Duration::from_secs(14*60) {return Err("chat_execution_wait_timeout");}
-        if send.is_closed() {return Err("chat_observer_disconnected");}
+        if start.elapsed()>Duration::from_secs(14*60) {return Err("budget_execution_wait_timeout".into());}
+        if send.is_closed() {return Err("chat_observer_disconnected".into());}
         let s=state.clone();let b=step.clone();
         let page=tokio::task::spawn_blocking(move || {
             let client=s.bridge_client();let path=format!("{}&after={after}",crate::budget_reconciler::request_path(&b,"chunks"));
@@ -111,21 +113,23 @@ async fn deliver(state:&Arc<StarlinkRouterState>,step:&BudgetStepView,request:&s
         let ready_to_read=if page["status"]=="available" {
             let deltas=page["chunks"].as_array().filter(|a|a.len()<=32).ok_or("chat_stream_invalid_page")?;
             let next=page["next"].as_u64().ok_or("chat_stream_invalid_page")?;
-            if next!=after.checked_add(deltas.len() as u64).ok_or("chat_stream_invalid_page")? {return Err("chat_stream_invalid_page");}
-            for delta in deltas {if !delta.is_object() {return Err("chat_stream_invalid_page");}send_frame(send,frame(request,model,delta.clone(),Value::Null,None)).await?;}
+            if next!=after.checked_add(deltas.len() as u64).ok_or("chat_stream_invalid_page")? {return Err("chat_stream_invalid_page".into());}
+            for delta in deltas {if !delta.is_object() {return Err("chat_stream_invalid_page".into());}send_frame(send,frame(request,model,delta.clone(),Value::Null,None)).await?;}
             after=next;
             if deltas.len()==32 {continue;}
             page["finished"].as_bool().ok_or("chat_stream_invalid_page")?
         } else if page["status"]=="unavailable" {
-            if after!=0 {return Err("chat_stream_cursor_unavailable");}true
-        } else {return Err("chat_stream_invalid_page");};
+            if after!=0 {return Err("chat_stream_cursor_unavailable".into());}true
+        } else {return Err("chat_stream_invalid_page".into());};
         if ready_to_read {
             let s=state.clone();let b=step.clone();
             let result=tokio::task::spawn_blocking(move ||read_result(&s,&b)).await.map_err(|_|"chat_result_unavailable")?.map_err(|_|"chat_result_unavailable")?;
-            if result["status"]=="failed_no_charge" {return Err("budget_not_sent");}
+            if result["status"]=="failed_no_charge" {return Err("budget_not_sent".into());}
+            if result["diagnostic"].is_object() {return Err(crate::seedance_feedback::Failure::diagnostic(&result["diagnostic"]));}
             if result["status"]=="ready" {
+                if result["result"]["error"].is_object() {return Err(crate::seedance_feedback::Failure::assistant(&result["result"]));}
                 let choice=&result["result"]["choices"][0];
-                if !choice["message"].is_object() || !choice["finish_reason"].is_string() {return Err("chat_result_invalid");}
+                if !choice["message"].is_object() || !choice["finish_reason"].is_string() {return Err("chat_result_invalid".into());}
                 if after==0 {send_frame(send,frame(request,model,replay_delta(&choice["message"])?,Value::Null,None)).await?;}
                 send_frame(send,frame(request,model,json!({}),choice["finish_reason"].clone(),result["result"].get("usage").cloned())).await?;
                 send_frame(send,"data: [DONE]\n\n".into()).await?;return Ok(());
@@ -133,7 +137,7 @@ async fn deliver(state:&Arc<StarlinkRouterState>,step:&BudgetStepView,request:&s
             // The writer closes only after outcome persistence (or unwinding).
             // A closed writer without a durable result cannot produce more
             // chunks. Report uncertainty now; do not free its financial hold.
-            if page["status"]=="available" && page["finished"]==true {return Err("chat_execution_unknown");}
+            if page["status"]=="available" && page["finished"]==true {return Err("chat_execution_unknown".into());}
         }
         if heartbeat.elapsed()>=Duration::from_secs(10) {send_frame(send,": keep-alive\n\n".into()).await?;heartbeat=Instant::now();}
         tokio::time::sleep(Duration::from_millis(250)).await;

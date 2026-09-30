@@ -21,7 +21,9 @@ pub(crate) fn fail(code:&str)->Response {
         "reference_asset_unavailable"|"reference_video_budget_metadata_required"|
         "video_safety_check_failed"|"reference_safety_check_failed"|"prompt_safety_check_failed"=>StatusCode::BAD_REQUEST,
         "video_execution_failed"=>StatusCode::UNPROCESSABLE_ENTITY,
-        "assist_execution_failed"=>StatusCode::BAD_GATEWAY,
+        "assist_execution_failed"|"chat_upstream_error"|"chat_stream_read_failed"|"chat_stream_incomplete"|
+        "chat_stream_invalid_event"|"chat_transport_failed"|"chat_dns_failed"|"chat_tls_failed"=>StatusCode::BAD_GATEWAY,
+        "chat_stream_read_timeout"|"chat_connection_timeout"|"chat_stream_progress_timeout"|"chat_stream_total_timeout"=>StatusCode::GATEWAY_TIMEOUT,
         "budget_chat_input_too_large"=>StatusCode::PAYLOAD_TOO_LARGE,
         "work_context_input_too_large"=>StatusCode::PAYLOAD_TOO_LARGE,
         "work_context_unavailable"|"work_decision_invalid"|"work_spec_unsupported"|"work_parent_required"|"reference_image_missing"|"invalid_reference_context"|"reference_image_limit"|"invalid_reference_image"|"reference_requires_inline_image_or_owned_asset"|"continuation_mode_unsupported"=>StatusCode::BAD_REQUEST,
@@ -153,18 +155,19 @@ pub(crate) async fn video_status(state:Arc<StarlinkRouterState>,principal:Princi
     let result=tokio::task::spawn_blocking(move ||->Result<Option<Value>,String> {
         let Some(step)=owned_video_step(&state,&principal,&request)? else {
             if state.config.work_context_for_key(&principal.key_id) && state.store.active_principal_for_request(&request).map_err(|_|"work_context_unavailable")?.is_some_and(|p|p.key_id==principal.key_id&&p.user_id==principal.user_id) {
+                let diagnostic=helper_failure(&state,&request);
                 let operation=state.store.budget_operation(&request).map_err(|_|"work_context_unavailable")?;
                 let failed=operation.as_ref().is_some_and(|op|matches!(op.execution_state,aiwork_core::BudgetExecutionState::Failed|aiwork_core::BudgetExecutionState::Canceled)) || state.store.request_state(&request).map_err(|_|"work_context_unavailable")?==aiwork_core::RequestState::Failed;
                 let unconfirmed_assist=operation.as_ref().is_some_and(|op|op.steps.iter().any(|s|s.kind==BudgetStepKind::Assist && s.execution_state==aiwork_core::BudgetExecutionState::Unknown));
                 let mut reply=json!({"task":{"id":request,"status":if failed {"failed"}else if unconfirmed_assist {"processing"}else{"queued"}},"request_id":request});
                 if !failed && unconfirmed_assist {
                     reply["task"]["stage"]=json!("assistant_reconciliation");
-                    reply["task"]["notice"]=json!({"code":"assist_result_unconfirmed","message":crate::seedance_feedback::message("assist_result_unconfirmed"),"billing_state":"pending"});
+                    reply["task"]["notice"]=failure_feedback(&state,&diagnostic.clone().unwrap_or_else(||Failure::from("assist_result_unconfirmed")),&request)["error"].clone();
                 }
                 if failed {
                     let result=state.store.request_result(&request).map_err(|_|"work_context_unavailable")?;
                     let code=result.as_ref().and_then(|r|r.error_code.as_deref()).and_then(crate::budget_errors::public_code).unwrap_or("budget_failure_reason_unavailable");
-                    reply["task"]["error"]=failure_feedback(&state,&Failure::from(code),&request)["error"].clone();
+                    reply["task"]["error"]=failure_feedback(&state,&diagnostic.unwrap_or_else(||Failure::from(code)),&request)["error"].clone();
                     reply["task"]["error"]["http_status"]=json!(result.and_then(|r|r.status));
                 }
                 return Ok(Some(reply));
@@ -192,7 +195,7 @@ pub(crate) async fn video_status(state:Arc<StarlinkRouterState>,principal:Princi
     match result {Ok(Ok(Some(value)))=>Json(value).into_response(),Ok(Ok(None))=>StatusCode::NOT_FOUND.into_response(),_=>fail("budget_result_unavailable")}
 }
 
-pub(crate) async fn wait_result(state:Arc<StarlinkRouterState>,step:BudgetStepView)->Result<Value,String> {
+pub(crate) async fn wait_result(state:Arc<StarlinkRouterState>,step:BudgetStepView)->Result<Value,Failure> {
     use crate::seedance_feedback::Stage;
     let started=std::time::Instant::now();
     loop {
@@ -206,10 +209,14 @@ pub(crate) async fn wait_result(state:Arc<StarlinkRouterState>,step:BudgetStepVi
                 state.seedance_results.progress(&step.parent_request_id,Stage::QueryDelayed);
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;continue;
             },
-            Err(code)=>return Err(code),
+            Err(code)=>return Err(code.into()),
         };
-        if reply["status"]=="ready" {return Ok(reply["result"].clone());}
+        if reply["status"]=="ready" {
+            if step.kind!=BudgetStepKind::Video && reply["result"]["error"].is_object() {return Err(Failure::assistant(&reply["result"]));}
+            return Ok(reply["result"].clone());
+        }
         if reply["status"]=="failed_no_charge" {return Err("budget_not_sent".into());}
+        if reply["diagnostic"].is_object() && result_state_unknown(&reply) {return Err(Failure::diagnostic(&reply["diagnostic"]));}
         let stage=if result_state_unknown(&reply) {Stage::QueryDelayed}
             else if step.kind==BudgetStepKind::Video {
                 if reply["task_ref"].as_str().is_some() {Stage::Processing} else {Stage::Submitting}
@@ -258,7 +265,11 @@ pub(crate) async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Princ
     }
     // Durable pre-video failures remain final across process restarts and tool
     // repairs. Do not re-extract assets or buy another helper on their replay.
-    if let Some(code)=stored_failure_code(&state,&request) {return Err(code.into());}
+    if let Some(code)=stored_failure_code(&state,&request) {
+        let s=state.clone();let rid=request.clone();
+        let failure=tokio::task::spawn_blocking(move ||helper_failure(&s,&rid)).await.ok().flatten();
+        return Err(failure.unwrap_or_else(||Failure::from(code)));
+    }
     if state.config.work_context_for_key(&principal.key_id) {return crate::work_execution::execute(state,principal,request,original,fresh,dispatch_only).await;}
     state.seedance_results.progress(&request,Stage::Assistant);
     let assist=if let Some(step)=operation.and_then(|op|op.steps.into_iter().find(|s|s.kind==BudgetStepKind::Assist)) {step} else {
@@ -462,7 +473,7 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
                 let bytes=match result {
                     Ok(value)=>crate::video_delivery::sse_completion(&value),
                     Err(failure)=>{
-                        let value=failure_feedback(&state,&failure,&request);
+                        let value=crate::seedance_feedback::readable_failure(failure_feedback(&state,&failure,&request));
                         format!("data: {value}\n\ndata: [DONE]\n\n").into_bytes()
                     },
                 };
@@ -495,17 +506,36 @@ fn stored_failure_code(state:&StarlinkRouterState,request:&str)->Option<&'static
     if state.store.request_state(request).ok()!=Some(aiwork_core::RequestState::Failed) {return None;}
     state.store.request_result(request).ok().flatten().and_then(|r|r.error_code.and_then(|c|crate::budget_errors::public_code(&c)))
 }
-fn failure_feedback(state:&StarlinkRouterState,failure:&Failure,request:&str)->Value {
+// Replays and status queries read the original, identity-checked Bridge fact;
+// no new helper request and no invented provider error are created.
+fn helper_failure(state:&StarlinkRouterState,request:&str)->Option<Failure> {
+    let operation=state.store.budget_operation(request).ok().flatten()?;
+    if operation.steps.iter().any(|s|s.kind==BudgetStepKind::Video) {return None;}
+    let step=operation.steps.into_iter().find(|s|s.kind==BudgetStepKind::Assist)?;
+    let reply=read_result(state,&step).ok()?;
+    if reply["status"]=="ready" && reply["result"]["error"].is_object() {Some(Failure::assistant(&reply["result"]))}
+    else if result_state_unknown(&reply) && reply["diagnostic"].is_object() {Some(Failure::diagnostic(&reply["diagnostic"]))}
+    else {None}
+}
+pub(crate) fn failure_feedback(state:&StarlinkRouterState,failure:&Failure,request:&str)->Value {
     let mut failure=failure.clone();
     // An already verified upstream failure must not be replaced by a generic
     // disposition saved by the independent execution reconciler.
-    if failure.upstream.is_none() {failure.code=stored_failure_code(state,request).unwrap_or(failure.code);}
+    if failure.upstream.is_none() && failure.stage.is_none() {failure.code=stored_failure_code(state,request).unwrap_or(failure.code);}
     let settled=state.store.budget_operation(request).ok().flatten().is_some_and(|op|!op.steps.is_empty() && op.steps.iter().all(|s|
         matches!(s.financial_state,aiwork_core::BudgetFinancialState::Settled|aiwork_core::BudgetFinancialState::Released)));
-    crate::seedance_feedback::failure_value(request,&failure,settled)
+    let mut value=crate::seedance_feedback::failure_value(request,&failure,settled);
+    let before_video=state.store.budget_operation(request).ok().flatten().is_some_and(|op|
+        op.steps.iter().any(|s|s.kind==BudgetStepKind::Assist) && !op.steps.iter().any(|s|s.kind==BudgetStepKind::Video));
+    if failure.stage.is_some_and(|s|s.starts_with("assistant_")) && before_video {
+        value["error"]["video_submitted"]=json!(false);
+        let text=format!("{} 本次尚未提交视频。请求编号：{request}。",value["error"]["message"].as_str().unwrap_or(""));
+        value["error"]["message"]=json!(text);value["choices"][0]["delta"]["content"]=json!(text);
+    }
+    value
 }
-fn request_failure(state:&StarlinkRouterState,failure:&Failure,request:&str)->Response {
-    let code=if failure.upstream.is_some() {failure.code} else {stored_failure_code(state,request).unwrap_or(failure.code)};
+pub(crate) fn request_failure(state:&StarlinkRouterState,failure:&Failure,request:&str)->Response {
+    let code=if failure.upstream.is_some() || failure.stage.is_some() {failure.code} else {stored_failure_code(state,request).unwrap_or(failure.code)};
     let mut response=fail(code);
     let value=failure_feedback(state,failure,request);
     *response.body_mut()=axum::body::Body::from(json!({"error":value["error"],"request_id":request}).to_string());
