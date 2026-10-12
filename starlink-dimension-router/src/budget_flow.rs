@@ -192,8 +192,14 @@ pub(crate) async fn video_status(state:Arc<StarlinkRouterState>,principal:Princi
             if result["result"]["id"].as_str()!=state.store.budget_operation(&request).map_err(|e|e.to_string())?.and_then(|op|op.steps.into_iter().find(|s|s.request_id==request)).and_then(|s|s.task_ref).as_deref() {return Err("video result task mismatch".into());}
             (status,Some(format!("{}/v1/videos/{request}/content",state.config.public_base_url.trim_end_matches('/'))))
         } else if result["status"]=="failed_no_charge" {("failed",None)}
+        else if result["status"]=="not_ready" && result_state_unknown(&result) {("unknown",None)}
         else if result["status"]=="not_ready" {("processing",None)} else {return Err("invalid result status".into())};
         let mut value=json!({"task":{"id":request,"status":status,"content_url":if status=="completed" {content} else {None}},"request_id":request});
+        if status=="unknown" {
+            let failure=if result["diagnostic"].is_object() {Failure::diagnostic(&result["diagnostic"])}
+                else {Failure::from("video_execution_unconfirmed")};
+            value["task"]["error"]=failure_feedback(&state,&failure,&request)["error"].clone();
+        }
         if status=="failed" {
             let failure=if result["status"]=="failed_no_charge" {Failure::from("budget_not_sent")} else {Failure::video(&result["result"])};
             value["task"]["error"]=failure_feedback(&state,&failure,&request)["error"].clone();

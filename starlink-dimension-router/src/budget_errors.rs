@@ -2,6 +2,14 @@
 pub(crate) fn public_code(code:&str)->Option<&'static str> {
     if let Some(code)=crate::assistant_json::public_code(code) {return Some(code);}
     Some(match code {
+        "video_stream_read_failed"=>"video_stream_read_failed",
+        "video_stream_timeout"=>"video_stream_timeout",
+        "video_stream_incomplete"=>"video_stream_incomplete",
+        "video_stream_invalid_event"=>"video_stream_invalid_event",
+        "video_stream_too_large"=>"video_stream_too_large",
+        "video_execution_interrupted"=>"video_execution_interrupted",
+        "video_execution_unconfirmed"=>"video_execution_unconfirmed",
+
         "chat_upstream_error"=>"chat_upstream_error",
         "chat_connection_timeout"=>"chat_connection_timeout",
         "chat_dns_failed"=>"chat_dns_failed",

@@ -42,6 +42,7 @@ pub(crate) struct Bridge {
     pub(crate) helper_finish_reason: Mutex<Option<String>>,
     pub(crate) helper_failure: Mutex<Option<Value>>,
     pub(crate) helper_diagnostic: Mutex<Option<Value>>,
+    pub(crate) video_diagnostic: Mutex<Option<Value>>,
     pub(crate) delivery_failure: Mutex<Option<Value>>,
     pub(crate) video_prepare_error: Mutex<Option<(u16, String)>>,
 }
@@ -161,7 +162,7 @@ impl BridgeTransport for Bridge {
             let mut v = json!({"wire_version":2,"budget_id":format!("b-{id}"),"request_id":id,"core_key_id":c["core_key_id"],"account_ref":"exclusive-account","bridge_instance_id":"fixture"});
             let helper_failure=if c["step_kind"]=="assist" {self.helper_failure.lock().unwrap().clone()}
                 else if c["step_kind"]=="chat" {self.delivery_failure.lock().unwrap().clone()}else{None};
-            let diagnostic=if c["step_kind"]=="assist" {self.helper_diagnostic.lock().unwrap().clone()}else{None};
+            let diagnostic=if c["step_kind"]=="assist" {self.helper_diagnostic.lock().unwrap().clone()}else{self.video_diagnostic.lock().unwrap().clone()};
             let unknown = (c["step_kind"] == "video" && self.unknown.load(Ordering::SeqCst)) || diagnostic.is_some();
             if url.contains("/execution?") {
                 v["status"] = json!(if unknown { "unknown" } else { "succeeded" });
@@ -320,6 +321,7 @@ impl Fixture {
             helper_finish_reason: Mutex::new(None),
             helper_failure: Mutex::new(None),
             helper_diagnostic: Mutex::new(None),
+            video_diagnostic: Mutex::new(None),
             delivery_failure: Mutex::new(None),
             video_prepare_error: Mutex::new(None),
         });

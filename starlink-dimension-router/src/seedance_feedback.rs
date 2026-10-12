@@ -91,6 +91,7 @@ impl Failure {
             Some("assistant_connection")=>Some("assistant_connection"),
             Some("assistant_http")=>Some("assistant_http"),
             Some("assistant_stream")=>Some("assistant_stream"),
+            Some("video_stream")=>Some("video_stream"),
             _=>None,
         };
         if value["upstream_error"].is_object() {failure.upstream=Some(aiwork_core::UpstreamFailure::from_value(value));}
@@ -105,6 +106,14 @@ impl Failure {
     }
 }
 pub(crate) fn message(code:&str)->&'static str {match code {
+    "video_stream_read_failed"=>"视频响应流读取中断，已停止本地等待；上游生成结果与费用仍待核对，不会自动重发。",
+    "video_stream_timeout"=>"视频响应超过本轮总等待时限，已停止本地等待；上游生成结果与费用仍待核对，不会自动重发。",
+    "video_stream_incomplete"=>"视频响应流已结束，但没有最终完成信号；生成结果与费用仍待核对，不会自动重发。",
+    "video_stream_invalid_event"=>"视频响应流未通过格式校验，已停止本地等待；生成结果与费用仍待核对。",
+    "video_stream_too_large"=>"视频响应事件超过处理长度，已停止本地等待；生成结果与费用仍待核对。",
+    "video_execution_interrupted"=>"原视频请求的本地读取进程已中断，尚未取得最终视频；保留原任务与费用核对，不会自动重新生成。",
+    "video_execution_unconfirmed"=>"视频请求的最终结果尚未确认，已停止显示生成中；保留原任务与费用核对，不会自动重新生成。",
+
     "chat_upstream_error"=>"文字模型上游明确返回错误，本轮文字模型执行未完成；不会自动重发付费请求。",
     "chat_connection_timeout"=>"请求文字模型上游时网络超时（连接、写入或等待响应阶段），未取得有效响应；本轮结果尚未确认。",
     "chat_dns_failed"=>"文字模型上游域名解析失败，未取得有效响应；本轮结果尚未确认。",
@@ -207,5 +216,17 @@ mod work_feedback_tests {
         assert!(super::Stage::Restoring.message().contains("指定版本"));
         assert!(super::Stage::SubmittingSegment.message().contains("新片段"));
         assert!(super::message("frame_extraction_unavailable").contains("原任务结算不受影响"));
+    }
+}
+
+#[cfg(test)]
+mod video_stream_diagnostic_tests {
+    #[test]
+    fn every_closed_video_diagnostic_preserves_video_stage_and_uncertainty() {
+        for code in ["video_stream_read_failed","video_stream_timeout","video_stream_incomplete","video_stream_invalid_event","video_stream_too_large","video_execution_interrupted","video_execution_unconfirmed"] {
+            let failure=super::Failure::diagnostic(&serde_json::json!({"code":code,"stage":"video_stream","outcome_known":false}));
+            assert_eq!(failure.code,code);assert_eq!(failure.stage,Some("video_stream"));assert!(failure.upstream.is_none());
+            assert!(super::message(code).contains("核对"));assert_eq!(crate::budget_errors::public_code(code),Some(code));
+        }
     }
 }
