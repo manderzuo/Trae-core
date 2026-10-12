@@ -1,5 +1,7 @@
 # TRAE CN 视频迁移与 Core 状态交接
 
+> 晚间追加：Core 视频响应读取未知状态补丁已部署，23项回归通过；当前运行和账务边界见 [最新记录](video-stream-recovery-20261012.md)。以下保留迁移阶段的历史交接。
+
 2026-10-12。用户授权将已完成修复推送仓库并更新相关记录。统一客户端登录、文字/视频协议身份和新积分包准入修复位于 [AI Work / trae-maker](https://github.com/manderzuo/trae-maker)；不把桥接实现复制到 Core。
 
 ## Core 已部署状态修复的源码补齐
