@@ -159,6 +159,7 @@ pub(crate) fn message(code:&str)->&'static str {match code {
     "reference_safety_check_failed"=>"上游返回：参考图片安全检查未通过，本次生成失败。",
     "prompt_safety_check_failed"=>"上游返回：提示词安全检查未通过，本次生成失败。",
     "video_execution_failed"=>"上游已确认视频生成失败，但未提供可公开确认的具体原因。",
+    "video_not_submitted"=>"本次辅助步骤已结束，但未提交视频生成；该请求不会继续生成视频或自动重发。辅助步骤的积分按真实回执结算，不代表未扣费或退款。",
     "budget_execution_wait_timeout"=>"本次等待已超时，尚未取得最终生成结果；可继续查询同一任务。",
     "key_concurrency_exceeded"=>"当前 Key 的任务并发已达上限，请等待已有任务结束。",
     "quota_insufficient"=>"当前 Key 可用积分不足，无法提交本次任务。",

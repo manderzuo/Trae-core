@@ -157,9 +157,21 @@ pub(crate) async fn video_status(state:Arc<StarlinkRouterState>,principal:Princi
             if state.config.work_context_for_key(&principal.key_id) && state.store.active_principal_for_request(&request).map_err(|_|"work_context_unavailable")?.is_some_and(|p|p.key_id==principal.key_id&&p.user_id==principal.user_id) {
                 let diagnostic=helper_failure(&state,&request);
                 let operation=state.store.budget_operation(&request).map_err(|_|"work_context_unavailable")?;
-                let failed=operation.as_ref().is_some_and(|op|matches!(op.execution_state,aiwork_core::BudgetExecutionState::Failed|aiwork_core::BudgetExecutionState::Canceled)) || state.store.request_state(&request).map_err(|_|"work_context_unavailable")?==aiwork_core::RequestState::Failed;
+                let request_state=state.store.request_state(&request).map_err(|_|"work_context_unavailable")?;
+                let failed=operation.as_ref().is_some_and(|op|matches!(op.execution_state,aiwork_core::BudgetExecutionState::Failed|aiwork_core::BudgetExecutionState::Canceled)) || request_state==aiwork_core::RequestState::Failed;
+                // A completed read-only helper decision has no video task to
+                // poll. Report the video disposition without changing the
+                // operation's successful text outcome or its actual charges.
+                let no_video_submitted=request_state==aiwork_core::RequestState::Succeeded && operation.as_ref().is_some_and(|op|
+                    op.execution_state==aiwork_core::BudgetExecutionState::Succeeded
+                    && !op.steps.iter().any(|s|s.kind==BudgetStepKind::Video)
+                    && op.steps.iter().all(|s|matches!(s.execution_state,aiwork_core::BudgetExecutionState::Succeeded|aiwork_core::BudgetExecutionState::Failed|aiwork_core::BudgetExecutionState::Canceled)));
                 let unconfirmed_assist=operation.as_ref().is_some_and(|op|op.steps.iter().any(|s|s.kind==BudgetStepKind::Assist && s.execution_state==aiwork_core::BudgetExecutionState::Unknown));
-                let mut reply=json!({"task":{"id":request,"status":if failed {"failed"}else if unconfirmed_assist {"processing"}else{"queued"}},"request_id":request});
+                let mut reply=json!({"task":{"id":request,"status":if failed || no_video_submitted {"failed"}else if unconfirmed_assist {"processing"}else{"queued"}},"request_id":request});
+                if no_video_submitted {
+                    reply["task"]["stage"]=json!("no_video_submitted");
+                    reply["task"]["error"]=failure_feedback(&state,&Failure::from("video_not_submitted"),&request)["error"].clone();
+                }
                 if !failed && unconfirmed_assist {
                     reply["task"]["stage"]=json!("assistant_reconciliation");
                     reply["task"]["notice"]=failure_feedback(&state,&diagnostic.clone().unwrap_or_else(||Failure::from("assist_result_unconfirmed")),&request)["error"].clone();

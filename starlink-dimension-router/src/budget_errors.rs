@@ -61,6 +61,7 @@ pub(crate) fn public_code(code:&str)->Option<&'static str> {
         "video_billing_paused"=>"video_billing_paused",
         "video_continuation_not_active"=>"video_continuation_not_active",
         "video_execution_failed"=>"video_execution_failed",
+        "video_not_submitted"=>"video_not_submitted",
         "video_safety_check_failed"=>"video_safety_check_failed",
         "reference_safety_check_failed"=>"reference_safety_check_failed",
         "prompt_safety_check_failed"=>"prompt_safety_check_failed",
