@@ -16,7 +16,7 @@ Core 读取原预算的、身份核验通过的最终失败结果。只接受 `r
 
 ## Studio 集成
 
-只有已审查部署契约同时声明 `workContext` 和 `videoRetry` 的新确认任务，才冻结 `maxAutomaticRetries:1`。旧任务没有此字段，不追溯执行。
+只有已审查部署契约声明 `videoRetry` 的新确认任务，才冻结 `maxAutomaticRetries:1`；Studio 原有 `workContext` 能力开关保持不变。旧任务没有此字段，不追溯执行。
 
 后台在保存已确认失败的原任务时，事务内创建关联子任务并保存 `retryRunId`；子任务保存 `retryOfRunId` 和 `retryOfCoreTaskId`。唯一索引限制同一原任务只有一个重试。关闭页面后后台仍会处理，暂停意图和项目回收状态仍受检查。
 
