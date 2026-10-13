@@ -292,6 +292,30 @@ async fn seedance_feedback_structured_bridge_failure_survives_restart_query() {
 }
 
 #[tokio::test(flavor="multi_thread",worker_threads=4)]
+async fn reference_resource_failure_survives_replay_query_without_a_refund_or_new_send() {
+    let f=Fixture::new("video",true);
+    *f.bridge.failure_detail.lock().unwrap()=Some(json!({"id":"native-video","status":"failed",
+        "upstream_error":{"code":3003,"message":"The parameter 'content[1][redacted]' specified in the request is not valid: resource download failed."}}));
+    let body=f.body(true,false);let first=f.request(body.clone(),true).await;f.waiting().await;
+    f.bridge.open.store(true,Ordering::SeqCst);
+    let streamed=read_stream(first).await;
+    assert_eq!(streamed["error"]["code"],"reference_resource_download_failed");
+    assert_eq!(streamed["error"]["billing_state"],"pending");
+    let replay=read_stream(f.request(body,true).await).await;
+    assert_eq!(replay["error"],streamed["error"]);
+    let id=streamed["request_id"].as_str().unwrap().to_string();
+    let operation=f.state.store.budget_operation(&id).unwrap().unwrap();
+    let video=operation.steps.iter().find(|s|s.kind==aiwork_core::BudgetStepKind::Video).unwrap();
+    assert_eq!(video.financial_state,aiwork_core::BudgetFinancialState::Held);
+    assert_eq!(video.actual_credits,None);
+    let restarted=StarlinkRouterState::for_test(f.state.store.clone(),BridgeClient::from_transport("http://bridge","bridge-only",f.bridge.clone()),f.state.config.clone());
+    let response=user_routes::video_task(State(restarted),axum::extract::Path(id),HeaderMap::new(),Extension(f.principal.clone())).await;
+    let queried:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+    assert_eq!(queried["task"]["error"],streamed["error"]);
+    assert_eq!(f.bridge.inner.sends.load(Ordering::SeqCst),2,"only the original assist and video may dispatch");
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=4)]
 async fn seedance_feedback_temporary_query_failure_keeps_original_task_running() {
     use http_body_util::BodyExt;
     let f=Fixture::new("video",false);let response=f.request(f.body(true,false),true).await;f.waiting().await;

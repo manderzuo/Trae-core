@@ -17,7 +17,7 @@ pub(crate) fn fail(code:&str)->Response {
         "quota_insufficient"=>StatusCode::PAYMENT_REQUIRED,
         "work_parent_unavailable"|"frame_result_not_ready"|"video_not_ready"|"budget_identity_conflict"|"video_continuation_not_active"=>StatusCode::CONFLICT,
         "invalid_budget_business_request"|"invalid_chat_image"|"reference_video_metadata_invalid"|
-        "reference_video_format_unsupported"|"reference_asset_type_mismatch"|
+        "reference_video_format_unsupported"|"reference_asset_type_mismatch"|"reference_resource_unavailable"|
         "reference_asset_unavailable"|"reference_video_budget_metadata_required"|
         "video_safety_check_failed"|"reference_safety_check_failed"|"prompt_safety_check_failed"=>StatusCode::BAD_REQUEST,
         "video_execution_failed"=>StatusCode::UNPROCESSABLE_ENTITY,
@@ -578,6 +578,7 @@ fn definite_failure_code(code:&str)->bool {
         "quota_insufficient"|"budget_policy_unconfigured"|"budget_policy_expired"|"budget_policy_invalid"|
         "reference_video_budget_metadata_required"|"invalid_budget_business_request"|"reference_image_limit"|
         "reference_video_metadata_invalid"|"reference_video_format_unsupported"|"reference_asset_type_mismatch"|
+        "reference_resource_unavailable"|"reference_resource_download_failed"|
         "invalid_image_asset_ids"|"invalid_reference_image"|"video_continuation_not_authorized"|"video_continuation_not_active"|
         "work_parent_required"|"work_decision_invalid"|"work_spec_unsupported"|"continuation_mode_unsupported"|
         "source_video_not_ready"|"source_video_unavailable"|"source_video_invalid"|"source_video_identity_invalid"|

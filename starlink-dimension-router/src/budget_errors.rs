@@ -2,6 +2,8 @@
 pub(crate) fn public_code(code:&str)->Option<&'static str> {
     if let Some(code)=crate::assistant_json::public_code(code) {return Some(code);}
     Some(match code {
+        "reference_resource_unavailable"=>"reference_resource_unavailable",
+        "reference_resource_download_failed"=>"reference_resource_download_failed",
         "video_stream_read_failed"=>"video_stream_read_failed",
         "video_stream_timeout"=>"video_stream_timeout",
         "video_stream_incomplete"=>"video_stream_incomplete",

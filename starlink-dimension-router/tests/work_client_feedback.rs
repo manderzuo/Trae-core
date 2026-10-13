@@ -151,7 +151,7 @@ async fn missing_parent_follow_up_is_classified_by_helper_without_video_dispatch
 async fn reference_prepare_rejection_releases_slot_without_refunding_paid_helper() {
     use aiwork_core::{BudgetExecutionState as E, BudgetFinancialState as F, BudgetReceiptInput};
     use starlink_dimension_router::assets::{self, ParsedAssetUpload};
-    for code in ["reference_video_metadata_invalid", "reference_video_format_unsupported", "reference_asset_type_mismatch"] {
+    for code in ["reference_video_metadata_invalid", "reference_video_format_unsupported", "reference_asset_type_mismatch", "reference_resource_unavailable"] {
         for stream in [false, true] {
             let f = Fixture::with_max_concurrency(1);
             let stored = assets::write_asset(&f.state.config.data_dir, &f.owner, ParsedAssetUpload {

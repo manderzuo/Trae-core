@@ -61,6 +61,10 @@ fn event(request:&str,progress:&Progress,elapsed_secs:u64,kind:&str,text:&str)->
 pub(crate) fn video_failure(result:&Value)->&'static str {
     let detail=aiwork_core::UpstreamFailure::from_value(result);
     let reason=detail.message.as_deref().unwrap_or("").trim().to_ascii_lowercase();
+    if matches!(detail.code.as_deref(),Some("3003"|"InvalidParameter"))
+        && (reason=="resource download failed" || reason.contains(": resource download failed")) {
+        return "reference_resource_download_failed";
+    }
     match reason.as_str() {
         "video security check failed"=>"video_safety_check_failed",
         "image security check failed"=>"reference_safety_check_failed",
@@ -106,6 +110,8 @@ impl Failure {
     }
 }
 pub(crate) fn message(code:&str)->&'static str {match code {
+    "reference_resource_unavailable"=>"上游参考素材未通过下载预检，视频尚未提交；请稍后重新发起任务。已执行的辅助步骤费用仍按真实回执核对。",
+    "reference_resource_download_failed"=>"上游读取参考素材失败，视频未生成；可能涉及下载超时或访问凭证失效，具体原因尚未确认。不会自动重发付费请求，积分继续按真实回执核对。",
     "video_stream_read_failed"=>"视频响应流读取中断，已停止本地等待；上游生成结果与费用仍待核对，不会自动重发。",
     "video_stream_timeout"=>"视频响应超过本轮总等待时限，已停止本地等待；上游生成结果与费用仍待核对，不会自动重发。",
     "video_stream_incomplete"=>"视频响应流已结束，但没有最终完成信号；生成结果与费用仍待核对，不会自动重发。",
@@ -221,6 +227,19 @@ mod work_feedback_tests {
 
 #[cfg(test)]
 mod video_stream_diagnostic_tests {
+    #[test]
+    fn reference_resource_failure_explains_download_without_claiming_expiry_or_refund() {
+        let result=serde_json::json!({"status":"failed","upstream_error":{"code":3003,
+            "message":"The parameter 'content[1][redacted]' specified in the request is not valid: resource download failed."}});
+        let failure=super::Failure::video(&result);
+        assert_eq!(failure.code,"reference_resource_download_failed");
+        let public=super::failure_value("fixture-request",&failure,false);
+        assert_eq!(public["error"]["billing_state"],"pending");
+        let text=public["error"]["message"].as_str().unwrap();
+        assert!(text.contains("参考素材")&&text.contains("不会自动重发"));
+        assert!(!text.contains("排队导致")&&!text.contains("已经退款"));
+        assert_eq!(crate::budget_errors::public_code(failure.code),Some(failure.code));
+    }
     #[test]
     fn every_closed_video_diagnostic_preserves_video_stage_and_uncertainty() {
         for code in ["video_stream_read_failed","video_stream_timeout","video_stream_incomplete","video_stream_invalid_event","video_stream_too_large","video_execution_interrupted","video_execution_unconfirmed"] {
