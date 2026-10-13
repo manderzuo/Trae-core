@@ -23,6 +23,8 @@ pub(crate) struct Bridge {
     pub(crate) claims: Mutex<BTreeMap<String, Value>>,
     pub(crate) video_sends: AtomicUsize,
     pub(crate) video_prepares: AtomicUsize,
+    pub(crate) video_prepare_inputs: Mutex<Vec<Value>>,
+    pub(crate) restored_references: Mutex<Vec<Value>>,
     pub(crate) asset_upload_failure: std::sync::atomic::AtomicBool,
     pub(crate) expired_video_budget: std::sync::atomic::AtomicBool,
     pub(crate) assist_sends: AtomicUsize,
@@ -68,6 +70,7 @@ impl BridgeTransport for Bridge {
         }
         if url.ends_with("/budgets/prepare") && input["step_kind"] == "video" {
             self.video_prepares.fetch_add(1,Ordering::SeqCst);
+            self.video_prepare_inputs.lock().unwrap().push(input.clone());
             if let Some((status, code)) = self.video_prepare_error.lock().unwrap().clone() {
                 return Ok(BridgeResponse { status, headers: BTreeMap::new(), body: serde_json::to_vec(&json!({"error":{"code":code}})).unwrap() });
             }
@@ -138,6 +141,12 @@ impl BridgeTransport for Bridge {
             json!({"tail_reference":self.tail_capability.load(Ordering::SeqCst),"native_first_frame":false,"native_video_extend":native,"contract_version":if native{"video-reference-continuation-v1"}else{"tail-reference-v1"},"evidence_digest":"ab".repeat(32)})
         } else if url.ends_with("/key-registry") {
             json!({"applied":true})
+        } else if url.ends_with("/reference-assets/restore") {
+            if self.asset_upload_failure.load(Ordering::SeqCst) {return Err("temporary fixture upload error".into());}
+            self.restored_references.lock().unwrap().push(input.clone());
+            *self.video_prepare_error.lock().unwrap()=None;
+            use base64::Engine;
+            json!({"id":input["id"],"sha256":input["sha256"],"size":base64::engine::general_purpose::STANDARD.decode(input["data_base64"].as_str().unwrap()).unwrap().len()})
         } else if url.ends_with("/v1/assets") {
             if self.asset_upload_failure.load(Ordering::SeqCst) {return Err("temporary fixture upload error".into());}
             json!({"id":"bridge-owned-image"})
@@ -307,6 +316,8 @@ impl Fixture {
             claims: Mutex::new(BTreeMap::new()),
             video_sends: AtomicUsize::new(0),
             video_prepares: AtomicUsize::new(0),
+            video_prepare_inputs: Mutex::new(Vec::new()),
+            restored_references: Mutex::new(Vec::new()),
             asset_upload_failure: std::sync::atomic::AtomicBool::new(false),
             expired_video_budget: std::sync::atomic::AtomicBool::new(false),
             assist_sends: AtomicUsize::new(0),

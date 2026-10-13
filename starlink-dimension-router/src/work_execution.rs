@@ -467,6 +467,30 @@ fn pin_and_bind(
         .version;
     Ok(v)
 }
+fn restore_dispatch_references(state:&StarlinkRouterState,p:&Principal,request:&str,version:&VideoWorkVersion,snapshot:&VideoWorkSnapshot,wire:&Value)->Result<(),String> {
+    let mut restored=Vec::new();let mut image_index=0;let mut video_index=0;
+    for id in snapshot.continuation_video_media_id.iter().chain(snapshot.user_media_ids.iter()).chain(snapshot.tail_frame_media_id.iter()) {
+        let media=state.store.owned_work_media(p,id).map_err(|_|"reference_asset_unavailable")?
+            .filter(|m|m.work_id==version.work_id).ok_or("reference_asset_missing")?;
+        if snapshot.continuation_video_media_id.is_some() && media.kind=="video" && Some(id)!=snapshot.continuation_video_media_id.as_ref() {continue;}
+        if snapshot.tail_frame_media_id.is_some() && media.kind=="video" {continue;}
+        let asset=crate::work_media::materialize(state,p,&media,chrono::Utc::now().timestamp_millis())?;
+        let (field,index)=if asset.mime_type.starts_with("image/") {("image_asset_ids",&mut image_index)}else{("video_asset_ids",&mut video_index)};
+        let bridge_id=wire[field].get(*index).and_then(Value::as_str).ok_or("work_snapshot_invalid")?;*index+=1;
+        if restored.iter().any(|(existing,_):&(String,aiwork_core::CoreAsset)|existing==bridge_id) {return Err("work_snapshot_invalid".into());}
+        restored.push((bridge_id.to_owned(),asset));
+    }
+    if restored.is_empty() || restored.len()>10 || image_index!=wire["image_asset_ids"].as_array().map_or(0,Vec::len) || video_index!=wire["video_asset_ids"].as_array().map_or(0,Vec::len) {return Err("work_snapshot_invalid".into());}
+    // All mappings come from the same authenticated immutable version. Restore
+    // exact bytes at the original IDs; never rewrite the saved business claim.
+    for (id,asset) in restored {
+        let _permit=state.asset_limiter.acquire(&p.key_id,asset.size as usize).map_err(|_|"reference_upload_limited")?;
+        let owned=crate::assets::read_reference(state,p,&asset.id)?;
+        state.bridge_client().restore_reference(&id,&owned.record.filename,&owned.record.mime_type,&owned.bytes,request)?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn execute(
     state: Arc<StarlinkRouterState>,
     p: Principal,
@@ -671,7 +695,7 @@ pub(crate) async fn execute(
         return Err("video_continuation_not_active".into());
     }
     let snapshot = work_context::read_snapshot(&state, &p, &version)?;
-    let wire = snapshot.dispatch_body.ok_or("work_snapshot_invalid")?;
+    let wire = snapshot.dispatch_body.clone().ok_or("work_snapshot_invalid")?;
     state
         .store
         .set_work_version_state(&p, &request, WorkVersionState::Running)
@@ -681,15 +705,24 @@ pub(crate) async fn execute(
     let owner = p.clone();
     let rid = request.clone();
     let step = tokio::task::spawn_blocking(move || {
-        crate::budget_flow::prepare_step(
+        let first=crate::budget_flow::prepare_step(
             &s,
             &owner,
             &rid,
             &rid,
             "seedance",
-            wire,
+            wire.clone(),
             BudgetStepKind::Video,
-        )
+        );
+        match first {
+            // Bridge replays persisted preparations before any asset read. These
+            // codes prove that this attempt did not prepare or dispatch a budget.
+            Err(code) if matches!(code.as_str(),"reference_asset_expired"|"reference_asset_missing")=>{
+                restore_dispatch_references(&s,&owner,&rid,&version,&snapshot,&wire)?;
+                crate::budget_flow::prepare_step(&s,&owner,&rid,&rid,"seedance",wire,BudgetStepKind::Video)
+            },
+            other=>other,
+        }
     })
     .await
     .map_err(|_| "video_worker_unavailable")??;

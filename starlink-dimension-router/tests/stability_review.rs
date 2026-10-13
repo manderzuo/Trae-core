@@ -11,6 +11,40 @@ async fn idle(state:&StarlinkRouterState) {
         while !state.video_stream_observers.lock().unwrap().is_empty() {tokio::time::sleep(std::time::Duration::from_millis(5)).await;}
     }).await.unwrap();
 }
+
+#[tokio::test]
+async fn bound_snapshot_recovers_missing_bridge_copy_without_changing_paid_claim() {
+    use base64::Engine;
+    for error in ["reference_asset_missing","reference_asset_expired","reference_asset_unavailable"] {
+        let f=Fixture::new();let (asset,bytes)=upload_image(&f,"frozen-reference");
+        let mut body=create();body["image_asset_ids"]=json!([asset.id]);
+        *f.bridge.video_prepare_error.lock().unwrap()=Some((429,"bridge_workers_busy".into()));
+        let first=send(&f.app,&f.key,"/v1/chat/completions","bound-recovery",&body).await;idle(&f.state).await;
+        let request=first["request_id"].as_str().unwrap().to_owned();
+        let version=f.state.store.work_version_for_request(&f.owner,&request).unwrap().unwrap();
+        let fingerprint=f.state.store.request_fingerprint_for_billing(&request).unwrap();
+        let helper=f.state.store.budget_operation(&request).unwrap().unwrap().steps;
+        *f.bridge.video_prepare_error.lock().unwrap()=Some((400,error.into()));make_due(&f,&request);
+        let (state,app)=reopened(&f);
+        let reply=send(&app,&f.key,"/v1/chat/completions","bound-recovery",&body).await;idle(&state).await;
+        assert_eq!(state.store.request_fingerprint_for_billing(&request).unwrap(),fingerprint);
+        let current=state.store.work_version_for_request(&f.owner,&request).unwrap().unwrap();
+        assert_eq!(version.sealed_snapshot,current.sealed_snapshot,"frozen upstream claim must remain byte-identical");
+        let attempts=f.bridge.video_prepare_inputs.lock().unwrap();
+        assert!(attempts.iter().all(|v|v==&attempts[0]),"must never replace request, account claim or temporary IDs");
+        let restored=f.bridge.restored_references.lock().unwrap();
+        if error=="reference_asset_unavailable" {
+            assert_eq!(reply["error"]["code"],error);assert!(restored.is_empty());assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+        }else{
+            assert!(reply["error"].is_null(),"{error}: {reply}");assert_eq!(restored.len(),1);
+            assert_eq!(restored[0]["id"],attempts[0]["body"]["image_asset_ids"][0]);
+            assert_eq!(base64::engine::general_purpose::STANDARD.decode(restored[0]["data_base64"].as_str().unwrap()).unwrap(),bytes);
+            assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),1);
+        }
+        assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);
+        assert_eq!(state.store.budget_operation(&request).unwrap().unwrap().steps.into_iter().find(|s|s.kind==aiwork_core::BudgetStepKind::Assist).unwrap(),helper[0]);
+    }
+}
 fn reopened(f:&Fixture)->(Arc<StarlinkRouterState>,axum::Router) {
     let store=Arc::new(CoreStore::open(&f.dir).unwrap());store.migrate().unwrap();
     let state=StarlinkRouterState::for_test(store,BridgeClient::from_transport("http://bridge","bridge-only",f.bridge.clone()),f.state.config.clone());

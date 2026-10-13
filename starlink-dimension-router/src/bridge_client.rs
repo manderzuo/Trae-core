@@ -858,6 +858,15 @@ impl BridgeClient {
         }
         serde_json::from_slice(&response.body).map_err(|e| format!("桥接响应不是有效 JSON: {e}"))
     }
+
+    pub(crate) fn restore_reference(&self,id:&str,filename:&str,mime:&str,bytes:&[u8],request:&str)->Result<(),String> {
+        use sha2::{Digest,Sha256};
+        let sha=format!("{:x}",Sha256::digest(bytes));
+        let body=serde_json::to_vec(&serde_json::json!({"id":id,"filename":filename,"mime_type":mime,"sha256":sha,"data_base64":STANDARD.encode(bytes)})).map_err(|_|"reference_asset_unavailable")?;
+        let reply=self.json_request("POST","/internal/bridge/v2/reference-assets/restore",&body,Some(request)).map_err(|_|"reference_asset_unavailable")?;
+        if reply["id"]!=id || reply["sha256"]!=sha || reply["size"].as_u64()!=Some(bytes.len() as u64) {return Err("reference_asset_unavailable".into());}
+        Ok(())
+    }
 }
 
 fn required_nonempty(value: Option<String>, field: &str) -> Result<String, String> {

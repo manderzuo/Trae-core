@@ -173,7 +173,9 @@ v2 桥接的参考素材类型、摘要、时长或格式无效时，Core 保留
 
 `src-core/tests/production_migration.rs` 提供显式启用的私有备份迁移演练：
 从 `CORE_MIGRATION_SNAPSHOT` 指定的不可变 SQLite 一致性备份复制到临时目录，
-升级 schema 28 后核对全部旧表旧列内容和完整性。必须额外设置
+升级当前 schema 31 后核对全部旧表旧列内容和完整性。必须额外设置
 `CORE_MIGRATION_SNAPSHOT_ACK=1` 并运行 ignored 测试；默认回归不读取生产数据。
 日志只记录表名/数量，不打印财务行或密钥材料。切勿把运行中数据库文件直接复制
 当作一致性备份，也不要将任何测试备份提交到仓库。
+
+[生产稳定性补丁与恢复边界](docs/production-stability-20261013.md) 记录输入保留、续接退避、同 ID 素材恢复和实际验收。
