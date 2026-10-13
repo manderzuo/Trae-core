@@ -621,7 +621,7 @@ pub(crate) async fn execute(
         if decision.action == WorkIntent::Create && base.is_some() {
             // Discard hydrated parent assets, not this turn's explicitly supplied
             // images. Independent creation cannot resurrect old reference markers.
-            let mut raw = original.clone();
+            let mut raw = crate::budget_continuation::restore_current_inputs(&state,&p,&request,&original)?;
             raw["action"] = json!("create");
             if let Some(latest) = raw["messages"]
                 .as_array()
@@ -803,6 +803,9 @@ pub(crate) async fn submit_direct(
             }
             return crate::budget_flow::fail(&code);
         }
+        if let Err(code)=crate::budget_continuation::ensure_retry_due(&state,&request) {
+            return crate::budget_flow::request_failure(&state,&crate::seedance_feedback::Failure::from(code),&request);
+        }
         state.seedance_results.subscribe(&request)
     };
     let (_subscription, publisher) = match subscribed {
@@ -879,6 +882,7 @@ pub(crate) async fn submit_direct(
                 if fresh {
                     crate::budget_flow::finish_unadmitted_failure(&state,&rid,code);
                 }
+                if owner.is_ok() {crate::budget_continuation::record_error(&state,&rid,code);}
             }
             publisher.complete(outcome);
         });

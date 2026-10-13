@@ -22,6 +22,8 @@ pub(crate) use tower::ServiceExt;
 pub(crate) struct Bridge {
     pub(crate) claims: Mutex<BTreeMap<String, Value>>,
     pub(crate) video_sends: AtomicUsize,
+    pub(crate) video_prepares: AtomicUsize,
+    pub(crate) asset_upload_failure: std::sync::atomic::AtomicBool,
     pub(crate) expired_video_budget: std::sync::atomic::AtomicBool,
     pub(crate) assist_sends: AtomicUsize,
     pub(crate) unknown: std::sync::atomic::AtomicBool,
@@ -65,6 +67,7 @@ impl BridgeTransport for Bridge {
             return Ok(BridgeResponse {status:if error.is_some(){503}else{200},headers:BTreeMap::new(),body:serde_json::to_vec(&match error {Some(code)=>json!({"error":{"code":code}}),None=>json!({"status":"ready"})}).unwrap()});
         }
         if url.ends_with("/budgets/prepare") && input["step_kind"] == "video" {
+            self.video_prepares.fetch_add(1,Ordering::SeqCst);
             if let Some((status, code)) = self.video_prepare_error.lock().unwrap().clone() {
                 return Ok(BridgeResponse { status, headers: BTreeMap::new(), body: serde_json::to_vec(&json!({"error":{"code":code}})).unwrap() });
             }
@@ -136,6 +139,7 @@ impl BridgeTransport for Bridge {
         } else if url.ends_with("/key-registry") {
             json!({"applied":true})
         } else if url.ends_with("/v1/assets") {
+            if self.asset_upload_failure.load(Ordering::SeqCst) {return Err("temporary fixture upload error".into());}
             json!({"id":"bridge-owned-image"})
         } else if url.ends_with("/budgets/prepare") {
             let id = input["request_id"].as_str().unwrap();
@@ -302,6 +306,8 @@ impl Fixture {
         let bridge = Arc::new(Bridge {
             claims: Mutex::new(BTreeMap::new()),
             video_sends: AtomicUsize::new(0),
+            video_prepares: AtomicUsize::new(0),
+            asset_upload_failure: std::sync::atomic::AtomicBool::new(false),
             expired_video_budget: std::sync::atomic::AtomicBool::new(false),
             assist_sends: AtomicUsize::new(0),
             unknown: std::sync::atomic::AtomicBool::new(false),

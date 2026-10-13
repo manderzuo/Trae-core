@@ -185,6 +185,7 @@ pub(crate) fn message(code:&str)->&'static str {match code {
     "video_continuation_not_active"=>"该任务已结束，不能再次提交视频；请查询原任务状态。需要重新生成时请发起新请求。",
     "budget_not_sent"=>"本次任务未发送到视频上游。",
     "budget_failure_reason_unavailable"=>"本次视频任务未提交成功，具体失败原因未保存；请保留请求编号供排查。",
+    "budget_continuation_deferred"=>"任务正在等待下一次恢复检查，请保留原任务编号；当前未开始新的提交。",
     "budget_continuation_requires_attention"=>"任务恢复多次未完成，已暂停自动重试，需检查素材或服务状态；原任务与费用记录均已保留。",
     "budget_policy_expired"=>"当前视频预冻结基准已过期，尚未提交视频。",
     "budget_policy_invalid"=>"当前视频预冻结配置未通过校验，尚未提交视频。",

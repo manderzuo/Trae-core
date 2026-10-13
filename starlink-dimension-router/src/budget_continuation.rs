@@ -65,7 +65,7 @@ pub(crate) fn save_with_headers(state:&StarlinkRouterState,principal:&aiwork_cor
     }
     // The original body remains the immutable request fingerprint. Only this
     // authenticated envelope holds the owned material used during recovery.
-    let stored=serde_json::json!({"format":"aiwork-checkpoint-v2","body":body,"binding":binding,"retained_inputs":retained});
+    let stored=serde_json::json!({"format":"aiwork-checkpoint-v2","body":body,"binding":binding,"retained_inputs":retained,"retained_input_origin":if has_assets {"current"} else {"inherited"}});
     let plaintext=zeroize::Zeroizing::new(serde_json::to_string(&stored).map_err(|_|"checkpoint encoding failed")?);
     let encrypted=state.key_vault.encrypt(&context,&plaintext).map_err(|_|"checkpoint encryption failed")?;
     state.store.save_budget_continuation(principal,request,body,encrypted.key_version,&encrypted.ciphertext).map_err(|_|"checkpoint persistence failed")?;
@@ -81,20 +81,40 @@ pub(crate) fn decode_checkpoint(raw:&str)->Result<(serde_json::Value,Option<crat
     }else{Ok((v,None))}
 }
 pub(crate) fn restore_inputs(state:&StarlinkRouterState,p:&aiwork_core::Principal,request:&str,body:&serde_json::Value)->Result<serde_json::Value,String> {
+    restore_inputs_scoped(state,p,request,body,false)
+}
+pub(crate) fn restore_current_inputs(state:&StarlinkRouterState,p:&aiwork_core::Principal,request:&str,body:&serde_json::Value)->Result<serde_json::Value,String> {
+    restore_inputs_scoped(state,p,request,body,true)
+}
+fn restore_inputs_scoped(state:&StarlinkRouterState,p:&aiwork_core::Principal,request:&str,body:&serde_json::Value,current_only:bool)->Result<serde_json::Value,String> {
     let Some(saved)=state.store.budget_continuation(request).map_err(|_|"budget_checkpoint_unavailable")? else {return Ok(body.clone());};
     let raw=zeroize::Zeroizing::new(state.key_vault.decrypt(&saved.encryption_context(),saved.key_version,&saved.ciphertext).map_err(|_|"budget_checkpoint_invalid")?);
     let envelope:serde_json::Value=serde_json::from_str(&raw).map_err(|_|"budget_checkpoint_invalid")?;
     let (original,_)=decode_checkpoint(&raw)?;
     if aiwork_core::canonical_json_hash(&original)!=aiwork_core::canonical_json_hash(body) {return Err("budget_checkpoint_invalid".into());}
     if envelope["format"]!="aiwork-checkpoint-v2" {
+        let mut restored=body.clone();
+        if crate::reference_context::has_current_marker(&restored) {
+            crate::reference_context::recover_checkpoint(state,p,&mut restored)?;
+        }
         for field in ["image_asset_ids","video_asset_ids"] {
-            for id in body[field].as_array().into_iter().flatten() {
+            for id in restored[field].as_array().into_iter().flatten() {
                 crate::assets::read_reference(state,p,id.as_str().ok_or("invalid_reference_context")?)?;
             }
         }
-        return Ok(body.clone());
+        return Ok(restored);
     }
     let mut restored=body.clone();
+    // Older v2 envelopes predate explicit provenance. Their immutable original
+    // body identifies current uploads/markers; absent those, retained IDs came
+    // from the parent snapshot and must not enter an independent creation.
+    let current=match envelope["retained_input_origin"].as_str() {
+        Some("current")=>true,
+        Some("inherited")=>false,
+        Some(_)=>return Err("budget_checkpoint_invalid".into()),
+        None=>["image_asset_ids","video_asset_ids"].iter().any(|f|body[*f].as_array().is_some_and(|ids|!ids.is_empty())) || crate::reference_context::has_current_marker(body),
+    };
+    if current_only && !current {return Ok(restored);}
     if envelope["retained_inputs"].as_object().is_some_and(|m|!m.is_empty()) {
         crate::reference_context::strip_body_markers(&mut restored);
     }
@@ -169,7 +189,17 @@ pub(crate) fn spawn(state:&Arc<StarlinkRouterState>) {
     });
 }
 
-fn record_error(state:&StarlinkRouterState,request:&str,code:&str) {
+pub(crate) fn ensure_retry_due(state:&StarlinkRouterState,request:&str)->Result<(),String> {
+    match state.store.budget_continuation_retry_block(request,chrono::Utc::now().timestamp_millis()).map_err(|_|"budget_checkpoint_invalid")?.as_deref() {
+        Some("attention")=>Err("budget_continuation_requires_attention".into()),
+        Some(_)=>Err("budget_continuation_deferred".into()),
+        None=>Ok(()),
+    }
+}
+
+pub(crate) fn record_error(state:&StarlinkRouterState,request:&str,code:&str) {
+    // Being denied another attempt is not itself an attempted continuation.
+    if matches!(code,"budget_continuation_deferred"|"budget_continuation_requires_attention") {return;}
     let safe=crate::budget_errors::public_code(code).unwrap_or("budget_continuation_requires_attention");
     match state.store.record_budget_continuation_error(request,safe,chrono::Utc::now().timestamp_millis()) {
         Ok(true)=>eprintln!("v2 continuation {request}: attention required after bounded retries: {safe}"),

@@ -12,6 +12,9 @@ fn text(message:&Value)->String {
         _=>String::new(),
     }
 }
+pub(crate) fn has_current_marker(body:&Value)->bool {
+    body["messages"].as_array().and_then(|m|m.iter().rev().find(|m|m["role"]=="user")).is_some_and(|m|text(m).contains(PREFIX))
+}
 fn wants_reference(s:&str)->bool {
     ["这是人物参考图","这是参考图","以图片为参考","使用参考图","根据参考图","附带参考图","参考图如下","参考图说明"]
         .iter().any(|p|s.contains(p))
@@ -32,6 +35,14 @@ fn validate_image(state:&StarlinkRouterState,principal:&Principal,id:&str)->Resu
 }
 
 pub(crate) fn recover(state:&StarlinkRouterState,principal:&Principal,body:&mut Value)->Result<(),&'static str> {
+    recover_inner(state,principal,body,false)
+}
+/// Only an authenticated immutable accepted checkpoint may outlive its marker.
+/// Ownership, token authentication, shape and actual asset expiry still apply.
+pub(crate) fn recover_checkpoint(state:&StarlinkRouterState,principal:&Principal,body:&mut Value)->Result<(),&'static str> {
+    recover_inner(state,principal,body,true)
+}
+fn recover_inner(state:&StarlinkRouterState,principal:&Principal,body:&mut Value,accepted_checkpoint:bool)->Result<(),&'static str> {
     // Validate explicit references before merging an opaque marker. Never turn
     // a malformed client field into an empty list or pay the helper first.
     for field in ["image_asset_ids","video_asset_ids"] {
@@ -57,7 +68,8 @@ pub(crate) fn recover(state:&StarlinkRouterState,principal:&Principal,body:&mut 
         let cipher=URL_SAFE_NO_PAD.decode(cipher).map_err(|_|"invalid_reference_context")?;
         let plaintext=zeroize::Zeroizing::new(state.key_vault.decrypt(&context(principal),version,&cipher).map_err(|_|"invalid_reference_context")?);
         let decoded:Value=serde_json::from_str(&plaintext).map_err(|_|"invalid_reference_context")?;
-        if decoded["expires_at_ms"].as_i64().is_none_or(|t|t<=chrono::Utc::now().timestamp_millis()) {return Err("reference_context_expired");}
+        let expires=decoded["expires_at_ms"].as_i64().filter(|t|*t>0).ok_or("invalid_reference_context")?;
+        if !accepted_checkpoint && expires<=chrono::Utc::now().timestamp_millis() {return Err("reference_context_expired");}
         let refs=decoded["asset_ids"].as_array().filter(|v|!v.is_empty() && v.len()<=10).ok_or("invalid_reference_context")?;
         for id in refs {
             let id=id.as_str().filter(|s|s.len()<=128).ok_or("invalid_reference_context")?;

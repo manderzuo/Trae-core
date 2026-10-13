@@ -13,7 +13,7 @@ struct Prepared {
 }
 pub(crate) fn fail(code:&str)->Response {
     let status=if crate::assistant_json::public_code(code).is_some() {StatusCode::BAD_GATEWAY} else {match code {
-        "frame_extractor_busy"|"key_concurrency_exceeded"|"video_download_busy"|"budget_preparation_busy"|"bridge_workers_busy"|"reference_upload_limited"|"stream_observer_limit"=>StatusCode::TOO_MANY_REQUESTS,
+        "frame_extractor_busy"|"key_concurrency_exceeded"|"video_download_busy"|"budget_preparation_busy"|"budget_continuation_deferred"|"bridge_workers_busy"|"reference_upload_limited"|"stream_observer_limit"=>StatusCode::TOO_MANY_REQUESTS,
         "quota_insufficient"=>StatusCode::PAYMENT_REQUIRED,
         "work_parent_unavailable"|"frame_result_not_ready"|"video_not_ready"|"budget_identity_conflict"|"video_continuation_not_active"=>StatusCode::CONFLICT,
         "invalid_budget_business_request"|"invalid_chat_image"|"reference_video_metadata_invalid"|
@@ -294,6 +294,7 @@ pub(crate) async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Princ
         let failure=tokio::task::spawn_blocking(move ||helper_failure(&s,&rid)).await.ok().flatten();
         return Err(failure.unwrap_or_else(||Failure::from(code)));
     }
+    crate::budget_continuation::ensure_retry_due(&state,&request)?;
     if state.config.work_context_for_key(&principal.key_id) {return crate::work_execution::execute(state,principal,request,original,fresh,dispatch_only).await;}
     original=crate::budget_continuation::restore_inputs(&state,&principal,&request,&original)?;
     state.seedance_results.progress(&request,Stage::Assistant);
@@ -470,6 +471,7 @@ pub(crate) async fn seedance_chat(state:Arc<StarlinkRouterState>,principal:Princ
                 finish_definite_failure(&state,&rid,code);
                 if work_enabled {crate::work_execution::reflect_failure(&state,&rid,code);}
                 if fresh {finish_unadmitted_failure(&state,&rid,code);}
+                if owner.is_ok() {crate::budget_continuation::record_error(&state,&rid,code);}
             }
             publisher.complete(outcome);
         });

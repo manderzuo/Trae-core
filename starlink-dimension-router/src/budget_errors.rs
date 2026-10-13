@@ -40,6 +40,7 @@ pub(crate) fn public_code(code:&str)->Option<&'static str> {
         "chat_incomplete_tool_identity"=>"chat_incomplete_tool_identity",
         "chat_output_after_completion"=>"chat_output_after_completion",
         "budget_policy_unconfigured"=>"budget_policy_unconfigured",
+        "budget_continuation_deferred"=>"budget_continuation_deferred",
         "budget_continuation_requires_attention"=>"budget_continuation_requires_attention",
         "budget_policy_expired"=>"budget_policy_expired",
         "budget_policy_invalid"=>"budget_policy_invalid",

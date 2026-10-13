@@ -28,9 +28,9 @@ fn production_backup_migrates_without_changing_historical_rows() {
     let store=aiwork_core::CoreStore::open(&root).unwrap();store.migrate().unwrap();drop(store);
     let migrated=Connection::open_with_flags(root.join("data/core.sqlite3"),OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     assert_eq!(migrated.query_row("PRAGMA integrity_check",[],|r|r.get::<_,String>(0)).unwrap(),"ok");
-    assert_eq!(migrated.query_row("SELECT value FROM schema_meta WHERE key='schema_version'",[],|r|r.get::<_,String>(0)).unwrap(),"28");
+    assert_eq!(migrated.query_row("SELECT value FROM schema_meta WHERE key='schema_version'",[],|r|r.get::<_,String>(0)).unwrap(),aiwork_core::CURRENT_SCHEMA_VERSION.to_string());
     for (table,(columns,before)) in &history {assert!(&rows(&migrated,table,columns)==before,"historical rows changed in {table}; values intentionally redacted");}
-    println!("Real Core backup migrated to schema28; {} historical tables preserved",history.len());
+    println!("Real Core backup migrated to schema{}; {} historical tables preserved",aiwork_core::CURRENT_SCHEMA_VERSION,history.len());
     drop(migrated);
     assert!(std::fs::read(source).unwrap()==source_bytes,"immutable backup must not change");
     std::fs::remove_dir_all(root).unwrap();

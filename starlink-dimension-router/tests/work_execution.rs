@@ -116,6 +116,8 @@ async fn temporary_video_preparation_error_keeps_work_recoverable_without_repayi
     assert_ne!(version.state,aiwork_core::WorkVersionState::Failed,"a temporary capacity error is not a permanent work failure");
     assert_eq!(f.state.store.active_execution_count_for_key(&f.owner.key_id).unwrap(),1);
     *f.bridge.video_prepare_error.lock().unwrap()=None;
+    // Simulate the persisted retry becoming due; an immediate POST is gated.
+    rusqlite::Connection::open(f.dir.join("data/core.sqlite3")).unwrap().execute("UPDATE budget_continuation_retries SET next_attempt_at_ms=0 WHERE request_id=?1",[&request]).unwrap();
     let response=f.chat("temporary-prepare",&b).await;
     assert_eq!(response["request_id"],request);
     assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);
@@ -621,6 +623,7 @@ async fn retained_input_survives_restart_after_helper_before_version_binding() {
     db.execute("UPDATE video_work_media SET expires_at_ms=1",[]).unwrap();
     starlink_dimension_router::work_media::cleanup(&f.state,chrono::Utc::now().timestamp_millis()).unwrap();
     f.bridge.frame_failure.store(false,Ordering::SeqCst);
+    db.execute("UPDATE budget_continuation_retries SET next_attempt_at_ms=0 WHERE request_id=?1",[&request]).unwrap();
     let store=Arc::new(CoreStore::open(&f.dir).unwrap());store.migrate().unwrap();
     let state=StarlinkRouterState::for_test(store,BridgeClient::from_transport("http://bridge","bridge-only",f.bridge.clone()),f.state.config.clone());
     let app=starlink_dimension_router::server::build_router(state.clone());
@@ -684,6 +687,7 @@ async fn legacy_missing_or_expired_inputs_end_only_proven_finished_workflows() {
         }
         let before=f.state.store.budget_operation(&request).unwrap().unwrap();
         if mode=="expired" {assert_eq!(before.steps[0].financial_state,aiwork_core::BudgetFinancialState::Settled);}
+        db.execute("UPDATE budget_continuation_retries SET next_attempt_at_ms=0 WHERE request_id=?1",[&request]).unwrap();
         let response=f.response(&f.key,mode,&body).await;
         let value:Value=serde_json::from_slice(&to_bytes(response.into_body(),256*1024).await.unwrap()).unwrap();
         let expected=match mode {"expired"|"unknown"=>"reference_asset_expired","missing"=>"reference_asset_missing",_=>"reference_asset_unavailable"};
@@ -701,10 +705,11 @@ async fn persisted_continuation_backoff_skips_poisoned_work_and_survives_restart
     let f=Fixture::with_max_concurrency(4);
     *f.bridge.video_prepare_error.lock().unwrap()=Some((429,"bridge_workers_busy".into()));
     for id in ["retry-a","retry-b","retry-c"] {let reply=f.response(&f.key,id,&create()).await;let _=to_bytes(reply.into_body(),256*1024).await.unwrap();}
+    let db=rusqlite::Connection::open(f.dir.join("data/core.sqlite3")).unwrap();
+    db.execute("UPDATE budget_continuation_retries SET next_attempt_at_ms=0",[]).unwrap();
     let mut ids=f.state.store.pending_budget_continuation_ids_after("",100).unwrap();ids.sort();
     assert_eq!(ids.len(),3);
-    let db=rusqlite::Connection::open(f.dir.join("data/core.sqlite3")).unwrap();
-    db.execute("INSERT INTO budget_continuation_retries(request_id,failures,next_attempt_at_ms,state,last_error_code) VALUES (?1,1,?2,'retry','reference_asset_unavailable')",rusqlite::params![ids[0],chrono::Utc::now().timestamp_millis()+60_000]).unwrap();
+    db.execute("UPDATE budget_continuation_retries SET next_attempt_at_ms=?2,last_error_code='reference_asset_unavailable' WHERE request_id=?1",rusqlite::params![ids[0],chrono::Utc::now().timestamp_millis()+60_000]).unwrap();
     let reopened=CoreStore::open(&f.dir).unwrap();reopened.migrate().unwrap();
     assert_eq!(reopened.pending_budget_continuation_ids_after("",100).unwrap(),ids[1..]);
     for attempt in 2..=8 {

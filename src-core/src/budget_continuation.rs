@@ -118,6 +118,10 @@ impl CoreStore {
         tx.commit()?;
         Ok(attention)
     }
+    pub fn budget_continuation_retry_block(&self,request:&str,now_ms:i64)->Result<Option<String>,CoreError> {
+        let con=self.connection.lock().expect("core store mutex poisoned");
+        Ok(con.query_row("SELECT retry.state FROM budget_continuation_retries retry JOIN budget_operations o ON o.parent_request_id=retry.request_id WHERE retry.request_id=?1 AND o.execution_state IN ('ready','running','unknown') AND NOT EXISTS(SELECT 1 FROM budget_steps s WHERE s.operation_id=o.operation_id AND s.kind='video') AND (retry.state='attention' OR retry.next_attempt_at_ms>?2)",params![request,now_ms],|r|r.get(0)).optional()?)
+    }
     pub fn budget_continuation_needs_attention(&self,request:&str)->Result<bool,CoreError> {
         let con=self.connection.lock().expect("core store mutex poisoned");
         Ok(con.query_row("SELECT EXISTS(SELECT 1 FROM budget_continuation_retries WHERE request_id=?1 AND state='attention')",[request],|r|r.get(0))?)
