@@ -19,6 +19,7 @@ pub fn build_router(state: Arc<StarlinkRouterState>) -> Router {
         .route("/v1/video-works/:work_id", get(crate::work_routes::get))
         .route("/v1/video-works/:work_id/continue", post(crate::work_routes::continue_work))
         .route("/v1/videos/:task_id", get(user_routes::video_task))
+        .route("/v1/videos/:task_id/retry", post(crate::work_retry::retry).get(crate::work_retry::lookup).layer(DefaultBodyLimit::max(1024)))
         .route("/v1/videos/:task_id/content", get(user_routes::video_content))
         .route("/v1/videos/:task_id/delivery", post(crate::video_delivery::delivery).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
         .layer(from_fn_with_state(state.clone(), auth::user_auth));

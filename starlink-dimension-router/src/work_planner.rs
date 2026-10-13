@@ -546,10 +546,12 @@ pub fn merge_snapshot(
         continuation_video_media_id: None,
         parent_version_id: None,
         source_request_id: None,
+        retry_source_request_id: None,
         reference_mode: "none".into(),
         summary: String::new(),
         dispatch_body:None,
     });
+    s.retry_source_request_id = None;
     s.effective_prompt = d.effective_prompt
             .as_deref()
             .filter(|s| !s.trim().is_empty() && s.len() <= 12 * 1024)

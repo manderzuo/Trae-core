@@ -21,6 +21,7 @@ pub(crate) mod assistant_json;
 pub mod work_execution;
 pub mod work_continuation;
 pub mod work_routes;
+pub mod work_retry;
 pub mod video_billing;
 pub mod video_reconciler;
 pub(crate) mod budget_reconciler;

@@ -80,6 +80,8 @@ pub struct VideoWorkSnapshot {
     pub continuation_video_media_id: Option<String>,
     pub parent_version_id: Option<String>,
     pub source_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_source_request_id: Option<String>,
     pub reference_mode: String,
     pub summary: String,
     /// Internal immutable, already-materialized upstream input. It is stored

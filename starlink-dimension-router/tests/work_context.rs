@@ -108,6 +108,7 @@ impl Fixture {
             continuation_video_media_id: None,
             parent_version_id: None,
             source_request_id: None,
+            retry_source_request_id: None,
             reference_mode: "user_reference".into(),
             summary: String::new(),
             dispatch_body: None,

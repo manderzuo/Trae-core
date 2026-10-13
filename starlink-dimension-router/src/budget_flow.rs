@@ -15,7 +15,8 @@ pub(crate) fn fail(code:&str)->Response {
     let status=if crate::assistant_json::public_code(code).is_some() {StatusCode::BAD_GATEWAY} else {match code {
         "frame_extractor_busy"|"key_concurrency_exceeded"|"video_download_busy"|"budget_preparation_busy"|"budget_continuation_deferred"|"bridge_workers_busy"|"reference_upload_limited"|"stream_observer_limit"=>StatusCode::TOO_MANY_REQUESTS,
         "quota_insufficient"=>StatusCode::PAYMENT_REQUIRED,
-        "work_parent_unavailable"|"frame_result_not_ready"|"video_not_ready"|"budget_identity_conflict"|"video_continuation_not_active"=>StatusCode::CONFLICT,
+        "video_retry_not_eligible"|"video_retry_limit_reached"|"work_parent_unavailable"|"frame_result_not_ready"|"video_not_ready"|"budget_identity_conflict"|"video_continuation_not_active"=>StatusCode::CONFLICT,
+        "video_retry_invalid"=>StatusCode::BAD_REQUEST,
         "invalid_budget_business_request"|"invalid_chat_image"|"reference_video_metadata_invalid"|
         "reference_video_format_unsupported"|"reference_asset_type_mismatch"|"reference_resource_unavailable"|
         "reference_asset_unavailable"|"reference_asset_expired"|"reference_asset_missing"|"reference_video_budget_metadata_required"|

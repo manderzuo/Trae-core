@@ -21,6 +21,8 @@ pub struct ContextBinding {
     pub base_version_id: Option<String>,
     pub association: String,
     pub clarification: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_source_request_id: Option<String>,
 }
 pub(crate) fn freeze_context(
     state: &StarlinkRouterState,
@@ -45,18 +47,21 @@ pub(crate) fn freeze_context(
             base_version_id: None,
             association,
             clarification: None,
+            retry_source_request_id: None,
         },
         WorkResolution::Existing { work, base_version } => ContextBinding {
             work_id: Some(work.work_id),
             base_version_id: base_version.map(|v| v.version_id),
             association,
             clarification: None,
+            retry_source_request_id: None,
         },
         WorkResolution::Clarify { text } => ContextBinding {
             work_id: None,
             base_version_id: None,
             association,
             clarification: Some(text),
+            retry_source_request_id: None,
         },
     })
 }
@@ -515,6 +520,10 @@ pub(crate) async fn execute(
             return Err("video_continuation_not_active".into());
         }
         v
+    } else if let Some(source)=load_binding(&state,&p,&request,&original)?.retry_source_request_id {
+        let s=state.clone();let owner=p.clone();let id=request.clone();
+        tokio::task::spawn_blocking(move ||crate::work_retry::bind_retry_version(&s,&owner,&id,&source))
+            .await.map_err(|_|"work_snapshot_unavailable")??
     } else {
         let binding = load_binding(&state, &p, &request, &original)?;
         let parent = parent(&state, &p, &binding)?;

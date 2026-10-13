@@ -50,6 +50,9 @@ pub(crate) struct Bridge {
     pub(crate) video_diagnostic: Mutex<Option<Value>>,
     pub(crate) delivery_failure: Mutex<Option<Value>>,
     pub(crate) video_prepare_error: Mutex<Option<(u16, String)>>,
+    pub(crate) next_video_failure: Mutex<Option<Value>>,
+    pub(crate) video_failures: Mutex<BTreeMap<String, Value>>,
+    pub(crate) asset_uploads: AtomicUsize,
 }
 impl BridgeTransport for Bridge {
     fn send(
@@ -149,6 +152,7 @@ impl BridgeTransport for Bridge {
             json!({"id":input["id"],"sha256":input["sha256"],"size":base64::engine::general_purpose::STANDARD.decode(input["data_base64"].as_str().unwrap()).unwrap().len()})
         } else if url.ends_with("/v1/assets") {
             if self.asset_upload_failure.load(Ordering::SeqCst) {return Err("temporary fixture upload error".into());}
+            self.asset_uploads.fetch_add(1, Ordering::SeqCst);
             json!({"id":"bridge-owned-image"})
         } else if url.ends_with("/budgets/prepare") {
             let id = input["request_id"].as_str().unwrap();
@@ -161,6 +165,11 @@ impl BridgeTransport for Bridge {
                 .clone();
             if kind == "video" {
                 self.video_sends.fetch_add(1, Ordering::SeqCst);
+                if let Some(mut failure)=self.next_video_failure.lock().unwrap().take() {
+                    let id=input["authorization"]["request_id"].as_str().unwrap();
+                    failure["id"]=json!(format!("video-{id}"));
+                    self.video_failures.lock().unwrap().insert(id.into(),failure);
+                }
             } else {
                 self.assist_sends.fetch_add(1, Ordering::SeqCst);
             }
@@ -175,7 +184,7 @@ impl BridgeTransport for Bridge {
                 .ok_or("missing claim")?;
             let mut v = json!({"wire_version":2,"budget_id":format!("b-{id}"),"request_id":id,"core_key_id":c["core_key_id"],"account_ref":"exclusive-account","bridge_instance_id":"fixture"});
             let helper_failure=if c["step_kind"]=="assist" {self.helper_failure.lock().unwrap().clone()}
-                else if c["step_kind"]=="chat" {self.delivery_failure.lock().unwrap().clone()}else{None};
+                else if c["step_kind"]=="chat" {self.delivery_failure.lock().unwrap().clone()}else{self.video_failures.lock().unwrap().get(id).cloned()};
             let diagnostic=if c["step_kind"]=="assist" {self.helper_diagnostic.lock().unwrap().clone()}else{self.video_diagnostic.lock().unwrap().clone()};
             let unknown = (c["step_kind"] == "video" && self.unknown.load(Ordering::SeqCst)) || diagnostic.is_some();
             if url.contains("/execution?") {
@@ -343,6 +352,9 @@ impl Fixture {
             video_diagnostic: Mutex::new(None),
             delivery_failure: Mutex::new(None),
             video_prepare_error: Mutex::new(None),
+            next_video_failure: Mutex::new(None),
+            video_failures: Mutex::new(BTreeMap::new()),
+            asset_uploads: AtomicUsize::new(0),
         });
         let mut config = RouterConfig::defaults(dir.clone());
         config.budget_billing_v2 = true;
