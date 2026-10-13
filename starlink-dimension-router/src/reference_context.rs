@@ -108,12 +108,16 @@ fn recover_inner(state:&StarlinkRouterState,principal:&Principal,body:&mut Value
     Ok(())
 }
 pub(crate) fn strip_body_markers(body:&mut Value) {
-    if let Some(message)=body["messages"].as_array_mut().and_then(|m|m.iter_mut().rev().find(|m|m["role"]=="user")) {
+    // get_mut preserves an absent messages field. IndexMut inserts null and
+    // makes a valid direct-video prompt fail later chat-shape validation.
+    if let Some(message)=body.get_mut("messages").and_then(Value::as_array_mut).and_then(|m|m.iter_mut().rev().find(|m|m["role"]=="user")) {
         match &mut message["content"] {
             Value::String(s)=>*s=strip_markers(s),
             Value::Array(parts)=>for part in parts {if let Some(s)=part["text"].as_str() {part["text"]=json!(strip_markers(s));}},
             _=>{},
         }
+    }else if body.get("messages").is_none() {
+        if let Some(Value::String(prompt))=body.get_mut("prompt") {*prompt=strip_markers(prompt);}
     }
 }
 fn strip_markers(s:&str)->String {
@@ -141,4 +145,17 @@ pub(crate) fn caption_reference(state:&StarlinkRouterState,principal:&Principal,
     if ids.len()>10 {return Err("reference_image_limit".into());}
     let sealed=state.key_vault.encrypt(&context(principal),&json!({"asset_ids":ids,"expires_at_ms":expires}).to_string()).map_err(|_|"reference_materialization_failed")?;
     Ok(Some(format!("{PREFIX}{}.{}]",sealed.key_version,URL_SAFE_NO_PAD.encode(sealed.ciphertext))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn stripping_direct_prompt_never_inserts_or_repairs_messages() {
+        for mut body in [json!({"prompt":"正文"}),json!({"prompt":"正文","messages":null}),json!({"prompt":"正文","messages":"invalid"})] {
+            let original=body.clone();strip_body_markers(&mut body);assert_eq!(body,original);
+        }
+        let mut body=json!({"prompt":"正文 [AIWORK_REFERENCE:opaque] 结尾"});strip_body_markers(&mut body);
+        assert_eq!(body,json!({"prompt":"正文  结尾"}));assert!(body.get("messages").is_none());
+    }
 }

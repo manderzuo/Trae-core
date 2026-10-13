@@ -106,6 +106,31 @@ fn make_due(f:&Fixture,request:&str) {
 }
 
 #[tokio::test]
+async fn fresh_direct_video_with_uploaded_image_accepts_prompt_only_input() {
+    for variant in ["image","video","mixed","messages"] {
+    let f=Fixture::new();let (asset,_)=upload_image(&f,"direct-image");
+    let bytes=b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2".to_vec();
+    let stored=starlink_dimension_router::assets::write_asset(&f.dir,&f.owner,starlink_dimension_router::assets::ParsedAssetUpload {filename:"source.mp4".into(),declared_mime:Some("video/mp4".into()),bytes}).unwrap();
+    let video=starlink_dimension_router::assets::persist_asset(&f.state.store,&f.owner,&stored).unwrap();
+    let mut body=json!({"model":"seedance","prompt":"生成医院病房里的连续剧情视频","duration":15,"ratio":"9:16","resolution":"480p"});
+    if variant!="video" {body["image_asset_ids"]=json!([asset.id]);}
+    if matches!(variant,"video"|"mixed") {body["video_asset_ids"]=json!([video.id]);}
+    if variant=="messages" {body["messages"]=json!([{"role":"user","content":"生成医院病房里的连续剧情视频"}]);}
+    let reply=send(&f.app,&f.key,"/v1/videos/generations","fresh-direct-image",&body).await;idle(&f.state).await;
+    assert!(reply["error"].is_null(),"valid freshly uploaded image must be accepted: {reply}");
+    let request=reply["task"]["id"].as_str().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3),async {
+        while f.bridge.video_sends.load(Ordering::SeqCst)==0 && f.state.store.request_state(request).unwrap()!=aiwork_core::RequestState::Failed {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }).await.unwrap();
+    assert_ne!(f.state.store.request_state(request).unwrap(),aiwork_core::RequestState::Failed,"{variant}: {:?}",f.state.store.request_result(request).unwrap());
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),1);
+    }
+}
+
+#[tokio::test]
 async fn independent_create_restores_current_turn_references_after_expiry_and_restart() {
     use sha2::{Digest,Sha256};
     for via_marker in [false,true] {
