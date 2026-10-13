@@ -739,6 +739,14 @@ impl CoreStore {
         validate_owner(&con, p)?;
         owned_media(&con, p, id)
     }
+    pub fn work_media_has_lease(&self,p:&Principal,id:&str,request:Option<&str>)->Result<bool,CoreError> {
+        let con=self.connection.lock().expect("core store mutex poisoned");
+        validate_owner(&con,p)?;
+        if owned_media(&con,p,id)?.is_none() {return Ok(false);}
+        let raw:String=con.query_row("SELECT leases_json FROM video_work_media WHERE media_id=?1",[id],|r|r.get(0))?;
+        let leases:Vec<String>=serde_json::from_str(&raw)?;
+        Ok(match request {Some(id)=>leases.iter().any(|r|r==id),None=>!leases.is_empty()})
+    }
     pub fn acquire_work_media_lease(
         &self,
         p: &Principal,
@@ -766,6 +774,19 @@ impl CoreStore {
             params![id, serde_json::to_string(&leases)?],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+    pub(crate) fn release_request_media_in_connection(con:&Connection,request:&str)->Result<(),CoreError> {
+        let rows={
+            let mut statement=con.prepare("SELECT media_id,leases_json FROM video_work_media WHERE owner_key_id=(SELECT api_key_id FROM requests WHERE id=?1) AND leases_json!='[]'")?;
+            let rows=statement.query_map([request],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (id,raw) in rows {
+            let mut leases:Vec<String>=serde_json::from_str(&raw)?;
+            leases.retain(|id|id!=request);
+            con.execute("UPDATE video_work_media SET leases_json=?2 WHERE media_id=?1",params![id,serde_json::to_string(&leases)?])?;
+        }
         Ok(())
     }
     pub fn release_work_media_leases(&self, p: &Principal, request: &str) -> Result<(), CoreError> {

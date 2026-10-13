@@ -1278,6 +1278,7 @@ impl CoreStore {
                 })),
                 now,
             )?;
+            Self::release_request_media_in_connection(&transaction,request_id)?;
             Self::insert_audit_event(
                 &transaction, "system", audit_action,
                 "request", request_id,

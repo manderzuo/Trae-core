@@ -63,8 +63,8 @@ fn read_cipher(
     m: &WorkMediaRef,
     r: &StorageRef,
 ) -> Result<Vec<u8>, String> {
-    let file = fs::File::open(path(state, &r.file)?).map_err(|_| "work_media_missing")?;
-    if file.metadata().map_err(|_| "work_media_missing")?.len() != m.size_bytes as u64
+    let file = fs::File::open(path(state, &r.file)?).map_err(|e| if e.kind()==std::io::ErrorKind::NotFound {"reference_asset_missing"} else {"reference_asset_unavailable"})?;
+    if file.metadata().map_err(|_| "reference_asset_unavailable")?.len() != m.size_bytes as u64
         || m.size_bytes > assets::MAX_ASSET_BYTES as i64 + 28
     {
         return Err("work_media_size_mismatch".into());
@@ -72,7 +72,7 @@ fn read_cipher(
     let mut bytes = Vec::new();
     file.take(assets::MAX_ASSET_BYTES as u64 + 29)
         .read_to_end(&mut bytes)
-        .map_err(|_| "work_media_missing")?;
+        .map_err(|_| "reference_asset_unavailable")?;
     Ok(bytes)
 }
 fn read_plain(
@@ -164,7 +164,7 @@ pub(crate) fn pin_kind(
                 && m.content_sha256 == digest
         });
     if let Some(ref old) = existing {
-        if old.state == "active" && old.expires_at_ms > now {
+        if old.state == "active" && (old.expires_at_ms > now || state.store.work_media_has_lease(p,&old.media_id,None).map_err(|_|"work_media_unavailable")?) {
             let current = state
                 .store
                 .owned_work_media(p, &old.media_id)
@@ -252,8 +252,8 @@ pub fn materialize(
         .owned_work_media(p, &media.media_id)
         .map_err(|_| "work_media_unavailable")?
         .ok_or("work_media_unavailable")?;
-    if m.expires_at_ms <= now {
-        return Err("work_media_expired".into());
+    if m.expires_at_ms <= now && !state.store.work_media_has_lease(p,&m.media_id,None).map_err(|_|"reference_asset_unavailable")? {
+        return Err("reference_asset_expired".into());
     }
     let r = reference(state, &m)?;
     let bytes = read_plain(state, &m, &r)?;
@@ -375,7 +375,7 @@ pub fn recover(state: &StarlinkRouterState) -> Result<usize, String> {
         let r = reference(state, &m)?;
         let ready = match read_plain(state, &m, &r) {
             Ok(_) => true,
-            Err(e) if e == "work_media_missing" => false,
+            Err(e) if e == "reference_asset_missing" => false,
             Err(e) => return Err(e),
         };
         state

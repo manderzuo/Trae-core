@@ -100,6 +100,29 @@ impl CoreStore {
         ids.into_iter().map(|id|continuation_in_connection(&connection,&id)?.ok_or(CoreError::RequestNotFound {request_id:id})).collect()
     }
 
+    /// Retry state never changes a paid identity, execution state or ledger.
+    /// Eight consecutive failures stop automatic continuation for inspection.
+    pub fn record_budget_continuation_error(&self,request:&str,code:&str,now_ms:i64)->Result<bool,CoreError> {
+        if code.is_empty() || code.len()>64 || !code.bytes().all(|b|b.is_ascii_lowercase() || b.is_ascii_digit() || b==b'_') || now_ms<0 {
+            return Err(CoreError::Validation {field:"continuation.error".into(),reason:"invalid machine code or timestamp".into()});
+        }
+        let mut con=self.connection.lock().expect("core store mutex poisoned");
+        let tx=con.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM budget_continuations c JOIN budget_operations o ON o.parent_request_id=c.request_id WHERE c.request_id=?1 AND o.execution_state IN ('ready','running','unknown') AND NOT EXISTS(SELECT 1 FROM budget_steps s WHERE s.operation_id=o.operation_id AND s.kind='video'))",[request],|r|r.get(0))?;
+        if !pending {return Ok(false);}
+        let previous:i64=tx.query_row("SELECT failures FROM budget_continuation_retries WHERE request_id=?1",[request],|r|r.get(0)).optional()?.unwrap_or(0);
+        let failures=(previous+1).min(8);
+        let attention=failures==8;
+        let delay=(5_000i64 << (failures-1)).min(300_000);
+        tx.execute("INSERT INTO budget_continuation_retries(request_id,failures,next_attempt_at_ms,state,last_error_code) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(request_id) DO UPDATE SET failures=excluded.failures,next_attempt_at_ms=excluded.next_attempt_at_ms,state=excluded.state,last_error_code=excluded.last_error_code",params![request,failures,now_ms.saturating_add(delay),if attention {"attention"}else{"retry"},code])?;
+        tx.commit()?;
+        Ok(attention)
+    }
+    pub fn budget_continuation_needs_attention(&self,request:&str)->Result<bool,CoreError> {
+        let con=self.connection.lock().expect("core store mutex poisoned");
+        Ok(con.query_row("SELECT EXISTS(SELECT 1 FROM budget_continuation_retries WHERE request_id=?1 AND state='attention')",[request],|r|r.get(0))?)
+    }
+
     /// Enumerate identities before loading protected data. One damaged row must
     /// not prevent a bounded worker from advancing to unrelated requests.
     pub fn pending_budget_continuation_ids_after(&self,after:&str,limit:usize)->Result<Vec<String>,CoreError> {
@@ -107,11 +130,11 @@ impl CoreStore {
         let connection=self.connection.lock().expect("core store mutex poisoned");
         let mut stmt=connection.prepare("SELECT c.request_id FROM budget_continuations c
             JOIN budget_operations o ON o.parent_request_id=c.request_id
-            WHERE c.request_id>?1 AND o.execution_state IN ('ready','running','unknown')
+            WHERE c.request_id>?1 AND NOT EXISTS(SELECT 1 FROM budget_continuation_retries retry WHERE retry.request_id=c.request_id AND (retry.state='attention' OR retry.next_attempt_at_ms>?3)) AND o.execution_state IN ('ready','running','unknown')
             AND EXISTS(SELECT 1 FROM budget_steps s WHERE s.operation_id=o.operation_id AND s.kind='assist' AND s.execution_state='succeeded')
             AND NOT EXISTS(SELECT 1 FROM budget_steps s WHERE s.operation_id=o.operation_id AND s.kind='video')
             ORDER BY c.request_id LIMIT ?2")?;
-        let ids=stmt.query_map(params![after,limit as i64],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let ids=stmt.query_map(params![after,limit as i64,chrono::Utc::now().timestamp_millis()],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(ids)
     }
 }

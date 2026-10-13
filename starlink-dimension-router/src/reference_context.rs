@@ -23,9 +23,9 @@ fn has_references(body:&Value)->bool {
 }
 fn context(principal:&Principal)->String {format!("seedance-reference-v1:{}",principal.key_id)}
 fn validate_image(state:&StarlinkRouterState,principal:&Principal,id:&str)->Result<i64,&'static str> {
-    let asset=crate::assets::read_owned(&state.store,&state.config.data_dir,principal,id).map_err(|_|"reference_asset_unavailable")?;
+    let asset=crate::assets::read_reference(state,principal,id)?;
     if asset.record.state!=aiwork_core::AssetState::Active || asset.record.expires_at_ms<=chrono::Utc::now().timestamp_millis() {
-        return Err("reference_asset_unavailable");
+        return Err("reference_asset_expired");
     }
     if !asset.record.mime_type.starts_with("image/") {return Err("reference_asset_type_mismatch");}
     Ok(asset.record.expires_at_ms)
@@ -94,6 +94,15 @@ pub(crate) fn recover(state:&StarlinkRouterState,principal:&Principal,body:&mut 
         if !has_references(body) {return Err("reference_image_missing");}
     }
     Ok(())
+}
+pub(crate) fn strip_body_markers(body:&mut Value) {
+    if let Some(message)=body["messages"].as_array_mut().and_then(|m|m.iter_mut().rev().find(|m|m["role"]=="user")) {
+        match &mut message["content"] {
+            Value::String(s)=>*s=strip_markers(s),
+            Value::Array(parts)=>for part in parts {if let Some(s)=part["text"].as_str() {part["text"]=json!(strip_markers(s));}},
+            _=>{},
+        }
+    }
 }
 fn strip_markers(s:&str)->String {
     let mut result=String::new();let mut tail=s;

@@ -942,3 +942,15 @@ CREATE TABLE video_work_contexts (
 CREATE UNIQUE INDEX video_work_version_handle ON video_work_contexts(version_id) WHERE version_id IS NOT NULL;
 CREATE UNIQUE INDEX video_work_pending_handle ON video_work_contexts(work_id) WHERE version_id IS NULL;
 "#;
+
+
+pub(crate) const SCHEMA_V31: &str = r#"
+CREATE TABLE IF NOT EXISTS budget_continuation_retries (
+  request_id TEXT PRIMARY KEY REFERENCES budget_continuations(request_id) ON DELETE CASCADE,
+  failures INTEGER NOT NULL CHECK(failures BETWEEN 1 AND 8),
+  next_attempt_at_ms INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('retry','attention')),
+  last_error_code TEXT NOT NULL CHECK(length(last_error_code) BETWEEN 1 AND 64)
+);
+CREATE INDEX IF NOT EXISTS budget_continuation_retries_due ON budget_continuation_retries(state,next_attempt_at_ms);
+"#;

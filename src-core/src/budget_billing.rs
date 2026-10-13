@@ -1114,6 +1114,7 @@ impl CoreStore {
             }
         })?;
         if current_operation == terminal {
+            Self::release_request_media_in_connection(&transaction,parent_request_id)?;
             transaction.commit()?;
             return Ok(BudgetMutation::Duplicate);
         }
@@ -1138,6 +1139,10 @@ impl CoreStore {
         )?;
         if changed != 1 {
             return Err(CoreError::IdempotencyConflict);
+        }
+        Self::release_request_media_in_connection(&transaction,parent_request_id)?;
+        if matches!(terminal,BudgetExecutionState::Failed|BudgetExecutionState::Canceled) {
+            transaction.execute("UPDATE video_work_versions SET state='failed',updated_at_ms=?2 WHERE operation_request_id=?1 AND state IN ('preparing','running','unknown')",params![parent_request_id,now])?;
         }
         if let Some(result)=result {
             let has_video:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM budget_steps WHERE operation_id=?1 AND kind='video')",[&operation_id],|r|r.get(0))?;
@@ -1979,7 +1984,8 @@ impl CoreStore {
                 error_code: Some("budget_preparation_aborted".into()),
             })),
             now,
-        )
+        )?;
+        Self::release_request_media_in_connection(connection,request_id)
     }
 
     pub fn begin_budget_operation(

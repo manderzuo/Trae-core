@@ -267,8 +267,7 @@ fn normalized_original(
                 .ok_or("invalid_reference_context")?;
             for id in ids {
                 let id = id.as_str().ok_or("invalid_reference_context")?;
-                crate::assets::read_owned(&state.store, &state.config.data_dir, p, id)
-                    .map_err(|_| "reference_asset_unavailable")?;
+                crate::assets::read_reference(state,p,id)?;
             }
         }
     }
@@ -344,13 +343,7 @@ fn pin_and_bind(
         }
         for field in ["image_asset_ids", "video_asset_ids"] {
             for id in original[field].as_array().into_iter().flatten() {
-                let owned = crate::assets::read_owned(
-                    &state.store,
-                    &state.config.data_dir,
-                    p,
-                    id.as_str().ok_or("invalid_reference_context")?,
-                )
-                .map_err(|_| "reference_asset_unavailable")?;
+                let owned = crate::assets::read_reference(state,p,id.as_str().ok_or("invalid_reference_context")?)?;
                 if uploaded_tail && field=="video_asset_ids" {
                     let frame=state.bridge_client().reference_last_frame(&p.key_id,&owned.bytes)?;
                     let parsed=crate::assets::ParsedAssetUpload {filename:"reference-tail.png".into(),declared_mime:Some("image/png".into()),bytes:frame.bytes};
@@ -516,7 +509,7 @@ pub(crate) async fn execute(
         let owner = p.clone();
         let frozen = binding.clone();
         let b = base.clone();
-        let raw = original.clone();
+        let raw = crate::budget_continuation::restore_inputs(&state,&p,&request,&original)?;
         let mut normalized = tokio::task::spawn_blocking(move || {
             normalized_original(&s, &owner, raw, b.as_ref(), &frozen)
         })

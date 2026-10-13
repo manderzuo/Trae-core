@@ -18,7 +18,7 @@ pub(crate) fn fail(code:&str)->Response {
         "work_parent_unavailable"|"frame_result_not_ready"|"video_not_ready"|"budget_identity_conflict"|"video_continuation_not_active"=>StatusCode::CONFLICT,
         "invalid_budget_business_request"|"invalid_chat_image"|"reference_video_metadata_invalid"|
         "reference_video_format_unsupported"|"reference_asset_type_mismatch"|"reference_resource_unavailable"|
-        "reference_asset_unavailable"|"reference_video_budget_metadata_required"|
+        "reference_asset_unavailable"|"reference_asset_expired"|"reference_asset_missing"|"reference_video_budget_metadata_required"|
         "video_safety_check_failed"|"reference_safety_check_failed"|"prompt_safety_check_failed"=>StatusCode::BAD_REQUEST,
         "video_execution_failed"=>StatusCode::UNPROCESSABLE_ENTITY,
         "assist_execution_failed"|"chat_upstream_error"|"chat_stream_read_failed"|"chat_stream_incomplete"|
@@ -92,6 +92,7 @@ pub(crate) fn prepare_step(state:&StarlinkRouterState,principal:&Principal,paren
         // whose full request/Key binding was checked above.
         let _=post(&client,"/internal/bridge/v2/budgets/cancel",&serde_json::to_value(&prepared).map_err(|_|"budget encoding failed")?,request);
         return Err(match error {
+            aiwork_core::CoreError::BillingQuoteExpired{..}=>"budget_policy_expired".into(),
             aiwork_core::CoreError::KeyConcurrencyExceeded{..}=>"key_concurrency_exceeded".into(),
             aiwork_core::CoreError::QuotaInsufficient{..}|aiwork_core::CoreError::QuotaPoolInsufficient{..}=>"quota_insufficient".into(),
             _=>error.to_string(),
@@ -167,7 +168,12 @@ pub(crate) async fn video_status(state:Arc<StarlinkRouterState>,principal:Princi
                     && !op.steps.iter().any(|s|s.kind==BudgetStepKind::Video)
                     && op.steps.iter().all(|s|matches!(s.execution_state,aiwork_core::BudgetExecutionState::Succeeded|aiwork_core::BudgetExecutionState::Failed|aiwork_core::BudgetExecutionState::Canceled)));
                 let unconfirmed_assist=operation.as_ref().is_some_and(|op|op.steps.iter().any(|s|s.kind==BudgetStepKind::Assist && s.execution_state==aiwork_core::BudgetExecutionState::Unknown));
-                let mut reply=json!({"task":{"id":request,"status":if failed || no_video_submitted {"failed"}else if unconfirmed_assist {"processing"}else{"queued"}},"request_id":request});
+                let attention=state.store.budget_continuation_needs_attention(&request).map_err(|_|"budget_checkpoint_unavailable")?;
+                let mut reply=json!({"task":{"id":request,"status":if failed || no_video_submitted {"failed"}else if unconfirmed_assist || attention {"processing"}else{"queued"}},"request_id":request});
+                if attention && !failed && !no_video_submitted {
+                    reply["task"]["stage"]=json!("continuation_requires_attention");
+                    reply["task"]["notice"]=failure_feedback(&state,&Failure::from("budget_continuation_requires_attention"),&request)["error"].clone();
+                }
                 if no_video_submitted {
                     reply["task"]["stage"]=json!("no_video_submitted");
                     reply["task"]["error"]=failure_feedback(&state,&Failure::from("video_not_submitted"),&request)["error"].clone();
@@ -289,6 +295,7 @@ pub(crate) async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Princ
         return Err(failure.unwrap_or_else(||Failure::from(code)));
     }
     if state.config.work_context_for_key(&principal.key_id) {return crate::work_execution::execute(state,principal,request,original,fresh,dispatch_only).await;}
+    original=crate::budget_continuation::restore_inputs(&state,&principal,&request,&original)?;
     state.seedance_results.progress(&request,Stage::Assistant);
     let assist=if let Some(step)=operation.and_then(|op|op.steps.into_iter().find(|s|s.kind==BudgetStepKind::Assist)) {step} else {
         if !fresh {return Err("budget_preparation_requires_recovery".into());}
@@ -578,7 +585,7 @@ fn definite_failure_code(code:&str)->bool {
         "quota_insufficient"|"budget_policy_unconfigured"|"budget_policy_expired"|"budget_policy_invalid"|
         "reference_video_budget_metadata_required"|"invalid_budget_business_request"|"reference_image_limit"|
         "reference_video_metadata_invalid"|"reference_video_format_unsupported"|"reference_asset_type_mismatch"|
-        "reference_resource_unavailable"|"reference_resource_download_failed"|
+        "reference_resource_unavailable"|"reference_resource_download_failed"|"reference_asset_expired"|"reference_asset_missing"|
         "invalid_image_asset_ids"|"invalid_reference_image"|"video_continuation_not_authorized"|"video_continuation_not_active"|
         "work_parent_required"|"work_decision_invalid"|"work_spec_unsupported"|"continuation_mode_unsupported"|
         "source_video_not_ready"|"source_video_unavailable"|"source_video_invalid"|"source_video_identity_invalid"|

@@ -9,13 +9,63 @@ pub(crate) fn save_with_headers(state:&StarlinkRouterState,principal:&aiwork_cor
     }
     let fingerprint=state.store.request_fingerprint_for_billing(request).map_err(|_|"checkpoint request missing")?;
     let context=format!("budget-continuation-v1:{request}:{}:{fingerprint}",principal.key_id);
-    let stored=if state.config.work_context_for_key(&principal.key_id) {
-        let mut binding=crate::work_execution::freeze_context(state,principal,headers,body)?;
-        if body.get("messages").is_none() && body["prompt"].as_str().is_some_and(|s|!s.trim().is_empty()) && binding.work_id.is_none() && binding.clarification.is_none() {
-            binding.work_id=Some(state.store.create_video_work(principal,&binding.association).map_err(|_|"work_context_unavailable")?.work_id);
+    let mut binding=if state.config.work_context_for_key(&principal.key_id) {
+        Some(crate::work_execution::freeze_context(state,principal,headers,body)?)
+    }else{None};
+    let mut normalized=body.clone();
+    if normalized.get("messages").is_none() {normalized["messages"]=serde_json::json!([{"role":"user","content":normalized["prompt"]}]);}
+    let needs_inputs=!crate::work_planner::clear_reference(&crate::work_planner::current_text(&normalized))
+        && !binding.as_ref().is_some_and(|b|b.clarification.is_some())
+        && crate::work_planner::read_only_decision(body,binding.as_ref().is_some_and(|b|b.base_version_id.is_some())).is_none();
+    if let Err(code)=if needs_inputs {crate::reference_context::recover(state,principal,&mut normalized)} else {Ok(())} {
+        // Inherited references are resolved from the immutable parent snapshot.
+        if code!="reference_image_missing" || binding.as_ref().and_then(|b|b.base_version_id.as_ref()).is_none() {return Err(code.into());}
+    }
+    let has_assets=["image_asset_ids","video_asset_ids"].iter().any(|f|normalized[*f].as_array().is_some_and(|v|!v.is_empty()));
+    let mut retained=serde_json::Map::new();
+    if needs_inputs && has_assets {
+        aiwork_core::require_scope(principal,"assets:write").map_err(|_|"insufficient_scope")?;
+        let association=binding.as_ref().map(|b|b.association.clone()).unwrap_or_else(||format!("checkpoint:{request}"));
+        let work=match binding.as_ref().and_then(|b|b.work_id.clone()) {
+            Some(id)=>id,
+            None=>state.store.create_video_work(principal,&association).map_err(|_|"work_context_unavailable")?.work_id,
+        };
+        if let Some(b)=binding.as_mut() {b.work_id=Some(work.clone());}
+        for field in ["image_asset_ids","video_asset_ids"] {
+            let mut ids=Vec::new();
+            for id in normalized[field].as_array().into_iter().flatten() {
+                let owned=crate::assets::read_reference(state,principal,id.as_str().ok_or("invalid_reference_context")?)?;
+                let upload=crate::assets::ParsedAssetUpload {filename:owned.record.filename,declared_mime:Some(owned.record.mime_type),bytes:owned.bytes};
+                let media=crate::work_media::pin(state,principal,&work,&upload,chrono::Utc::now().timestamp_millis())?;
+                state.store.acquire_work_media_lease(principal,&media.media_id,request).map_err(|_|"work_media_unavailable")?;
+                ids.push(media.media_id);
+            }
+            retained.insert(field.into(),serde_json::json!(ids));
         }
-        serde_json::json!({"format":"aiwork-work-checkpoint-v1","body":body,"binding":binding})
-    }else{body.clone()};
+    }
+    if needs_inputs && !has_assets && crate::budget_flow::inline_images(&normalized)?.is_empty() && body["action"]!="create" {
+        if let Some(version_id)=binding.as_ref().and_then(|b|b.base_version_id.as_ref()) {
+            let version=state.store.owned_work_version(principal,version_id).map_err(|_|"work_context_unavailable")?.ok_or("work_context_unavailable")?;
+            let snapshot=crate::work_context::read_snapshot(state,principal,&version)?;
+            let mut images=Vec::new();let mut videos=Vec::new();
+            for id in snapshot.user_media_ids {
+                let media=state.store.owned_work_media(principal,&id).map_err(|_|"reference_asset_unavailable")?.ok_or("reference_asset_missing")?;
+                if media.expires_at_ms<=chrono::Utc::now().timestamp_millis() && !state.store.work_media_has_lease(principal,&id,None).map_err(|_|"reference_asset_unavailable")? {return Err("reference_asset_expired".into());}
+                state.store.acquire_work_media_lease(principal,&id,request).map_err(|_|"work_media_unavailable")?;
+                if media.kind=="video" {videos.push(id);} else {images.push(id);}
+            }
+            if !images.is_empty(){retained.insert("image_asset_ids".into(),serde_json::json!(images));}
+            if !videos.is_empty(){retained.insert("video_asset_ids".into(),serde_json::json!(videos));}
+        }
+    }
+    if let Some(b)=binding.as_mut() {
+        if body.get("messages").is_none() && body["prompt"].as_str().is_some_and(|s|!s.trim().is_empty()) && b.work_id.is_none() && b.clarification.is_none() {
+            b.work_id=Some(state.store.create_video_work(principal,&b.association).map_err(|_|"work_context_unavailable")?.work_id);
+        }
+    }
+    // The original body remains the immutable request fingerprint. Only this
+    // authenticated envelope holds the owned material used during recovery.
+    let stored=serde_json::json!({"format":"aiwork-checkpoint-v2","body":body,"binding":binding,"retained_inputs":retained});
     let plaintext=zeroize::Zeroizing::new(serde_json::to_string(&stored).map_err(|_|"checkpoint encoding failed")?);
     let encrypted=state.key_vault.encrypt(&context,&plaintext).map_err(|_|"checkpoint encryption failed")?;
     state.store.save_budget_continuation(principal,request,body,encrypted.key_version,&encrypted.ciphertext).map_err(|_|"checkpoint persistence failed")?;
@@ -24,12 +74,46 @@ pub(crate) fn save_with_headers(state:&StarlinkRouterState,principal:&aiwork_cor
 
 pub(crate) fn decode_checkpoint(raw:&str)->Result<(serde_json::Value,Option<crate::work_execution::ContextBinding>),String> {
     let v:serde_json::Value=serde_json::from_str(raw).map_err(|_|"budget_checkpoint_invalid")?;
-    if v["format"]=="aiwork-work-checkpoint-v1" {
-        let binding=serde_json::from_value(v["binding"].clone()).map_err(|_|"budget_checkpoint_invalid")?;
+    if v["format"]=="aiwork-work-checkpoint-v1" || v["format"]=="aiwork-checkpoint-v2" {
+        let binding=if v["binding"].is_null() {None} else {Some(serde_json::from_value(v["binding"].clone()).map_err(|_|"budget_checkpoint_invalid")?)};
         if !v["body"].is_object(){return Err("budget_checkpoint_invalid".into());}
-        Ok((v["body"].clone(),Some(binding)))
+        Ok((v["body"].clone(),binding))
     }else{Ok((v,None))}
 }
+pub(crate) fn restore_inputs(state:&StarlinkRouterState,p:&aiwork_core::Principal,request:&str,body:&serde_json::Value)->Result<serde_json::Value,String> {
+    let Some(saved)=state.store.budget_continuation(request).map_err(|_|"budget_checkpoint_unavailable")? else {return Ok(body.clone());};
+    let raw=zeroize::Zeroizing::new(state.key_vault.decrypt(&saved.encryption_context(),saved.key_version,&saved.ciphertext).map_err(|_|"budget_checkpoint_invalid")?);
+    let envelope:serde_json::Value=serde_json::from_str(&raw).map_err(|_|"budget_checkpoint_invalid")?;
+    let (original,_)=decode_checkpoint(&raw)?;
+    if aiwork_core::canonical_json_hash(&original)!=aiwork_core::canonical_json_hash(body) {return Err("budget_checkpoint_invalid".into());}
+    if envelope["format"]!="aiwork-checkpoint-v2" {
+        for field in ["image_asset_ids","video_asset_ids"] {
+            for id in body[field].as_array().into_iter().flatten() {
+                crate::assets::read_reference(state,p,id.as_str().ok_or("invalid_reference_context")?)?;
+            }
+        }
+        return Ok(body.clone());
+    }
+    let mut restored=body.clone();
+    if envelope["retained_inputs"].as_object().is_some_and(|m|!m.is_empty()) {
+        crate::reference_context::strip_body_markers(&mut restored);
+    }
+    for field in ["image_asset_ids","video_asset_ids"] {
+        if let Some(ids)=envelope["retained_inputs"][field].as_array() {
+            let mut assets=Vec::new();
+            for id in ids {
+                let id=id.as_str().ok_or("budget_checkpoint_invalid")?;
+                let media=state.store.owned_work_media(p,id).map_err(|_|"reference_asset_unavailable")?.ok_or("reference_asset_missing")?;
+                if !state.store.work_media_has_lease(p,id,Some(request)).map_err(|_|"reference_asset_unavailable")? {return Err("budget_checkpoint_invalid".into());}
+                let asset=crate::work_media::materialize(state,p,&media,chrono::Utc::now().timestamp_millis())?;
+                assets.push(asset.id);
+            }
+            restored[field]=serde_json::json!(assets);
+        }
+    }
+    Ok(restored)
+}
+
 pub(crate) fn spawn(state:&Arc<StarlinkRouterState>) {
     if !state.config.budget_billing_v2 {return;}
     let maintenance=Arc::downgrade(state);
@@ -72,16 +156,24 @@ pub(crate) fn spawn(state:&Arc<StarlinkRouterState>) {
                     let checkpoint=match tokio::task::spawn_blocking(move ||store.budget_continuation(&id)).await {
                         Ok(Ok(Some(checkpoint)))=>checkpoint,
                         Ok(Ok(None))=>return,
-                        _=>{eprintln!("v2 continuation {request}: checkpoint unavailable; other requests continue");return;},
+                        _=>{record_error(&state,&request,"budget_checkpoint_invalid");return;},
                     };
                     if let Err(code)=crate::budget_flow::resume_checkpoint(state.clone(),checkpoint).await {
                         crate::budget_flow::finish_definite_failure(&state,&request,&code);
-                        let safe=crate::budget_errors::public_code(&code).unwrap_or("budget_continuation_requires_attention");
-                        eprintln!("v2 continuation {request}: {safe}");
+                        record_error(&state,&request,&code);
                     }
                 });
             }
             if consumed_page && !full_page {after.clear();}
         }
     });
+}
+
+fn record_error(state:&StarlinkRouterState,request:&str,code:&str) {
+    let safe=crate::budget_errors::public_code(code).unwrap_or("budget_continuation_requires_attention");
+    match state.store.record_budget_continuation_error(request,safe,chrono::Utc::now().timestamp_millis()) {
+        Ok(true)=>eprintln!("v2 continuation {request}: attention required after bounded retries: {safe}"),
+        Ok(false)=>eprintln!("v2 continuation {request}: {safe}"),
+        Err(_)=>eprintln!("v2 continuation {request}: retry persistence unavailable"),
+    }
 }

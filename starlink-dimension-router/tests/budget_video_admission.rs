@@ -752,7 +752,13 @@ async fn run_case_with_fault(probe:bool,stream:bool,video_intent:bool,reference:
                     input["messages"][0]["content"][1].clone()
                 ]);
             }
-            assert_eq!(serde_json::from_str::<Value>(&restored).unwrap(),expected_checkpoint);
+            let restored:Value=serde_json::from_str(&restored).unwrap();
+            if resume_helper {
+                assert_eq!(restored,expected_checkpoint,"legacy checkpoints remain immutable and readable");
+            } else {
+                assert_eq!(restored["format"],"aiwork-checkpoint-v2");
+                assert_eq!(restored["body"],expected_checkpoint);
+            }
             assert_eq!(op.steps.len(),if video_intent {2} else {1});assert_eq!(op.steps.iter().map(|s|s.hold_credits.as_microcredits()).sum::<i64>(),if video_intent {42_000_000} else {2_000_000});
             assert_eq!(op.steps[0].financial_state,aiwork_core::BudgetFinancialState::Held);
             assert_eq!(store.active_execution_count_for_key(&k.id).unwrap(),0);

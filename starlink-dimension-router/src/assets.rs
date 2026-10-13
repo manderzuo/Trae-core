@@ -346,6 +346,17 @@ pub fn cleanup_expired_assets_once(store: &CoreStore, data_dir: &Path, now_ms: i
     }
 }
 
+pub(crate) fn read_reference(state:&crate::state::StarlinkRouterState,p:&Principal,id:&str)->Result<StoredAssetBytes,&'static str> {
+    let record=state.store.asset_for_user(p,id).map_err(|_|"reference_asset_unavailable")?.ok_or("reference_asset_missing")?;
+    if record.state!=AssetState::Active || record.expires_at_ms<=Utc::now().timestamp_millis() {return Err("reference_asset_expired");}
+    let bytes=read_record_bytes(&state.config.data_dir,&record).map_err(|e|match e {AssetError::NotFound=>"reference_asset_missing",_=>"reference_asset_unavailable"})?;
+    Ok(StoredAssetBytes {record,bytes})
+}
+
+fn read_error(error:std::io::Error)->AssetError {
+    if error.kind()==std::io::ErrorKind::NotFound {AssetError::NotFound} else {AssetError::Storage(error.to_string())}
+}
+
 pub fn read_owned(
     store: &CoreStore,
     data_dir: &Path,
@@ -354,7 +365,7 @@ pub fn read_owned(
 ) -> Result<StoredAssetBytes, AssetError> {
     let record = store
         .asset_for_user(principal, asset_id)
-        .map_err(|_| AssetError::NotFound)?
+        .map_err(|e| AssetError::Storage(e.to_string()))?
         .ok_or(AssetError::NotFound)?;
     let bytes = read_record_bytes(data_dir, &record)?;
     Ok(StoredAssetBytes { record, bytes })
@@ -452,10 +463,10 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), AssetError> {
 
 fn read_record_bytes(data_dir: &Path, record: &CoreAsset) -> Result<Vec<u8>, AssetError> {
     let path = storage_path(data_dir, &record.storage_ref).map_err(|_| AssetError::NotFound)?;
-    let root = asset_dir(data_dir).canonicalize().map_err(|_| AssetError::NotFound)?;
-    let canonical = fs::canonicalize(&path).map_err(|_| AssetError::NotFound)?;
+    let root = asset_dir(data_dir).canonicalize().map_err(read_error)?;
+    let canonical = fs::canonicalize(&path).map_err(read_error)?;
     if !canonical.starts_with(&root) { return Err(AssetError::NotFound); }
-    let bytes = fs::read(canonical).map_err(|_| AssetError::NotFound)?;
+    let bytes = fs::read(canonical).map_err(read_error)?;
     if bytes.len() as i64 != record.size || format!("{:x}", Sha256::digest(&bytes)) != record.sha256 {
         return Err(AssetError::NotFound);
     }

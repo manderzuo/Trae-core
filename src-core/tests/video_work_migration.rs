@@ -4,7 +4,8 @@ use serde_json::json;
 use std::{collections::BTreeSet, fs};
 
 #[test]
-fn v29_to_v30_preserves_ledger_and_unknown_holds() {
+fn v29_and_v30_to_current_preserve_ledger_and_unknown_holds() {
+    for version in [29,30] {
     let dir = std::env::temp_dir().join(format!("video-work-migration-{}", rand::random::<u64>()));
     let store = CoreStore::open(&dir).unwrap();
     store.migrate().unwrap();
@@ -45,18 +46,23 @@ fn v29_to_v30_preserves_ledger_and_unknown_holds() {
     let db = dir.join("data").join(CORE_DB_FILE);
     let con = Connection::open(&db).unwrap();
     con.execute("INSERT INTO quota_reservations (id,user_id,request_id,resource_kind,amount,state,expires_at_ms,created_at_ms,api_key_id) VALUES ('unknown-hold','admin',?1,'credits',123000000,'held',9999999999999,1,?2)", params![request.id,key.id]).unwrap();
-    con.execute_batch("DROP TABLE IF EXISTS video_work_contexts; DROP TABLE IF EXISTS video_work_versions; DROP TABLE IF EXISTS video_work_media; DROP TABLE IF EXISTS video_works; UPDATE schema_meta SET value='29' WHERE key='schema_version';").unwrap();
+    if version==29 {
+        con.execute_batch("DROP TABLE IF EXISTS video_work_contexts; DROP TABLE IF EXISTS video_work_versions; DROP TABLE IF EXISTS video_work_media; DROP TABLE IF EXISTS video_works;").unwrap();
+    }
+    con.execute("DROP TABLE budget_continuation_retries",[]).unwrap();
+    con.execute("UPDATE schema_meta SET value=?1 WHERE key='schema_version'",[version.to_string()]).unwrap();
     let before = snapshot(&con);
     drop(con);
     let reopened = CoreStore::open(&dir).unwrap();
     reopened.migrate().unwrap();
     reopened.migrate().unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 30);
+    assert_eq!(reopened.schema_version().unwrap(), aiwork_core::CURRENT_SCHEMA_VERSION);
     for name in [
         "video_works",
         "video_work_versions",
         "video_work_media",
         "video_work_contexts",
+        "budget_continuation_retries",
     ] {
         assert_eq!(reopened.table_count(name).unwrap(), 1);
     }
@@ -73,6 +79,7 @@ fn v29_to_v30_preserves_ledger_and_unknown_holds() {
     drop(con);
     drop(reopened);
     fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 fn snapshot(con: &Connection) -> Vec<String> {

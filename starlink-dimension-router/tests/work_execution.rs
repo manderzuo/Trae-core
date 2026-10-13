@@ -604,3 +604,136 @@ async fn unknown_execution_keeps_original_hold() {
     assert_eq!(result["request_id"], request);
     assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst), 1);
 }
+
+
+#[tokio::test]
+async fn retained_input_survives_restart_after_helper_before_version_binding() {
+    let f=Fixture::with_continuation(true);let body=uploaded_tail(&f);
+    f.bridge.frame_failure.store(true,Ordering::SeqCst);
+    let response=f.response(&f.key,"retain-before-helper",&body).await;
+    let _=to_bytes(response.into_body(),256*1024).await.unwrap();
+    let request=f.bridge.claims.lock().unwrap().values().find(|v|v["step_kind"]=="assist").unwrap()["parent_request_id"].as_str().unwrap().to_owned();
+    assert!(f.state.store.work_version_for_request(&f.owner,&request).unwrap().is_none());
+    let db=rusqlite::Connection::open(f.dir.join("data/core.sqlite3")).unwrap();
+    db.execute("UPDATE assets SET created_at_ms=0,expires_at_ms=1",[]).unwrap();
+    starlink_dimension_router::assets::cleanup_expired_assets_once(&f.state.store,&f.dir,chrono::Utc::now().timestamp_millis()).unwrap();
+    // Workflow ownership, rather than a fixed TTL, must protect the bytes.
+    db.execute("UPDATE video_work_media SET expires_at_ms=1",[]).unwrap();
+    starlink_dimension_router::work_media::cleanup(&f.state,chrono::Utc::now().timestamp_millis()).unwrap();
+    f.bridge.frame_failure.store(false,Ordering::SeqCst);
+    let store=Arc::new(CoreStore::open(&f.dir).unwrap());store.migrate().unwrap();
+    let state=StarlinkRouterState::for_test(store,BridgeClient::from_transport("http://bridge","bridge-only",f.bridge.clone()),f.state.config.clone());
+    let app=starlink_dimension_router::server::build_router(state.clone());
+    let reply=app.oneshot(Request::post("/v1/chat/completions").header("authorization",format!("Bearer {}",f.key)).header("idempotency-key","retain-before-helper").header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+    let value:Value=serde_json::from_slice(&to_bytes(reply.into_body(),256*1024).await.unwrap()).unwrap();
+    assert!(value.get("error").is_none(),"{value}");
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),1);
+    assert_eq!(state.store.budget_operation(&request).unwrap().unwrap().execution_state,aiwork_core::BudgetExecutionState::Succeeded);
+    let leases:i64=db.query_row("SELECT COUNT(*) FROM video_work_media WHERE leases_json!='[]'",[],|r|r.get(0)).unwrap();
+    assert_eq!(leases,0,"completed workflows must release retained input leases");
+}
+
+#[tokio::test]
+async fn expired_prepared_video_budget_finishes_without_replaying_helper_or_clearing_its_hold() {
+    let f=Fixture::new();let body=create();
+    f.bridge.expired_video_budget.store(true,Ordering::SeqCst);
+    let response=f.response(&f.key,"expired-prepared-video",&body).await;
+    let value:Value=serde_json::from_slice(&to_bytes(response.into_body(),256*1024).await.unwrap()).unwrap();
+    assert_eq!(value["error"]["code"],"budget_policy_expired","{value}");
+    let request=value["request_id"].as_str().unwrap();
+    let op=f.state.store.budget_operation(request).unwrap().unwrap();
+    assert_eq!(op.execution_state,aiwork_core::BudgetExecutionState::Failed);
+    assert_eq!(op.steps.len(),1);assert_eq!(op.steps[0].financial_state,aiwork_core::BudgetFinancialState::Held);
+    assert_eq!(f.state.store.work_version_for_request(&f.owner,request).unwrap().unwrap().state,aiwork_core::WorkVersionState::Failed);
+    f.bridge.expired_video_budget.store(false,Ordering::SeqCst);
+    let replay=f.response(&f.key,"expired-prepared-video",&body).await;
+    let replay:Value=serde_json::from_slice(&to_bytes(replay.into_body(),256*1024).await.unwrap()).unwrap();
+    assert_eq!(replay["error"]["code"],"budget_policy_expired");
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+}
+
+
+#[tokio::test]
+async fn legacy_missing_or_expired_inputs_end_only_proven_finished_workflows() {
+    for mode in ["expired","missing","temporary","unknown"] {
+        let f=Fixture::with_continuation(true);let body=uploaded_tail(&f);
+        f.bridge.frame_failure.store(true,Ordering::SeqCst);
+        let response=f.response(&f.key,mode,&body).await;
+        let _=to_bytes(response.into_body(),256*1024).await.unwrap();
+        let request=f.bridge.claims.lock().unwrap().values().find(|v|v["step_kind"]=="assist").unwrap()["parent_request_id"].as_str().unwrap().to_owned();
+        let checkpoint=f.state.store.budget_continuation(&request).unwrap().unwrap();
+        let plain=f.state.key_vault.decrypt(&checkpoint.encryption_context(),checkpoint.key_version,&checkpoint.ciphertext).unwrap();
+        let mut envelope:Value=serde_json::from_str(&plain).unwrap();
+        envelope["format"]=json!("aiwork-work-checkpoint-v1");
+        envelope.as_object_mut().unwrap().remove("retained_inputs");
+        let sealed=f.state.key_vault.encrypt(&checkpoint.encryption_context(),&envelope.to_string()).unwrap();
+        let db=rusqlite::Connection::open(f.dir.join("data/core.sqlite3")).unwrap();
+        db.execute("UPDATE budget_continuations SET ciphertext=?1,key_version=?2 WHERE request_id=?3",rusqlite::params![sealed.ciphertext,sealed.key_version,request]).unwrap();
+        let asset=f.state.store.asset_for_user(&f.owner,body["video_asset_ids"][0].as_str().unwrap()).unwrap().unwrap();
+        let path=f.dir.join("data").join(&asset.storage_ref);
+        if mode=="expired" || mode=="unknown" {db.execute("UPDATE assets SET created_at_ms=0,expires_at_ms=1",[]).unwrap();}
+        else {std::fs::remove_file(&path).unwrap();if mode=="temporary" {std::fs::create_dir(&path).unwrap();}}
+        if mode=="unknown" {db.execute("UPDATE budget_steps SET execution_state='unknown' WHERE request_id!=?1",[&request]).unwrap();}
+        if mode=="expired" {
+            let step=f.state.store.budget_operation(&request).unwrap().unwrap().steps[0].clone();
+            f.state.store.apply_budget_receipt(aiwork_core::BudgetReceiptInput {
+                budget_id:step.budget_id,account_ref:step.account_ref,bridge_instance_id:step.bridge_instance_id,
+                receipt:serde_json::from_value(json!({"request_id":step.request_id,"status":"final","actual_credits":"1.250000","unit":"credits","source_ref":"fixture-settled-helper","task_ref":null,"observed_at_ms":chrono::Utc::now().timestamp_millis()})).unwrap(),
+            }).unwrap();
+        }
+        let before=f.state.store.budget_operation(&request).unwrap().unwrap();
+        if mode=="expired" {assert_eq!(before.steps[0].financial_state,aiwork_core::BudgetFinancialState::Settled);}
+        let response=f.response(&f.key,mode,&body).await;
+        let value:Value=serde_json::from_slice(&to_bytes(response.into_body(),256*1024).await.unwrap()).unwrap();
+        let expected=match mode {"expired"|"unknown"=>"reference_asset_expired","missing"=>"reference_asset_missing",_=>"reference_asset_unavailable"};
+        assert_eq!(value["error"]["code"],expected,"{mode}: {value}");
+        let after=f.state.store.budget_operation(&request).unwrap().unwrap();
+        assert_eq!(after.execution_state==aiwork_core::BudgetExecutionState::Failed,matches!(mode,"expired"|"missing"));
+        assert_eq!(after.steps,before.steps,"input loss cannot alter a helper's financial or dispatch facts");
+        assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+    }
+}
+
+
+#[tokio::test]
+async fn persisted_continuation_backoff_skips_poisoned_work_and_survives_restart() {
+    let f=Fixture::with_max_concurrency(4);
+    *f.bridge.video_prepare_error.lock().unwrap()=Some((429,"bridge_workers_busy".into()));
+    for id in ["retry-a","retry-b","retry-c"] {let reply=f.response(&f.key,id,&create()).await;let _=to_bytes(reply.into_body(),256*1024).await.unwrap();}
+    let mut ids=f.state.store.pending_budget_continuation_ids_after("",100).unwrap();ids.sort();
+    assert_eq!(ids.len(),3);
+    let db=rusqlite::Connection::open(f.dir.join("data/core.sqlite3")).unwrap();
+    db.execute("INSERT INTO budget_continuation_retries(request_id,failures,next_attempt_at_ms,state,last_error_code) VALUES (?1,1,?2,'retry','reference_asset_unavailable')",rusqlite::params![ids[0],chrono::Utc::now().timestamp_millis()+60_000]).unwrap();
+    let reopened=CoreStore::open(&f.dir).unwrap();reopened.migrate().unwrap();
+    assert_eq!(reopened.pending_budget_continuation_ids_after("",100).unwrap(),ids[1..]);
+    for attempt in 2..=8 {
+        assert_eq!(reopened.record_budget_continuation_error(&ids[0],"reference_asset_unavailable",100_000).unwrap(),attempt==8);
+        let (failures,due):(i64,i64)=db.query_row("SELECT failures,next_attempt_at_ms FROM budget_continuation_retries WHERE request_id=?1",[&ids[0]],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(failures,attempt);assert!(due>=110_000 && due<=400_000);
+    }
+    assert!(reopened.budget_continuation_needs_attention(&ids[0]).unwrap());
+    let status=f.app.clone().oneshot(Request::get(format!("/v1/videos/{}",ids[0])).header("authorization",format!("Bearer {}",f.key)).body(Body::empty()).unwrap()).await.unwrap();
+    let value:Value=serde_json::from_slice(&to_bytes(status.into_body(),256*1024).await.unwrap()).unwrap();
+    assert_eq!(value["task"]["status"],"processing","{value}");
+    assert_eq!(value["task"]["stage"],"continuation_requires_attention");
+    assert_eq!(value["task"]["notice"]["code"],"budget_continuation_requires_attention");
+    assert_eq!(value["task"]["notice"]["billing_state"],"pending");
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+    assert_eq!(reopened.pending_budget_continuation_ids_after("",100).unwrap(),ids[1..]);
+    assert_eq!(reopened.active_execution_count_for_key(&f.owner.key_id).unwrap(),3,"attention must preserve unknown holds and execution");
+}
+
+
+#[tokio::test]
+async fn retained_input_lease_ends_when_helper_returns_read_only_answer() {
+    let f=Fixture::new();let mut body=create();
+    let stored=starlink_dimension_router::assets::write_asset(&f.dir,&f.owner,starlink_dimension_router::assets::ParsedAssetUpload {filename:"reference.png".into(),declared_mime:Some("image/png".into()),bytes:b"\x89PNG\r\n\x1a\nfixture".to_vec()}).unwrap();
+    let asset=starlink_dimension_router::assets::persist_asset(&f.state.store,&f.owner,&stored).unwrap();
+    body["image_asset_ids"]=json!([asset.id]);
+    *f.bridge.helper_decision.lock().unwrap()=Some(json!({"action":"clarify","effective_prompt":null,"spec_patch":{},"reference_policy":"inherit","clarification":"请说明修改内容"}));
+    let result=f.chat("retained-read-only",&body).await;
+    let request=result["request_id"].as_str().unwrap();
+    assert_eq!(f.state.store.budget_operation(request).unwrap().unwrap().execution_state,aiwork_core::BudgetExecutionState::Succeeded);
+    assert!(f.state.store.leased_work_media_ids().unwrap().is_empty(),"terminal read-only work cannot retain an indefinite asset lease");
+}

@@ -22,6 +22,7 @@ pub(crate) use tower::ServiceExt;
 pub(crate) struct Bridge {
     pub(crate) claims: Mutex<BTreeMap<String, Value>>,
     pub(crate) video_sends: AtomicUsize,
+    pub(crate) expired_video_budget: std::sync::atomic::AtomicBool,
     pub(crate) assist_sends: AtomicUsize,
     pub(crate) unknown: std::sync::atomic::AtomicBool,
     pub(crate) tail_capability: std::sync::atomic::AtomicBool,
@@ -140,7 +141,7 @@ impl BridgeTransport for Bridge {
             let id = input["request_id"].as_str().unwrap();
             self.claims.lock().unwrap().insert(id.into(), input.clone());
             json!({"wire_version":2,"dispatch_token":"fixture","evidence_level":"policy_only","prepared_at_ms":chrono::Utc::now().timestamp_millis(),"revision":1,
-                "authorization":{"budget_id":format!("b-{id}"),"parent_request_id":input["parent_request_id"],"request_id":id,"core_key_id":input["core_key_id"],"request_fingerprint":input["request_fingerprint"],"endpoint":input["endpoint"],"model":input["model"],"account_ref":"exclusive-account","bridge_instance_id":"fixture","profile_fingerprint":"profile","policy_version":"fixture","hold_credits":if input["step_kind"]=="assist" {"2"}else{"40"},"expires_at_ms":chrono::Utc::now().timestamp_millis()+60000}})
+                "authorization":{"budget_id":format!("b-{id}"),"parent_request_id":input["parent_request_id"],"request_id":id,"core_key_id":input["core_key_id"],"request_fingerprint":input["request_fingerprint"],"endpoint":input["endpoint"],"model":input["model"],"account_ref":"exclusive-account","bridge_instance_id":"fixture","profile_fingerprint":"profile","policy_version":"fixture","hold_credits":if input["step_kind"]=="assist" {"2"}else{"40"},"expires_at_ms":chrono::Utc::now().timestamp_millis()+if input["step_kind"]=="video" && self.expired_video_budget.load(Ordering::SeqCst) {-1} else {60000}}})
         } else if url.ends_with("/budgets/dispatch") {
             let kind = self.claims.lock().unwrap()
                 [input["authorization"]["request_id"].as_str().unwrap()]["step_kind"]
@@ -301,6 +302,7 @@ impl Fixture {
         let bridge = Arc::new(Bridge {
             claims: Mutex::new(BTreeMap::new()),
             video_sends: AtomicUsize::new(0),
+            expired_video_budget: std::sync::atomic::AtomicBool::new(false),
             assist_sends: AtomicUsize::new(0),
             unknown: std::sync::atomic::AtomicBool::new(false),
             tail_capability: std::sync::atomic::AtomicBool::new(true),
