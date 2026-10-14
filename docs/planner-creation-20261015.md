@@ -1,0 +1,17 @@
+# Image-based creation and read-only planner recovery
+
+Runtime: `8f9d06dae1807381307aef0b77cc33f47d6a3239`, SHA256 `cef64aa852880d36e712b0014134be8cc4ab52616d4b547515a2d762f036d19d`. Companion Studio: `58b74cbf46fd04a8d864b7c9b04f741bfd8c916c`. Activated 2026-10-15 01:53 +08. Core store source and schema 33 are unchanged.
+
+The failure occurred before video submission. GLM-5.3-Flash interpreted a new clip requested from an uploaded image as native continuation without a parent, then returned a read-only clarification twice: first text, then null. Strict JSON validation rejected the duplicate. Studio did not recognize that public planning error and displayed a generic failure.
+
+The helper now receives separate verified image/video creation capabilities and native-parent availability. Its policy distinguishes a new clip conditioned on an uploaded image from revising an existing video or continuing a stored parent. Natural-language intent remains an AI decision. Studio's generation button sends explicit `action=create`; when the AI calls that explicitly requested image creation `continue`, Core can use the already-owned image as a new creation. It never invents a parent, native extension capability or strict first-frame guarantee. Inline and uploaded images are both included; original prompt and reference files remain intact.
+
+A narrow JSON recovery accepts a clarification-only response containing one text value and a duplicate null placeholder, in either order. It requires `action=clarify`, no effective prompt, no specification change and no reference change. Different non-null messages, paid actions, duplicate actions/specifications, nested duplicates, refused/truncated output and malformed JSON remain rejected. The existing helper result is reused without another paid call. All legacy/paid parsing remains strict.
+
+Validation: 426 router tests passed, including image ownership/reference preservation, one helper/one video dispatch, read-only recovery without additional calls, paid/nested duplicate rejection, existing retry and billing boundaries. Studio passed 870 frontend tests, 331 server tests, both TypeScript checks and targeted ESLint. Independent Linux release build passed.
+
+Before activation, native workers/queued work/capacity holds and pending deliveries were checked. Core/Studio programs were switched with backups under `/opt/aiwork-studio/backups/planner-20261015`; AI Work remained on the same process/generation. Core request, execution, reservation, settlement, ledger and slot-release rows were unchanged by activation. No paid model or video test was submitted. The original failed task retains its result and charge; only its Studio public failure explanation was refreshed through the new application schema after confirming the exact original Core error.
+
+Desktop and mobile HTML and all 11 unique published script/style assets matched release SHA256 values, including the lazy mobile workspace. Mobile HTML uses the shared `/assets/` route: both new mobile chunks must also be copied into the desktop static root. The first public probe caught missing mobile chunks; those were copied and the complete public check passed. Retain existing hashed assets during future releases. Local evidence is private under `.codex/task-diagnostics/20261015/` in the operator workspace.
+
+This verification does not claim a new paid generation succeeded. Original paid tasks are not automatically replayed. The next user submission exercises the updated real-model planning policy.
