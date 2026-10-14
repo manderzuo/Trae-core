@@ -108,6 +108,13 @@ pub(crate) fn object(raw: &str, max_bytes: usize) -> Result<Value, ()> {
     object_checked(raw, max_bytes).map_err(|_| ())
 }
 pub(crate) fn object_checked(raw: &str, max_bytes: usize) -> Result<Value, Diagnostic> {
+    let json=json_source(raw,max_bytes)?;
+    let value = serde_json::from_str::<StrictValue>(json)
+        .map_err(json_diagnostic)?.0;
+    if !value.is_object() {return Err(Diagnostic::new("assistant_json_not_object"));}
+    Ok(value)
+}
+fn json_source(raw:&str,max_bytes:usize)->Result<&str,Diagnostic> {
     if raw.len() > max_bytes {
         return Err(Diagnostic::new("assistant_output_too_large"));
     }
@@ -130,8 +137,9 @@ pub(crate) fn object_checked(raw: &str, max_bytes: usize) -> Result<Value, Diagn
     } else {
         trimmed
     };
-    let value = serde_json::from_str::<StrictValue>(json)
-        .map_err(|e| {
+    Ok(json)
+}
+fn json_diagnostic(e:serde_json::Error)->Diagnostic {
             let detail = e.to_string();
             let code = if detail.starts_with("assistant_duplicate_key") {
                 "assistant_json_duplicate_key"
@@ -153,12 +161,57 @@ pub(crate) fn object_checked(raw: &str, max_bytes: usize) -> Result<Value, Diagn
                 line: e.line(),
                 column: e.column(),
             }
-        })?
-        .0;
-    if !value.is_object() {
-        return Err(Diagnostic::new("assistant_json_not_object"));
+}
+
+// A known GLM response emits its read-only clarification and then appends the
+// schema's null placeholder. Preserve that sole message without a paid retry.
+// No execution intent, specification, reference change or nested duplicate is
+// repaired. All paid decisions continue through StrictValue unchanged.
+struct ReadOnlyClarification(Value);
+impl<'de> Deserialize<'de> for ReadOnlyClarification {
+    fn deserialize<D:Deserializer<'de>>(d:D)->Result<Self,D::Error> {
+        struct ClarificationVisitor;
+        impl<'de> Visitor<'de> for ClarificationVisitor {
+            type Value=ReadOnlyClarification;
+            fn expecting(&self,f:&mut fmt::Formatter)->fmt::Result {f.write_str("one read-only clarification")}
+            fn visit_map<A:MapAccess<'de>>(self,mut map:A)->Result<Self::Value,A::Error> {
+                let mut fields=Map::new();let mut recovered=false;
+                while let Some(key)=map.next_key::<String>()? {
+                    let incoming=map.next_value::<StrictValue>()?.0;
+                    if let Some(prior)=fields.get_mut(&key) {
+                        if key!="clarification" {return Err(de::Error::custom("assistant_duplicate_key"));}
+                        match (&*prior,&incoming) {
+                            (Value::Null,Value::String(_))=>{*prior=incoming;recovered=true;},
+                            (Value::String(_),Value::Null)=>recovered=true,
+                            _=>return Err(de::Error::custom("assistant_duplicate_key")),
+                        }
+                    } else {fields.insert(key,incoming);}
+                }
+                let value=Value::Object(fields);
+                if !recovered || value.as_object().is_none_or(|o|o.len()!=5)
+                    || value["action"]!="clarify" || !value["effective_prompt"].is_null()
+                    || !(value["spec_patch"].is_null() || value["spec_patch"].as_object().is_some_and(|o|o.is_empty()))
+                    || !(value["reference_policy"].is_null() || value["reference_policy"]=="inherit")
+                    || value["clarification"].as_str().is_none_or(|s|s.trim().is_empty() || s.len()>2048) {
+                    return Err(de::Error::custom("assistant_duplicate_key"));
+                }
+                Ok(ReadOnlyClarification(value))
+            }
+        }
+        d.deserialize_map(ClarificationVisitor)
     }
-    Ok(value)
+}
+
+pub(crate) fn planning_result_object(result:&Value)->Result<Value,Diagnostic> {
+    match result_object(result) {
+        Err(error) if error.code=="assistant_json_duplicate_key"=>{
+            // result_object already validated stop/refusal/tools, size and fence.
+            let raw=result["choices"][0]["message"]["content"].as_str().ok_or_else(||error.clone())?;
+            serde_json::from_str::<ReadOnlyClarification>(json_source(raw,16*1024)?)
+                .map(|v|v.0).map_err(|_|error)
+        },
+        other=>other,
+    }
 }
 
 pub(crate) fn result_object(result: &Value) -> Result<Value, Diagnostic> {

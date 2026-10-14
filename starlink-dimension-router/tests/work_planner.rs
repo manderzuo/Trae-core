@@ -1,6 +1,36 @@
 use aiwork_core::VideoWorkSnapshot;
 use serde_json::{json, Value};
 #[test]
+fn helper_receives_creation_capabilities_separately_from_narrative_and_native_parent() {
+    for (refs,image,video) in [(json!({"image_asset_ids":["owned-image"]}),true,false),(json!({"video_asset_ids":["owned-video"]}),false,true),(json!({}),false,false)] {
+        let mut b=body("从上传画面接着拍下一段，不改变人物服装");
+        b["action"]=json!("create");
+        for (k,v)in refs.as_object().unwrap(){b[k]=v.clone();}
+        let input=work_planner::build_helper_input(None,&b,"glm-5.3-flash").unwrap();
+        let payload:Value=serde_json::from_str(input["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["reference_capabilities"],json!({"image_conditioned_creation":image,"video_conditioned_creation":video,"native_parent_available":false}));
+        assert_eq!(payload["requested_action"],"create");
+        assert_eq!(payload["current"],"从上传画面接着拍下一段，不改变人物服装");
+        assert!(!input.to_string().contains("owned-image"));
+    }
+}
+
+#[test]
+fn explicit_creation_from_image_accepts_ai_continuation_without_inventing_a_parent() {
+    let mut d=decision(WorkIntent::Continue,"replace");
+    let b=json!({"action":"create","image_asset_ids":["owned-image"],"duration":5,"resolution":"480p","ratio":"9:16"});
+    work_planner::resolve_uploaded_video_action(&mut d,false,&b);
+    assert_eq!(d.action,WorkIntent::Create);
+    let snapshot=work_planner::merge_snapshot(None,&d,&b).unwrap();
+    assert!(snapshot.parent_version_id.is_none());
+    assert!(snapshot.tail_frame_media_id.is_none());
+    for input in [json!({"action":"continue","image_asset_ids":["owned-image"]}),json!({"action":"revise","image_asset_ids":["owned-image"]}),json!({"action":"create"})] {
+        let mut d=decision(WorkIntent::Continue,"replace");
+        work_planner::resolve_uploaded_video_action(&mut d,false,&input);
+        assert_eq!(d.action,WorkIntent::Continue);
+    }
+}
+#[test]
 fn helper_contract_includes_schema_and_escaping_without_rewriting_dialogue() {
     let b=json!({"messages":[{"role":"user","content":"生成５秒７２０Ｐ９：１６视频，猫说：\"你好。\""}]});
     let input=work_planner::build_helper_input(None,&b,"glm-5.3-flash").unwrap();

@@ -256,17 +256,22 @@ pub fn build_helper_input(
         "user_reference_count":s.user_media_ids.len(),"has_tail_frame":s.tail_frame_media_id.is_some(),"summary":cut(&sanitized(&s.summary),1024)}));
     let mut normalized=text_spec.as_object().ok_or_else(invalid)?.clone();
     normalized.extend(explicit.clone());
-    let current_references=json!({"video_count":body["video_asset_ids"].as_array().map_or(0,Vec::len),
-        "image_count":body["image_asset_ids"].as_array().map_or(0,Vec::len)});
+    // Execution validates inline files in normalized_original before buying a
+    // helper. Standalone prompt construction must not echo malformed file data.
+    let image_count=body["image_asset_ids"].as_array().map_or(0,Vec::len)+crate::budget_flow::inline_images(body).map_or(0,|a|a.len());
+    let current_references=json!({"video_count":body["video_asset_ids"].as_array().map_or(0,Vec::len),"image_count":image_count});
+    let reference_capabilities=json!({"image_conditioned_creation":current_references["image_count"].as_u64().is_some_and(|n|n>0),
+        "video_conditioned_creation":current_references["video_count"].as_u64().is_some_and(|n|n>0),"native_parent_available":snapshot.is_some()});
     let payload = json!({"parent":parent,"history":history,"current":current,"explicit_spec":explicit,"current_references":current_references,
-        "normalized_spec":normalized,"create_defaults":create_defaults(),"requested_action":body["action"].as_str()});
+        "reference_capabilities":reference_capabilities,"normalized_spec":normalized,"create_defaults":create_defaults(),"requested_action":body["action"].as_str()});
     let mut value = json!({"model":model,"stream":false,"max_tokens":4096,"temperature":0.2,"messages":[
         {"role":"system","content":"你是视频作业规划助手，负责规范自然语言提示词和视频规格。仅输出严格JSON对象，字段只能是action、effective_prompt、spec_patch、reference_policy、clarification。action只能是create/revise/continue/status/download/clarify。用户明确独立生成才create；在已提供parent上明确修改才revise；明确接着上一段生成才continue；查看进度用status、重新下载用download，普通问候/测试/不满意但无修改方向用clarify。无parent不得猜父版本。effective_prompt忠实合并parent和当前修改，保留人物、动作、场景与未被修改的约束，不新增剧情；只读操作为null。spec_patch只使用normalized_spec中已确认的duration/resolution/ratio/watermark：竖屏/竖构图为9:16，横屏/横构图为16:9，正方形为1:1，高清/高分辨率在当前能力下为720p，低分辨率为480p；explicit_spec优先。分镜的0-2秒等是区间，不能当总时长。未指定字段在revise/continue时沿用parent，create时使用create_defaults；可以省略这些字段或原值回显，不得猜测新值。时长4至15秒，480p或720p，画幅16:9/9:16/1:1/4:3/3:4/21:9。全角字符规范化为半角。reference_policy为inherit/replace/merge/clear，新参考默认replace，只有用户明确合并才merge，明确取消才clear。clarification用于简短追问或只读回复，否则null。不要输出任何ID、链接、账户、工具、扣费字段；不要虚构已提交或完成。"},
         {"role":"user","content":payload.to_string()}]});
     let instruction=value["messages"][0]["content"].as_str().ok_or_else(invalid)?;
     let instruction=instruction.replace("全角字符规范化为半角。", "仅将视频规格中的全角数字、字母和冒号规范为半角；保留正文和台词原文。");
     let example=json!({"action":"create","effective_prompt":"猫说：\"你好。\"\n路径文字 C:\\clips\\cat.mp4。","spec_patch":{},"reference_policy":"inherit","clarification":null});
-    value["messages"][0]["content"]=json!(format!("{instruction} current_references是服务器已验证的素材数量，不是用户自称。仅根据current判断本轮意图，不要把分镜里角色继续行动、上一段剧情等叙述误判为对已生成视频的续写；用户明确请求独立生成新视频时action=create，即使脚本很长。无parent且用户明确要求修改或续写已有视频时action=clarify，clarification请其指定原视频；不要猜测父版本。无parent但video_count大于0时，用户明确要求从上传视频继续生成或续写新片段，应使用该素材规划create、reference_policy=replace，不得要求提供Core已有父版本；仍不得虚构原生延长、严格首帧锁定或已完成。\n{}\n必须遵守的JSON Schema：{}\n仅作编码示例，不得复制其剧情：{example}\n长度限制按UTF-8字节计算：effective_prompt不超过12288，clarification不超过2048，整个对象不超过16384。",crate::assistant_json::ENCODING_RULES,helper_output_schema()));
+    let clarify_example=json!({"action":"clarify","effective_prompt":null,"spec_patch":{},"reference_policy":"inherit","clarification":"请提供要修改的原视频。"});
+    value["messages"][0]["content"]=json!(format!("{instruction} current_references和reference_capabilities是服务器已验证的素材事实，不是用户自称。requested_action是调用者明确发起的操作；create表示生成一个新片段。仅根据current判断本轮意图，不要把分镜里角色继续行动、上一段剧情等叙述误判为对已生成视频的原生续写；用户明确请求独立生成新视频时action=create，即使脚本很长。无parent但image_conditioned_creation为true时，若用户要求以上传图片作为上一段尾帧、起始画面或视觉参考生成下一段，应以图片规划create、reference_policy=replace，不得仅因提到上一段就索要Core父版本。普通人物图或风格图不能宣称为已验证尾帧；需要原视频的实际修改仍须提供原视频。无parent但video_conditioned_creation为true时，用户明确要求从上传视频继续生成或续写新片段，应使用该素材规划create、reference_policy=replace。只有缺少完成操作所需的真实来源时才clarify，请其提供所缺来源；不要猜测父版本，仍不得虚构原生延长、严格首帧锁定或已完成。\n{}\n必须遵守的JSON Schema：{}\n仅作编码示例，不得复制其剧情。生成示例：{example}\n补充信息示例：{clarify_example}\n每个字段恰好出现一次；clarify时将补充信息只写入clarification的唯一位置，不能再追加同名null字段。长度限制按UTF-8字节计算：effective_prompt不超过12288，clarification不超过2048，整个对象不超过16384。",crate::assistant_json::ENCODING_RULES,helper_output_schema()));
     if serde_json::to_vec(&value).map_err(|_| invalid())?.len() > 32 * 1024 {
         return Err("work_context_input_too_large".into());
     }
@@ -277,7 +282,7 @@ pub fn parse_decision(raw: &str) -> Result<WorkDecision, String> {
     parse_decision_value(value)
 }
 pub(crate) fn parse_helper_result(result:&Value)->Result<WorkDecision,crate::assistant_json::Diagnostic> {
-    let value=crate::assistant_json::result_object(result)?;
+    let value=crate::assistant_json::planning_result_object(result)?;
     parse_decision_value(value).map_err(|code|crate::assistant_json::Diagnostic::new(
         crate::budget_errors::public_code(&code).unwrap_or("assistant_schema_invalid")))
 }
@@ -317,14 +322,16 @@ fn parse_decision_value(mut value:Value)->Result<WorkDecision,String> {
     Ok(d)
 }
 
-/// An explicitly uploaded source video is usable without a stored parent.
+/// An explicitly uploaded source is usable without a stored parent.
 /// "Continue" in the prompt can mean extending that file, not Core's
 /// tail-frame workflow. Keep the full video and prompt; never claim native
 /// extension support from this routing decision alone.
 pub fn resolve_uploaded_video_action(decision: &mut WorkDecision, has_parent: bool, body: &Value) {
     if !has_parent && decision.action == WorkIntent::Continue
         && matches!(body["action"].as_str(), None | Some("create"))
-        && body["video_asset_ids"].as_array().is_some_and(|a| !a.is_empty())
+        && (body["video_asset_ids"].as_array().is_some_and(|a| !a.is_empty())
+            || (body["action"]=="create" && (body["image_asset_ids"].as_array().is_some_and(|a| !a.is_empty())
+                || crate::budget_flow::inline_images(body).is_ok_and(|a|!a.is_empty()))))
     {
         decision.action = WorkIntent::Create;
     }

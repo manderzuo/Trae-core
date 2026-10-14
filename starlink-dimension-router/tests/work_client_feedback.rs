@@ -3,6 +3,58 @@ mod fixture;
 use fixture::*;
 
 #[tokio::test]
+async fn explicit_image_creation_keeps_uploaded_image_when_ai_calls_it_continuation() {
+    let f=Fixture::new();
+    *f.bridge.helper_decision.lock().unwrap()=Some(json!({"action":"continue","effective_prompt":"从上传画面接着拍下一段，保持人物服装一致","spec_patch":{},"reference_policy":"replace","clarification":null}));
+    let mut body=create();body["action"]=json!("create");
+    body["messages"][0]["content"]=json!([{"type":"text","text":"从上传尾帧接着拍下一段"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgpmaXh0dXJl"}}]);
+    let result=f.chat("explicit-image-continuation",&body).await;
+    let version=f.state.store.work_version_for_request(&f.owner,result["request_id"].as_str().unwrap()).unwrap().unwrap();
+    let snapshot=starlink_dimension_router::work_context::read_snapshot(&f.state,&f.owner,&version).unwrap();
+    assert!(snapshot.parent_version_id.is_none());
+    assert_eq!(snapshot.reference_mode,"user_reference");
+    assert_eq!(snapshot.user_media_ids.len(),1);
+    assert_eq!(snapshot.dispatch_body.unwrap()["image_asset_ids"].as_array().unwrap().len(),1);
+    assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),1);
+    assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);
+}
+
+#[tokio::test]
+async fn readonly_clarification_duplicate_null_preserves_text_without_another_paid_call() {
+    for raw in [
+        r#"{"action":"clarify","clarification":"请指定原视频。","effective_prompt":null,"spec_patch":null,"reference_policy":null,"clarification":null}"#,
+        r#"{"action":"clarify","clarification":null,"effective_prompt":null,"spec_patch":{},"reference_policy":"inherit","clarification":"请指定原视频。"}"#,
+    ] {
+        let f=Fixture::new();*f.bridge.helper_raw.lock().unwrap()=Some(raw.into());
+        let response=f.response(&f.key,"readonly-duplicate-null",&create()).await;
+        assert_eq!(response.status(),StatusCode::OK);
+        let result:Value=serde_json::from_slice(&to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+        assert!(result["choices"][0]["message"]["content"].as_str().unwrap().contains("请指定原视频"),"{result}");
+        let op=f.state.store.budget_operation(result["request_id"].as_str().unwrap()).unwrap().unwrap();
+        assert_eq!(op.execution_state,aiwork_core::BudgetExecutionState::Succeeded);
+        assert_eq!(op.steps.len(),1);assert_eq!(op.steps[0].financial_state,aiwork_core::BudgetFinancialState::Held);
+        assert_eq!(f.bridge.assist_sends.load(Ordering::SeqCst),1);
+        assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+    }
+}
+
+#[tokio::test]
+async fn ambiguous_paid_decisions_and_different_clarification_strings_still_fail_closed() {
+    for raw in [
+        r#"{"action":"create","effective_prompt":"生成猫散步","spec_patch":{},"reference_policy":"replace","clarification":"确认","clarification":null}"#,
+        r#"{"action":"clarify","effective_prompt":null,"spec_patch":{},"reference_policy":null,"clarification":"需要原片","clarification":"无需原片"}"#,
+        r#"{"action":"clarify","action":"create","effective_prompt":null,"spec_patch":null,"reference_policy":null,"clarification":"说明","clarification":null}"#,
+        r#"{"action":"clarify","effective_prompt":null,"spec_patch":{"duration":5,"duration":10},"reference_policy":null,"clarification":"说明","clarification":null}"#,
+    ] {
+        let f=Fixture::new();*f.bridge.helper_raw.lock().unwrap()=Some(raw.into());
+        let response=f.response(&f.key,"ambiguous-duplicates",&create()).await;
+        let result:Value=serde_json::from_slice(&to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
+        assert_eq!(result["error"]["code"],"assistant_json_duplicate_key");
+        assert_eq!(f.bridge.video_sends.load(Ordering::SeqCst),0);
+    }
+}
+
+#[tokio::test]
 async fn failed_stream_is_readable_completion_not_top_level_protocol_error() {
     let f=Fixture::new();
     *f.bridge.helper_raw.lock().unwrap()=Some("malformed".into());
