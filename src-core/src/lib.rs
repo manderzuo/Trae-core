@@ -3,6 +3,8 @@ mod upstream_failure;
 pub use upstream_failure::UpstreamFailure;
 mod budget_billing;
 mod budget_hold;
+mod budget_execution_slot;
+pub use budget_execution_slot::ReviewedExecutionSlotRelease;
 pub use budget_hold::BudgetHoldRelease;
 mod budget_continuation;
 pub use budget_continuation::BudgetContinuation;

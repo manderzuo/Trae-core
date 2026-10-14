@@ -145,7 +145,10 @@ pub(crate) fn spawn(state:&Arc<StarlinkRouterState>) {
             let Some(state)=maintenance.upgrade() else {break};
             let store=state.store.clone();
             // One small SQL batch, independent from paid work and its recovery.
-            if !matches!(tokio::task::spawn_blocking(move ||store.prune_completed_budget_continuations(chrono::Utc::now().timestamp_millis(),8)).await,Ok(Ok(_))) {
+            if !matches!(tokio::task::spawn_blocking(move || {
+                store.release_attention_execution_slots(8)?;
+                store.prune_completed_budget_continuations(chrono::Utc::now().timestamp_millis(),8)
+            }).await,Ok(Ok(_))) {
                 eprintln!("v2 completed-input retention failed; no billing records removed");
             }
         }

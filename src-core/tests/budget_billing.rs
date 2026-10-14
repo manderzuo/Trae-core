@@ -55,6 +55,76 @@ fn reviewed_hold_release_survives_restart_and_late_charge_is_debited_once() {
 
 struct TestDirectory(PathBuf);
 
+#[test]
+fn reviewed_execution_slot_preserves_unknown_money_and_prevents_redispatch() {
+    let (dir,store,key,admin)=budget_fixture("execution-slot",1,100_000_000);
+    let request=begin_video_parent(&store,&key,"execution-slot");
+    let budget="slot-budget";
+    store.begin_budget_operation(&request,video_budget_step(&store,&key,&request,budget)).unwrap();
+    dispatch_current_budget_step(&store,&request).unwrap();
+    store.bind_budget_video_task(&request,"task-receipt-video-1").unwrap();
+    let now=chrono::Utc::now().timestamp_millis();
+    let proof=aiwork_core::ReviewedExecutionSlotRelease {
+        request_id:request.clone(),core_key_id:key.clone(),budget_id:budget.into(),
+        account_ref:"account-test".into(),bridge_instance_id:"bridge-test".into(),task_ref:"task-receipt-video-1".into(),
+        worker_absent_since_ms:now-86_400_000,observed_at_ms:now,review_ref:"operator-reviewed-worker-absence".into(),
+    };
+    assert!(store.release_reviewed_unknown_execution_slot(&proof).is_err(),"running is not releasable");
+    store.mark_budget_step_execution(&request,aiwork_core::BudgetExecutionState::Unknown).unwrap();
+    assert!(store.release_reviewed_unknown_execution_slot(&proof).is_err(),"financially unresolved is not releasable here");
+    store.apply_budget_receipt(final_budget_receipt(&request,budget,"1.25")).unwrap();
+    let db=Connection::open(dir.0.join("data").join(CORE_DB_FILE)).unwrap();
+    db.execute("UPDATE budget_operations SET created_at_ms=?1 WHERE parent_request_id=?2",params![now-90_000_000,request]).unwrap();
+    let before=store.key_quota_balance_as_admin(&admin,&key,"credits").unwrap();
+    let mut wrong=proof.clone();wrong.task_ref="other-task".into();
+    assert!(store.release_reviewed_unknown_execution_slot(&wrong).is_err());
+    wrong=proof.clone();wrong.core_key_id="other-key".into();
+    assert!(store.release_reviewed_unknown_execution_slot(&wrong).is_err());
+    wrong=proof.clone();wrong.observed_at_ms=now-600_000;
+    assert!(store.release_reviewed_unknown_execution_slot(&wrong).is_err());
+    assert_eq!(store.release_reviewed_unknown_execution_slot(&proof).unwrap(),aiwork_core::BudgetMutation::Applied);
+    assert_eq!(store.release_reviewed_unknown_execution_slot(&proof).unwrap(),aiwork_core::BudgetMutation::Duplicate);
+    assert_eq!(store.active_execution_count_for_key(&key).unwrap(),0);
+    assert_eq!(store.budget_operation(&request).unwrap().unwrap().execution_state,aiwork_core::BudgetExecutionState::Unknown);
+    assert!(store.mark_budget_step_dispatched(&request,budget).is_err());
+    store.mark_budget_step_execution(&request,aiwork_core::BudgetExecutionState::Running).unwrap();
+    assert_eq!(store.active_execution_count_for_key(&key).unwrap(),1,"a fresh running observation must regain occupancy without redispatch");
+    store.mark_budget_step_execution(&request,aiwork_core::BudgetExecutionState::Unknown).unwrap();
+    assert_eq!(store.key_quota_balance_as_admin(&admin,&key,"credits").unwrap(),before);
+    drop(store);let store=CoreStore::open(&dir.0).unwrap();store.migrate().unwrap();
+    assert_eq!(store.active_execution_count_for_key(&key).unwrap(),0);
+    let next=begin_video_parent(&store,&key,"slot-next");
+    store.begin_budget_operation(&next,video_budget_step(&store,&key,&next,"slot-next-budget")).unwrap();
+    assert_eq!(store.active_execution_count_for_key(&key).unwrap(),1);
+    let blocked=begin_video_parent(&store,&key,"slot-full");
+    assert!(store.begin_budget_operation(&blocked,video_budget_step(&store,&key,&blocked,"slot-full-budget")).is_err());
+    store.mark_budget_step_execution(&request,aiwork_core::BudgetExecutionState::Succeeded).unwrap();
+    store.apply_budget_receipt(final_budget_receipt(&request,budget,"1.25")).unwrap();
+    assert_eq!(db.query_row("SELECT COUNT(*) FROM quota_ledger WHERE request_id=?1 AND event_kind='commit'",[request],|r|r.get::<_,i64>(0)).unwrap(),1);
+}
+
+#[test]
+fn attention_execution_slot_requires_terminal_helper_and_blocks_new_video() {
+    let (dir,store,key,_) = budget_fixture("attention-slot",1,100_000_000);
+    let parent=begin_video_parent(&store,&key,"attention-slot-parent");
+    let child=match store.begin_budget_assist_request(&parent,budget_assist_input(&key,"attention-slot-child")).unwrap(){BeginRequest::Created(c)=>c,_=>panic!()};
+    store.begin_budget_operation(&parent,assist_budget_step(&store,&key,&parent,&child.id,"attention-assist-budget")).unwrap();
+    dispatch_current_budget_step(&store,&child.id).unwrap();
+    let db=Connection::open(dir.0.join("data").join(CORE_DB_FILE)).unwrap();
+    db.execute("INSERT INTO budget_continuations(request_id,request_hash,key_version,ciphertext,created_at_ms) SELECT id,request_hash,1,?1,created_at_ms FROM requests WHERE id=?2",params![vec![5u8;64],parent]).unwrap();
+    for _ in 0..8 {store.record_budget_continuation_error(&parent,"budget_checkpoint_invalid",chrono::Utc::now().timestamp_millis()).unwrap();}
+    assert_eq!(store.release_attention_execution_slots(8).unwrap(),0,"active helper must keep its slot");
+    assert_eq!(store.active_execution_count_for_key(&key).unwrap(),1);
+    store.mark_budget_step_execution(&child.id,aiwork_core::BudgetExecutionState::Succeeded).unwrap();
+    assert_eq!(store.release_attention_execution_slots(8).unwrap(),1);
+    assert_eq!(store.release_attention_execution_slots(8).unwrap(),0);
+    assert_eq!(store.active_execution_count_for_key(&key).unwrap(),0);
+    assert!(store.add_budget_step(&parent,video_budget_step(&store,&key,&parent,"attention-new-video")).is_err());
+    assert!(store.pending_budget_continuation_ids_after("",100).unwrap().is_empty());
+    assert_eq!(store.budget_continuation_retry_block(&parent,chrono::Utc::now().timestamp_millis()).unwrap().as_deref(),Some("attention"));
+    assert_eq!(store.reservation_for_request(&child.id).unwrap().unwrap().amount,1_000_000,"concurrency cleanup does not release money");
+}
+
 impl TestDirectory {
     fn new(label: &str) -> Self {
         let path = std::env::temp_dir().join(format!(

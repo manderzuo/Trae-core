@@ -954,6 +954,15 @@ CREATE TABLE IF NOT EXISTS budget_hold_releases (
 );
 "#;
 
+pub(crate) const SCHEMA_V33: &str = r#"
+CREATE TABLE IF NOT EXISTS budget_execution_slot_releases (
+ parent_request_id TEXT PRIMARY KEY REFERENCES budget_operations(parent_request_id),
+ reason TEXT NOT NULL CHECK(reason IN ('continuation_attention','reviewed_worker_absence')),
+ proof_json TEXT NOT NULL CHECK(length(proof_json)>0),
+ released_at_ms INTEGER NOT NULL CHECK(released_at_ms>0)
+);
+"#;
+
 pub(crate) const SCHEMA_V31: &str = r#"
 CREATE TABLE IF NOT EXISTS budget_continuation_retries (
   request_id TEXT PRIMARY KEY REFERENCES budget_continuations(request_id) ON DELETE CASCADE,

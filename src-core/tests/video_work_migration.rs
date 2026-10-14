@@ -5,7 +5,7 @@ use std::{collections::BTreeSet, fs};
 
 #[test]
 fn v29_v30_and_v31_to_current_preserve_ledger_and_unknown_holds() {
-    for version in [29,30,31] {
+    for version in [29,30,31,32] {
     let dir = std::env::temp_dir().join(format!("video-work-migration-{}", rand::random::<u64>()));
     let store = CoreStore::open(&dir).unwrap();
     store.migrate().unwrap();
@@ -50,7 +50,8 @@ fn v29_v30_and_v31_to_current_preserve_ledger_and_unknown_holds() {
         con.execute_batch("DROP TABLE IF EXISTS video_work_contexts; DROP TABLE IF EXISTS video_work_versions; DROP TABLE IF EXISTS video_work_media; DROP TABLE IF EXISTS video_works;").unwrap();
     }
     if version<31 {con.execute("DROP TABLE budget_continuation_retries",[]).unwrap();}
-    con.execute("DROP TABLE budget_hold_releases",[]).unwrap();
+    if version<32 {con.execute("DROP TABLE budget_hold_releases",[]).unwrap();}
+    con.execute("DROP TABLE budget_execution_slot_releases",[]).unwrap();
     con.execute("UPDATE schema_meta SET value=?1 WHERE key='schema_version'",[version.to_string()]).unwrap();
     let before = snapshot(&con);
     drop(con);

@@ -24,3 +24,7 @@ The user authorized reconciliation of all Keys and implementation of the two pre
 ## Evidence baseline (2026-10-14 20:11 +08)
 
 26 held reservations total 4,504 credits: 25 failed reservations total 4,319 with no matching official consumption row; one old unknown reservation holds 185 with an exact upstream charge of 167.6964. This baseline must be refreshed before mutation. Active new work remains reserved until its own outcome is known.
+
+## Follow-up: stale execution slots
+
+The four remaining slots on Zhou are three helper-complete continuations already stopped at attention, and one old unknown video whose actual 167.6964 charge is settled and whose native worker is absent. Keep execution results and financial facts intact. Add a durable slot-release journal, exclude its rows in both display and admission counts, and prohibit any new step/dispatch on released operations. Continue read-only result and receipt recovery. Automatically release attention continuations only when all existing steps are terminal and no video exists. Unknown executions require a fresh, identity-bound operator review of worker absence; age or payment alone is insufficient. No automatic resumption or extra paid calls. Verify restart, replay, cross-identity rejection, concurrency admission and unchanged money; rehearse schema 32 migration on a live snapshot before Core-only deployment. AI Work stays running.

@@ -120,6 +120,7 @@ impl CoreStore {
     }
     pub fn budget_continuation_retry_block(&self,request:&str,now_ms:i64)->Result<Option<String>,CoreError> {
         let con=self.connection.lock().expect("core store mutex poisoned");
+        if Self::execution_slot_released_in_connection(&con,request)? {return Ok(Some("attention".into()));}
         Ok(con.query_row("SELECT retry.state FROM budget_continuation_retries retry JOIN budget_operations o ON o.parent_request_id=retry.request_id WHERE retry.request_id=?1 AND o.execution_state IN ('ready','running','unknown') AND NOT EXISTS(SELECT 1 FROM budget_steps s WHERE s.operation_id=o.operation_id AND s.kind='video') AND (retry.state='attention' OR retry.next_attempt_at_ms>?2)",params![request,now_ms],|r|r.get(0)).optional()?)
     }
     pub fn budget_continuation_needs_attention(&self,request:&str)->Result<bool,CoreError> {
@@ -134,7 +135,7 @@ impl CoreStore {
         let connection=self.connection.lock().expect("core store mutex poisoned");
         let mut stmt=connection.prepare("SELECT c.request_id FROM budget_continuations c
             JOIN budget_operations o ON o.parent_request_id=c.request_id
-            WHERE c.request_id>?1 AND NOT EXISTS(SELECT 1 FROM budget_continuation_retries retry WHERE retry.request_id=c.request_id AND (retry.state='attention' OR retry.next_attempt_at_ms>?3)) AND o.execution_state IN ('ready','running','unknown')
+            WHERE c.request_id>?1 AND NOT EXISTS(SELECT 1 FROM budget_execution_slot_releases e WHERE e.parent_request_id=c.request_id) AND NOT EXISTS(SELECT 1 FROM budget_continuation_retries retry WHERE retry.request_id=c.request_id AND (retry.state='attention' OR retry.next_attempt_at_ms>?3)) AND o.execution_state IN ('ready','running','unknown')
             AND EXISTS(SELECT 1 FROM budget_steps s WHERE s.operation_id=o.operation_id AND s.kind='assist' AND s.execution_state='succeeded')
             AND NOT EXISTS(SELECT 1 FROM budget_steps s WHERE s.operation_id=o.operation_id AND s.kind='video')
             ORDER BY c.request_id LIMIT ?2")?;

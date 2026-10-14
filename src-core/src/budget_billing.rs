@@ -472,6 +472,8 @@ impl CoreStore {
         if budget_id != expected_budget_id {
             return Err(CoreError::IdempotencyConflict);
         }
+        let released:bool=transaction.query_row("SELECT EXISTS(SELECT 1 FROM budget_execution_slot_releases e JOIN budget_operations o ON o.parent_request_id=e.parent_request_id WHERE o.operation_id=?1)",[&operation_id],|r|r.get(0))?;
+        if released { return Err(CoreError::IdempotencyConflict); }
         let reservation = Self::reservation_by_request(&transaction, request_id)?.ok_or_else(|| {
             CoreError::ReservationNotFound {
                 reservation_id: request_id.into(),
@@ -731,6 +733,9 @@ impl CoreStore {
                 request_id: parent_request_id.into(),
             });
         };
+        if Self::execution_slot_released_in_connection(&transaction,parent_request_id)? {
+            return Err(CoreError::IdempotencyConflict);
+        }
         let existing_step: Option<(String, String, Vec<u8>)> = transaction
             .query_row(
                 "SELECT request_id, budget_id, authorization_hash FROM budget_steps
@@ -2669,7 +2674,9 @@ impl CoreStore {
         let sql = format!(
             "SELECT
                (SELECT COUNT(*) FROM budget_operations
-                WHERE api_key_id = ?1 AND execution_state IN ('ready','running','unknown'))
+                WHERE api_key_id = ?1 AND execution_state IN ('ready','running','unknown')
+                  AND NOT EXISTS(SELECT 1 FROM budget_execution_slot_releases e WHERE e.parent_request_id=budget_operations.parent_request_id
+                    AND NOT EXISTS(SELECT 1 FROM budget_steps s WHERE s.operation_id=budget_operations.operation_id AND s.execution_state IN ('ready','running'))))
                +
                (SELECT COUNT(*) FROM requests request
                 WHERE request.api_key_id = ?1
@@ -2726,6 +2733,8 @@ impl CoreStore {
             connection.query_row(
                 "SELECT COUNT(*) FROM budget_operations
                  WHERE api_key_id = ?1 AND execution_state IN ('ready','running','unknown')
+                   AND NOT EXISTS(SELECT 1 FROM budget_execution_slot_releases e WHERE e.parent_request_id=budget_operations.parent_request_id
+                     AND NOT EXISTS(SELECT 1 FROM budget_steps s WHERE s.operation_id=budget_operations.operation_id AND s.execution_state IN ('ready','running')))
                    AND (?2 IS NULL OR parent_request_id <> ?2)",
                 params![api_key_id, assist_parent_request_id],
                 |row| row.get::<_, i64>(0),
