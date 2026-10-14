@@ -201,7 +201,9 @@ pub(crate) async fn video_status(state:Arc<StarlinkRouterState>,principal:Princi
         } else if result["status"]=="failed_no_charge" {("failed",None)}
         else if result["status"]=="not_ready" && result_state_unknown(&result) {("unknown",None)}
         else if result["status"]=="not_ready" {("processing",None)} else {return Err("invalid result status".into())};
-        let mut value=json!({"task":{"id":request,"status":status,"content_url":if status=="completed" {content} else {None}},"request_id":request});
+        let operation=state.store.budget_operation(&request).map_err(|e|e.to_string())?;
+        let billing=if operation.as_ref().is_some_and(|op|!op.steps.is_empty() && op.steps.iter().all(|s|matches!(s.financial_state,aiwork_core::BudgetFinancialState::Settled|aiwork_core::BudgetFinancialState::Released))) {"settled"}else{"pending"};
+        let mut value=json!({"task":{"id":request,"status":status,"billing_state":billing,"content_url":if status=="completed" {content} else {None}},"request_id":request});
         if status=="unknown" {
             let failure=if result["diagnostic"].is_object() {Failure::diagnostic(&result["diagnostic"])}
                 else {Failure::from("video_execution_unconfirmed")};
@@ -394,7 +396,13 @@ pub(crate) async fn video_content(state:Arc<StarlinkRouterState>,principal:Princ
         s.bridge_client().budget_content(&step).map(|upstream|Some((upstream,permit)))
     }).await;
     let (upstream,permit)=match result {Ok(Ok(Some((value,permit)))) if value.status==200=>(value,permit),Ok(Ok(None))=>return StatusCode::NOT_FOUND.into_response(),
-        Ok(Ok(Some((value,_)))) if value.status==429=>return fail("video_download_busy"),
+        Ok(Ok(Some((value,_)))) if value.status==429=>{
+            let mut response=fail("video_download_busy");
+            if let Some(seconds)=value.headers.get("retry-after").and_then(|s|s.parse::<u64>().ok()).filter(|v|*v>0 && *v<=86400) {
+                if let Ok(header)=seconds.to_string().parse() {response.headers_mut().insert("retry-after",header);}
+            }
+            return response;
+        },
         Ok(Err(code)) if code=="video_not_ready"=>return fail(&code),_=>return fail("video_content_unavailable")};
     let (send,receive)=tokio::sync::mpsc::channel(2);
     tokio::task::spawn_blocking(move || {

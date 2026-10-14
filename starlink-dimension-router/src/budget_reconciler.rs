@@ -143,6 +143,11 @@ pub(crate) fn sync_receipt(state: &StarlinkRouterState, client: &BridgeClient, s
     apply_receipt_envelope(state,step,&value)
 }
 fn apply_receipt_envelope(state:&StarlinkRouterState,step:&BudgetStepView,value:&Value)->Result<(),String> {
+    if value["hold_release"].is_object() {
+        identity(&value["hold_release"],step)?;
+        let proof:aiwork_core::BudgetHoldRelease=serde_json::from_value(value["hold_release"].clone()).map_err(|_|"invalid hold release proof")?;
+        state.store.release_budget_hold(&proof).map_err(|e|e.to_string())?;
+    }
     let status=value["status"].as_str().ok_or("missing billing status")?;
     if status=="pending" && value["receipt"].is_null() && value["event"].is_null() {return Ok(());}
     let event=&value["event"]; identity(event,step)?;

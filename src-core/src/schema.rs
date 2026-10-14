@@ -944,6 +944,16 @@ CREATE UNIQUE INDEX video_work_pending_handle ON video_work_contexts(work_id) WH
 "#;
 
 
+pub(crate) const SCHEMA_V32: &str = r#"
+CREATE TABLE IF NOT EXISTS budget_hold_releases (
+ request_id TEXT PRIMARY KEY REFERENCES budget_steps(request_id),
+ budget_id TEXT NOT NULL UNIQUE,
+ evidence_hash TEXT NOT NULL CHECK(length(evidence_hash)>0),
+ proof_json TEXT NOT NULL CHECK(length(proof_json)>0),
+ released_at_ms INTEGER NOT NULL CHECK(released_at_ms>0)
+);
+"#;
+
 pub(crate) const SCHEMA_V31: &str = r#"
 CREATE TABLE IF NOT EXISTS budget_continuation_retries (
   request_id TEXT PRIMARY KEY REFERENCES budget_continuations(request_id) ON DELETE CASCADE,

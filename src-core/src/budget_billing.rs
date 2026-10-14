@@ -1587,8 +1587,12 @@ impl CoreStore {
                 BudgetReceiptResult::Pending
             });
         }
+        let prior_release=Self::hold_release_in_connection(&transaction,&receipt.request_id)?;
+        let late_charge=reservation.state==ReservationState::Released && prior_release.as_ref().is_some_and(|proof|
+            proof.budget_id==input.budget_id && proof.core_key_id==context.core_key_id && proof.account_ref==input.account_ref
+            && proof.bridge_instance_id==input.bridge_instance_id && proof.hold_microcredits==context.hold_microcredits);
         if !matches!(context.financial_state.as_str(), "held" | "unknown")
-            || !matches!(reservation.state, ReservationState::Held | ReservationState::Unknown)
+            || !(matches!(reservation.state, ReservationState::Held | ReservationState::Unknown) || late_charge)
         {
             return Err(CoreError::ReservationSettlementConflict {
                 reservation_id: reservation.id,
@@ -1622,7 +1626,7 @@ impl CoreStore {
             &reservation,
             "commit",
             actual_microcredits,
-            released_microcredits,
+            if late_charge {-actual_microcredits} else {released_microcredits},
             None,
             now,
             reservation.event_group_id.as_deref().ok_or_else(|| CoreError::InvalidConfiguration {

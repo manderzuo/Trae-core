@@ -16,6 +16,43 @@ use aiwork_core::{
 use rusqlite::{params, Connection};
 use serde_json::json;
 
+#[test]
+fn reviewed_hold_release_survives_restart_and_late_charge_is_debited_once() {
+    let (dir,store,key,admin)=budget_fixture("reviewed-release-late",1,1_000_000_000);
+    let request=begin_video_parent(&store,&key,"reviewed-release");let budget="reviewed-release-budget";
+    store.begin_budget_operation(&request,video_budget_step(&store,&key,&request,budget)).unwrap();
+    dispatch_current_budget_step(&store,&request).unwrap();
+    store.bind_budget_video_task(&request,"task-receipt-video-1").unwrap();
+    let now=chrono::Utc::now().timestamp_millis();
+    let proof:aiwork_core::BudgetHoldRelease=serde_json::from_value(json!({
+        "wire_version":2,"request_id":request,"budget_id":budget,"core_key_id":key,
+        "account_ref":"account-test","bridge_instance_id":"bridge-test","session_ref":format!("core-v2-{budget}"),
+        "hold_microcredits":2000000,"policy":"failed-absence-reservation-release-v1","review_ref":null,
+        "started_at_ms":now-2000000,"finished_at_ms":now-1800000,"query_start_ms":now-3000000,
+        "query_end_ms":now+300000,"first_read_at_ms":now-600000,"last_read_at_ms":now-1000,
+        "observed_at_ms":now,"source_hash":"complete-source-read-hash"
+    })).unwrap();
+    assert!(store.release_budget_hold(&proof).is_err(),"running executions cannot release");
+    store.mark_budget_step_execution(&request,aiwork_core::BudgetExecutionState::Failed).unwrap();
+    let mut wrong=proof.clone();wrong.core_key_id="unrelated-key".into();
+    assert!(store.release_budget_hold(&wrong).is_err());
+    assert_eq!(store.release_budget_hold(&proof).unwrap(),aiwork_core::BudgetMutation::Applied);
+    assert_eq!(store.release_budget_hold(&proof).unwrap(),aiwork_core::BudgetMutation::Duplicate);
+    let balance=store.key_quota_balance_as_admin(&admin,&key,"credits").unwrap();
+    assert_eq!((balance.available,balance.held),(1_000_000_000,0));
+    assert_eq!(store.reconcile_quota_event_groups(now).unwrap(),0,"release journal must pass quota audit");
+    let db=Connection::open(dir.0.join("data").join(CORE_DB_FILE)).unwrap();
+    assert_eq!(db.query_row("SELECT COUNT(*) FROM budget_settlements",[],|r|r.get::<_,i64>(0)).unwrap(),0,"release must not invent a zero-fee bill");
+    drop(store);let store=CoreStore::open(&dir.0).unwrap();
+    let receipt=final_budget_receipt(&request,budget,"2.5");
+    store.apply_budget_receipt(receipt.clone()).unwrap();store.apply_budget_receipt(receipt).unwrap();
+    assert_eq!(store.release_budget_hold(&proof).unwrap(),aiwork_core::BudgetMutation::Duplicate);
+    let balance=store.key_quota_balance_as_admin(&admin,&key,"credits").unwrap();
+    assert_eq!((balance.available,balance.held),(997_500_000,0));
+    assert_eq!(store.reconcile_quota_event_groups(now+1).unwrap(),0,"release plus late debit must pass quota audit");
+    assert_eq!(db.query_row("SELECT COUNT(*) FROM quota_ledger WHERE request_id=?1 AND event_kind='commit'",[&request],|r|r.get::<_,i64>(0)).unwrap(),1);
+}
+
 struct TestDirectory(PathBuf);
 
 impl TestDirectory {

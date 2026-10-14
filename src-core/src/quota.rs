@@ -1695,10 +1695,19 @@ impl CoreStore {
             .map(|(_, _, version)| *version)
             .collect::<Vec<_>>();
 
+        let released_proof=match Self::hold_release_in_connection(transaction,&reservation.request_id) {
+            Ok(proof)=>proof,Err(_)=>return Ok((false,"v2_hold_release_evidence_invalid".into())),
+        };
+        if released_proof.as_ref().is_some_and(|proof|proof.budget_id!=step.budget_id || proof.core_key_id!=step.core_key_id
+            || proof.account_ref!=step.account_ref || proof.bridge_instance_id!=step.bridge_instance_id || proof.hold_microcredits!=step.hold_microcredits)
+        {return Ok((false,"v2_hold_release_identity_invalid".into()));}
+        let had_release=released_proof.is_some();
+        let late_charge=had_release && reservation.state==ReservationState::Committed;
         let final_kind = match (reservation.state, step.financial_state.as_str()) {
             (ReservationState::Held, "held" | "conflict")
             | (ReservationState::Unknown, "unknown" | "conflict") => None,
             (ReservationState::Released, "released") => Some("release"),
+            (ReservationState::Released,"unknown"|"conflict") if had_release => Some("release"),
             (ReservationState::Committed, "settled" | "conflict") => Some("commit"),
             _ => return Ok((false, "v2_reservation_financial_state_mismatch".into())),
         };
@@ -1708,9 +1717,9 @@ impl CoreStore {
             return Ok((false, "v2_unsettled_step_has_actual_amount".into()));
         }
         if reservation.state == ReservationState::Released
-            && (step.dispatch_attempted != 0
+            && ((!had_release && step.dispatch_attempted != 0)
                 || step.actual_microcredits.is_some()
-                || step.release_reason.as_deref().is_none_or(str::is_empty))
+                || (!had_release && step.release_reason.as_deref().is_none_or(str::is_empty)))
         {
             return Ok((false, "v2_release_state_invalid".into()));
         }
@@ -1743,13 +1752,14 @@ impl CoreStore {
             rows.collect::<Result<Vec<_>, _>>()?
         };
         let adjustment_revision_count = revision_holds.len().saturating_sub(1);
-        let expected_event_count = account_ids.len() * (1 + adjustment_revision_count + usize::from(final_kind.is_some()));
+        let expected_event_count = account_ids.len() * (1 + adjustment_revision_count + usize::from(final_kind.is_some()) + usize::from(late_charge));
         if events.len() != expected_event_count {
             return Ok((false, "v2_ledger_event_count_mismatch".into()));
         }
         let mut reserve_versions = vec![None; account_ids.len()];
         let mut adjustment_versions = vec![vec![None; account_ids.len()]; revision_holds.len()];
         let mut final_versions = vec![None; account_ids.len()];
+        let mut release_versions = vec![None; account_ids.len()];
         for event in &events {
             let Some(event_account_id) = event.account_id.as_deref() else {
                 return Ok((false, "ledger_event_missing_budget_account".into()));
@@ -1797,12 +1807,13 @@ impl CoreStore {
                     }
                 }
                 "release"
-                    if final_kind == Some("release")
+                    if (final_kind == Some("release") || late_charge)
                         && event.authorization_revision == Some(history_max)
                         && event.amount == reservation.amount
                         && event.delta == reservation.amount =>
                 {
-                    if final_versions[account_index].replace(event_version).is_some() {
+                    let versions=if late_charge {&mut release_versions}else{&mut final_versions};
+                    if versions[account_index].replace(event_version).is_some() {
                         return Ok((false, "settlement_event_missing_or_duplicate".into()));
                     }
                 }
@@ -1810,7 +1821,7 @@ impl CoreStore {
                     if final_kind == Some("commit")
                         && event.authorization_revision == Some(history_max)
                         && Some(event.amount) == step.actual_microcredits
-                        && step.hold_microcredits.checked_sub(event.amount) == Some(event.delta) =>
+                        && (if late_charge {event.amount.checked_neg()}else{step.hold_microcredits.checked_sub(event.amount)}) == Some(event.delta) =>
                 {
                     if final_versions[account_index].replace(event_version).is_some() {
                         return Ok((false, "settlement_event_missing_or_duplicate".into()));
@@ -1839,6 +1850,9 @@ impl CoreStore {
                 };
                 if final_version < prior_version {
                     return Ok((false, "v2_ledger_event_version_order_mismatch".into()));
+                }
+                if late_charge && release_versions[index].is_none_or(|v|v<prior_version || v>final_version) {
+                    return Ok((false,"v2_late_charge_release_order_invalid".into()));
                 }
             }
         }
