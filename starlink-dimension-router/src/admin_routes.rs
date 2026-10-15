@@ -437,6 +437,8 @@ async fn list_api_keys(State(state): State<Arc<StarlinkRouterState>>, Extension(
                 "remaining": decimal_credits(remaining)?,
                 "deficit": decimal_credits(deficit)?,
                 "held": decimal_credits(held)?,
+                "running_held": decimal_credits(held.saturating_sub(key.reconciliation_held_credits))?,
+                "reconciliation_held": decimal_credits(key.reconciliation_held_credits)?,
             },
             "created_at_ms": key.created_at_ms,
             "revoked_at_ms": key.revoked_at_ms,

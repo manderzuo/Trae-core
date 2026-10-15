@@ -558,9 +558,22 @@ pub(crate) fn failure_feedback(state:&StarlinkRouterState,failure:&Failure,reque
     // An already verified upstream failure must not be replaced by a generic
     // disposition saved by the independent execution reconciler.
     if failure.upstream.is_none() && failure.stage.is_none() {failure.code=stored_failure_code(state,request).unwrap_or(failure.code);}
-    let settled=state.store.budget_operation(request).ok().flatten().is_some_and(|op|!op.steps.is_empty() && op.steps.iter().all(|s|
+    let operation=state.store.budget_operation(request).ok().flatten();
+    let settled=operation.as_ref().is_some_and(|op|!op.steps.is_empty() && op.steps.iter().all(|s|
         matches!(s.financial_state,aiwork_core::BudgetFinancialState::Settled|aiwork_core::BudgetFinancialState::Released)));
     let mut value=crate::seedance_feedback::failure_value(request,&failure,settled);
+    if let Some(op)=&operation {
+        let actual=if settled {op.steps.iter().try_fold(0i64,|sum,s|match (s.financial_state,s.actual_credits) {(_,Some(c))=>sum.checked_add(c.as_microcredits()),(aiwork_core::BudgetFinancialState::Released,None)=>Some(sum),_=>None}).and_then(aiwork_core::CreditAmount::try_from_microcredits)}else{None};
+        value["error"]["actual_credits"]=json!(actual);
+        value["error"]["billing_steps"]=json!(op.steps.iter().map(|s|json!({"kind":s.kind,"financial_state":s.financial_state,"actual_credits":s.actual_credits})).collect::<Vec<_>>());
+        if let Some(actual)=actual {
+            let old="积分已结算，可在 Key 使用记录查看实际扣费。";
+            let new=format!("积分已结算，本次实际扣费 {actual} 积分；可在 Key 使用记录查看明细。");
+            if let Some(text)=value["error"]["message"].as_str() {
+                let text=text.replace(old,&new);value["error"]["message"]=json!(text);value["choices"][0]["delta"]["content"]=json!(text);
+            }
+        }
+    }
     let before_video=state.store.budget_operation(request).ok().flatten().is_some_and(|op|
         op.steps.iter().any(|s|s.kind==BudgetStepKind::Assist) && !op.steps.iter().any(|s|s.kind==BudgetStepKind::Video));
     if failure.stage.is_some_and(|s|s.starts_with("assistant_")) && before_video {

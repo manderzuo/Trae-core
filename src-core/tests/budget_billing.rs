@@ -56,6 +56,57 @@ fn reviewed_hold_release_survives_restart_and_late_charge_is_debited_once() {
 struct TestDirectory(PathBuf);
 
 #[test]
+fn stopped_unknown_slot_can_retire_without_settling_or_refunding_money() {
+    let (dir,store,key,admin)=budget_fixture("unknown-slot-money-independent",1,100_000_000);
+    let request=begin_video_parent(&store,&key,"unknown-slot-money-independent");let budget="unknown-slot-independent-budget";
+    store.begin_budget_operation(&request,video_budget_step(&store,&key,&request,budget)).unwrap();
+    dispatch_current_budget_step(&store,&request).unwrap();store.bind_budget_video_task(&request,"task-receipt-video-1").unwrap();
+    store.mark_budget_step_execution(&request,aiwork_core::BudgetExecutionState::Unknown).unwrap();
+    let now=chrono::Utc::now().timestamp_millis();
+    let db=Connection::open(dir.0.join("data").join(CORE_DB_FILE)).unwrap();
+    db.execute("UPDATE budget_operations SET created_at_ms=?1 WHERE parent_request_id=?2",params![now-1_900_000,request]).unwrap();
+    db.execute("UPDATE budget_steps SET created_at_ms=?1 WHERE request_id=?2",params![now-1_900_000,request]).unwrap();
+    let before=store.key_quota_balance_as_admin(&admin,&key,"credits").unwrap();
+    let proof=aiwork_core::ReviewedExecutionSlotRelease {request_id:request.clone(),core_key_id:key.clone(),budget_id:budget.into(),account_ref:"account-test".into(),bridge_instance_id:"bridge-test".into(),task_ref:"task-receipt-video-1".into(),worker_absent_since_ms:now-61_000,observed_at_ms:now,review_ref:"bridge-worker-exit-v1:fixture".into()};
+    let key_view=store.list_api_keys_as_admin(&admin,None).unwrap().into_iter().find(|k|k.id==key).unwrap();
+    assert_eq!(serde_json::to_value(key_view).unwrap()["reconciliation_held_credits"],2_000_000);
+    assert_eq!(store.release_reviewed_unknown_execution_slot(&proof).unwrap(),aiwork_core::BudgetMutation::Applied);
+    assert_eq!(store.active_execution_count_for_key(&key).unwrap(),0);
+    assert_eq!(store.key_quota_balance_as_admin(&admin,&key,"credits").unwrap(),before);
+    assert!(store.mark_budget_step_dispatched(&request,budget).is_err());
+    let mut refreshed=proof.clone();refreshed.observed_at_ms+=1;
+    assert_eq!(store.release_reviewed_unknown_execution_slot(&refreshed).unwrap(),aiwork_core::BudgetMutation::Duplicate);
+    drop(store);let store=CoreStore::open(&dir.0).unwrap();
+    assert_eq!(store.active_execution_count_for_key(&key).unwrap(),0);
+    let receipt=final_budget_receipt(&request,budget,"1.25");store.apply_budget_receipt(receipt.clone()).unwrap();store.apply_budget_receipt(receipt).unwrap();
+    assert_eq!(store.key_quota_balance_as_admin(&admin,&key,"credits").unwrap().held,0);
+    let key_view=store.list_api_keys_as_admin(&admin,None).unwrap().into_iter().find(|k|k.id==key).unwrap();
+    assert_eq!(serde_json::to_value(key_view).unwrap()["reconciliation_held_credits"],0);
+}
+
+#[test]
+fn bridge_worker_exit_retires_unknown_assist_without_video_or_fee_side_effects() {
+    let (dir,store,key,admin)=budget_fixture("assist-worker-exit",1,100_000_000);
+    let parent=begin_video_parent(&store,&key,"assist-worker-exit-parent");
+    let child=match store.begin_budget_assist_request(&parent,budget_assist_input(&key,"assist-worker-exit-child")).unwrap(){BeginRequest::Created(c)=>c,_=>panic!()};
+    store.begin_budget_operation(&parent,assist_budget_step(&store,&key,&parent,&child.id,"assist-worker-exit-budget")).unwrap();
+    dispatch_current_budget_step(&store,&child.id).unwrap();store.mark_budget_step_execution(&child.id,aiwork_core::BudgetExecutionState::Unknown).unwrap();
+    let now=chrono::Utc::now().timestamp_millis();let db=Connection::open(dir.0.join("data").join(CORE_DB_FILE)).unwrap();
+    let proof=aiwork_core::ConfirmedWorkerExit {request_id:child.id.clone(),core_key_id:key.clone(),budget_id:"assist-worker-exit-budget".into(),account_ref:"account-test".into(),bridge_instance_id:"bridge-test".into(),task_ref:None,worker_absent_since_ms:now-61_000,observed_at_ms:now,review_ref:"bridge-worker-exit-v1:fixture".into()};
+    assert!(store.release_confirmed_worker_execution_slot(&proof).is_err(),"a fresh attempt is not past its execution window");
+    db.execute("UPDATE budget_steps SET created_at_ms=?1 WHERE request_id=?2",params![now-1_900_000,child.id]).unwrap();
+    let before=store.key_quota_balance_as_admin(&admin,&key,"credits").unwrap();
+    let mut wrong=proof.clone();wrong.core_key_id="wrong-key".into();assert!(store.release_confirmed_worker_execution_slot(&wrong).is_err());
+    wrong=proof.clone();wrong.worker_absent_since_ms=now;assert!(store.release_confirmed_worker_execution_slot(&wrong).is_err());
+    assert_eq!(store.release_confirmed_worker_execution_slot(&proof).unwrap(),aiwork_core::BudgetMutation::Applied);
+    assert_eq!(store.release_confirmed_worker_execution_slot(&proof).unwrap(),aiwork_core::BudgetMutation::Duplicate);
+    assert_eq!(store.active_execution_count_for_key(&key).unwrap(),0);
+    assert_eq!(store.key_quota_balance_as_admin(&admin,&key,"credits").unwrap(),before);
+    assert!(store.add_budget_step(&parent,video_budget_step(&store,&key,&parent,"blocked-after-assist-exit")).is_err());
+    assert_eq!(store.budget_operation(&parent).unwrap().unwrap().steps.len(),1);
+}
+
+#[test]
 fn reviewed_execution_slot_preserves_unknown_money_and_prevents_redispatch() {
     let (dir,store,key,admin)=budget_fixture("execution-slot",1,100_000_000);
     let request=begin_video_parent(&store,&key,"execution-slot");
@@ -75,6 +126,7 @@ fn reviewed_execution_slot_preserves_unknown_money_and_prevents_redispatch() {
     store.apply_budget_receipt(final_budget_receipt(&request,budget,"1.25")).unwrap();
     let db=Connection::open(dir.0.join("data").join(CORE_DB_FILE)).unwrap();
     db.execute("UPDATE budget_operations SET created_at_ms=?1 WHERE parent_request_id=?2",params![now-90_000_000,request]).unwrap();
+    db.execute("UPDATE budget_steps SET created_at_ms=?1 WHERE request_id=?2",params![now-90_000_000,request]).unwrap();
     let before=store.key_quota_balance_as_admin(&admin,&key,"credits").unwrap();
     let mut wrong=proof.clone();wrong.task_ref="other-task".into();
     assert!(store.release_reviewed_unknown_execution_slot(&wrong).is_err());

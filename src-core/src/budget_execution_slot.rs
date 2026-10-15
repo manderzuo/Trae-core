@@ -20,7 +20,38 @@ pub struct ReviewedExecutionSlotRelease {
     pub review_ref: String,
 }
 
+/// Authenticated bridge evidence of local worker retirement. This can also
+/// describe an assist/chat step which has no native video task reference.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmedWorkerExit {
+    pub request_id:String,pub core_key_id:String,pub budget_id:String,
+    pub account_ref:String,pub bridge_instance_id:String,pub task_ref:Option<String>,
+    pub worker_absent_since_ms:i64,pub observed_at_ms:i64,pub review_ref:String,
+}
+
 impl CoreStore {
+    pub fn release_confirmed_worker_execution_slot(&self,proof:&ConfirmedWorkerExit)->Result<BudgetMutation,CoreError> {
+        let invalid=||CoreError::Validation {field:"execution_slot.worker_exit".into(),reason:"worker exit evidence or identity does not match".into()};
+        let now=chrono::Utc::now().timestamp_millis();
+        if [&proof.request_id,&proof.core_key_id,&proof.budget_id,&proof.account_ref,&proof.bridge_instance_id,&proof.review_ref].iter().any(|s|s.is_empty()||s.len()>256)
+            || !proof.review_ref.starts_with("bridge-worker-exit-v1:") || proof.worker_absent_since_ms<=0
+            || proof.worker_absent_since_ms>proof.observed_at_ms.saturating_sub(60_000)
+            || proof.observed_at_ms<now-300_000 || proof.observed_at_ms>now+60_000 {return Err(invalid());}
+        let mut db=self.connection.lock().expect("core store mutex poisoned");let tx=db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let identity:Option<(String,String)>=tx.query_row("SELECT o.parent_request_id,s.operation_id FROM budget_steps s JOIN budget_operations o ON o.operation_id=s.operation_id
+            WHERE s.request_id=?1 AND s.core_key_id=?2 AND s.budget_id=?3 AND s.account_ref=?4 AND s.bridge_instance_id=?5
+              AND s.task_ref IS ?6 AND s.dispatch_attempted=1 AND s.execution_state='unknown' AND s.created_at_ms<=?7",
+            params![proof.request_id,proof.core_key_id,proof.budget_id,proof.account_ref,proof.bridge_instance_id,proof.task_ref,now-1_800_000],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let Some((parent,operation))=identity else{return Err(invalid())};
+        if Self::execution_slot_released_in_connection(&tx,&parent)? {return Ok(BudgetMutation::Duplicate);}
+        let eligible:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM budget_operations o WHERE o.operation_id=?1 AND o.api_key_id=?2 AND o.execution_state IN ('ready','running','unknown')
+            AND NOT EXISTS(SELECT 1 FROM budget_steps s WHERE s.operation_id=o.operation_id AND s.request_id<>?3 AND s.execution_state NOT IN ('succeeded','failed','canceled')))",params![operation,proof.core_key_id,proof.request_id],|r|r.get(0))?;
+        if !eligible {return Err(invalid());}
+        tx.execute("INSERT INTO budget_execution_slot_releases(parent_request_id,reason,proof_json,released_at_ms) VALUES (?1,'reviewed_worker_absence',?2,?3)",params![parent,serde_json::to_string(proof)?,now])?;
+        Self::insert_audit_event(&tx,"system","budget.execution_slot_released","request",&parent,serde_json::json!({"reason":"confirmed_worker_exit","budget_id":proof.budget_id}),now)?;
+        tx.commit()?;Ok(BudgetMutation::Applied)
+    }
     pub(crate) fn execution_slot_released_in_connection(db: &Connection, parent: &str) -> Result<bool, CoreError> {
         Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM budget_execution_slot_releases WHERE parent_request_id=?1)", [parent], |r|r.get(0))?)
     }
@@ -55,20 +86,24 @@ impl CoreStore {
         let invalid=||CoreError::Validation {field:"execution_slot.review".into(),reason:"worker review or request identity does not match".into()};
         let now=chrono::Utc::now().timestamp_millis();
         if [&proof.request_id,&proof.core_key_id,&proof.budget_id,&proof.account_ref,&proof.bridge_instance_id,&proof.task_ref,&proof.review_ref].iter().any(|v|v.trim().is_empty() || v.len()>256)
-            || proof.worker_absent_since_ms<=0 || proof.worker_absent_since_ms>proof.observed_at_ms.saturating_sub(1_800_000)
+            || proof.worker_absent_since_ms<=0 || proof.worker_absent_since_ms>proof.observed_at_ms.saturating_sub(60_000)
             || proof.observed_at_ms>now+60_000 || proof.observed_at_ms<now-300_000 { return Err(invalid()); }
         let mut db=self.connection.lock().expect("core store mutex poisoned");
         let tx=db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let serialized=serde_json::to_string(proof)?;
         let prior:Option<String>=tx.query_row("SELECT proof_json FROM budget_execution_slot_releases WHERE parent_request_id=?1",[&proof.request_id],|r|r.get(0)).optional()?;
-        if let Some(prior)=prior { return if prior==serialized {Ok(BudgetMutation::Duplicate)} else {Err(CoreError::IdempotencyConflict)}; }
+        if let Some(prior)=prior {
+            let previous:ReviewedExecutionSlotRelease=serde_json::from_str(&prior).map_err(|_|invalid())?;
+            return if (previous.request_id,previous.core_key_id,previous.budget_id,previous.account_ref,previous.bridge_instance_id,previous.task_ref)==
+                (proof.request_id.clone(),proof.core_key_id.clone(),proof.budget_id.clone(),proof.account_ref.clone(),proof.bridge_instance_id.clone(),proof.task_ref.clone()) {Ok(BudgetMutation::Duplicate)}else{Err(CoreError::IdempotencyConflict)};
+        }
         let eligible:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM budget_operations o
             JOIN budget_steps s ON s.operation_id=o.operation_id
             WHERE o.parent_request_id=?1 AND o.api_key_id=?2 AND o.execution_state='unknown' AND o.created_at_ms<=?7
               AND s.request_id=?1 AND s.core_key_id=?2 AND s.budget_id=?3 AND s.account_ref=?4 AND s.bridge_instance_id=?5 AND s.task_ref=?6
-              AND s.kind='video' AND s.dispatch_attempted=1 AND s.execution_state='unknown' AND s.financial_state='settled'
-              AND NOT EXISTS(SELECT 1 FROM budget_steps other WHERE other.operation_id=o.operation_id AND (other.financial_state<>'settled' OR (other.request_id<>?1 AND other.execution_state NOT IN ('succeeded','failed','canceled')))))",
-            params![proof.request_id,proof.core_key_id,proof.budget_id,proof.account_ref,proof.bridge_instance_id,proof.task_ref,now-86_400_000],|r|r.get(0))?;
+              AND s.kind='video' AND s.dispatch_attempted=1 AND s.execution_state='unknown' AND s.created_at_ms<=?7
+              AND NOT EXISTS(SELECT 1 FROM budget_steps other WHERE other.operation_id=o.operation_id AND other.request_id<>?1 AND other.execution_state NOT IN ('succeeded','failed','canceled')))",
+            params![proof.request_id,proof.core_key_id,proof.budget_id,proof.account_ref,proof.bridge_instance_id,proof.task_ref,now-1_800_000],|r|r.get(0))?;
         if !eligible {return Err(invalid());}
         tx.execute("INSERT INTO budget_execution_slot_releases(parent_request_id,reason,proof_json,released_at_ms) VALUES (?1,'reviewed_worker_absence',?2,?3)",params![proof.request_id,serialized,now])?;
         Self::insert_audit_event(&tx,"operator","budget.execution_slot_released","request",&proof.request_id,serde_json::json!({"reason":"reviewed_worker_absence","review_ref":proof.review_ref}),now)?;

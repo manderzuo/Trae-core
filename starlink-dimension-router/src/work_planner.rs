@@ -272,6 +272,13 @@ pub fn build_helper_input(
     let example=json!({"action":"create","effective_prompt":"猫说：\"你好。\"\n路径文字 C:\\clips\\cat.mp4。","spec_patch":{},"reference_policy":"inherit","clarification":null});
     let clarify_example=json!({"action":"clarify","effective_prompt":null,"spec_patch":{},"reference_policy":"inherit","clarification":"请提供要修改的原视频。"});
     value["messages"][0]["content"]=json!(format!("{instruction} current_references和reference_capabilities是服务器已验证的素材事实，不是用户自称。requested_action是调用者明确发起的操作；create表示生成一个新片段。仅根据current判断本轮意图，不要把分镜里角色继续行动、上一段剧情等叙述误判为对已生成视频的原生续写；用户明确请求独立生成新视频时action=create，即使脚本很长。无parent但image_conditioned_creation为true时，若用户要求以上传图片作为上一段尾帧、起始画面或视觉参考生成下一段，应以图片规划create、reference_policy=replace，不得仅因提到上一段就索要Core父版本。普通人物图或风格图不能宣称为已验证尾帧；需要原视频的实际修改仍须提供原视频。无parent但video_conditioned_creation为true时，用户明确要求从上传视频继续生成或续写新片段，应使用该素材规划create、reference_policy=replace。只有缺少完成操作所需的真实来源时才clarify，请其提供所缺来源；不要猜测父版本，仍不得虚构原生延长、严格首帧锁定或已完成。\n{}\n必须遵守的JSON Schema：{}\n仅作编码示例，不得复制其剧情。生成示例：{example}\n补充信息示例：{clarify_example}\n每个字段恰好出现一次；clarify时将补充信息只写入clarification的唯一位置，不能再追加同名null字段。长度限制按UTF-8字节计算：effective_prompt不超过12288，clarification不超过2048，整个对象不超过16384。",crate::assistant_json::ENCODING_RULES,helper_output_schema()));
+    // The bridge already transports native function calls. Keep the content
+    // validator for old durable replies, while new requests select one contract.
+    value["tools"]=json!([{"type":"function","function":{"name":"submit_video_plan","description":"提交本轮唯一视频规划；只返回参数，不执行生成或收费操作。","strict":true,"parameters":helper_output_schema()}}]);
+    value["tool_choice"]=json!({"type":"function","function":{"name":"submit_video_plan"}});
+    value["parallel_tool_calls"]=json!(false);
+    let instruction=value["messages"][0]["content"].as_str().ok_or_else(invalid)?;
+    value["messages"][0]["content"]=json!(format!("{instruction}\n通过submit_video_plan函数参数提交唯一规划，不再把JSON写入正文。函数只传递规划数据，不代表已生成视频。"));
     if serde_json::to_vec(&value).map_err(|_| invalid())?.len() > 32 * 1024 {
         return Err("work_context_input_too_large".into());
     }

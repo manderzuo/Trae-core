@@ -42,6 +42,14 @@ fn helper_contract_includes_schema_and_escaping_without_rewriting_dialogue() {
     assert_eq!(payload["current"],b["messages"][0]["content"],"document text must stay data, only specification fields are normalized");
 }
 #[test]
+fn planner_uses_a_named_strict_function_contract_for_quoted_dialogue() {
+    let input=work_planner::build_helper_input(None,&body("女人说：\"加一套。\"，保留引号、换行和路径C:\\clips。"),"glm-5.3-flash").unwrap();
+    assert_eq!(input["tool_choice"]["function"]["name"],"submit_video_plan");
+    assert_eq!(input["tools"][0]["function"]["strict"],true);
+    assert_eq!(input["tools"][0]["function"]["parameters"]["additionalProperties"],false);
+    assert_eq!(input["tools"][0]["function"]["parameters"]["required"].as_array().unwrap().len(),5);
+}
+#[test]
 fn helper_schema_rejects_missing_unknown_and_wrong_types_but_preserves_valid_text() {
     let prompt="猫说：\"你好。\"\nC:\\clips\\猫.mp4";
     let base=json!({"action":"create","effective_prompt":prompt,"spec_patch":{},"reference_policy":"inherit","clarification":null});

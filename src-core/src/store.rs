@@ -1532,6 +1532,12 @@ impl CoreStore {
                         })
                     })
                     .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+                let reconciliation_held_credits=transaction.query_row(
+                    "SELECT COALESCE(SUM(q.amount),0) FROM quota_reservations q
+                     LEFT JOIN budget_steps s ON s.reservation_id=q.id LEFT JOIN requests r ON r.id=q.request_id
+                     WHERE q.api_key_id=?1 AND q.resource_kind='credits' AND q.state IN ('held','unknown') AND q.key_budget_account_id IS NOT NULL
+                       AND COALESCE(s.execution_state,r.state,'unknown') NOT IN ('ready','running','received','validating','reserved','queued','dispatched','completing','cancel_requested')",
+                    [&id],|row|row.get(0))?;
                 Ok(CoreApiKeyAdminView {
                     id,
                     user_id,
@@ -1546,6 +1552,7 @@ impl CoreStore {
                     usage,
                     key_quota,
                     verified_credit_spent,
+                    reconciliation_held_credits,
                     pool_allocatable,
                     created_at_ms,
                     revoked_at_ms,

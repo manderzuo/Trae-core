@@ -99,6 +99,13 @@ pub(crate) fn sync_execution(state: &StarlinkRouterState, client: &BridgeClient,
     } else {
         state.store.mark_budget_step_execution(&step.request_id,next).map_err(|e|e.to_string())?;
     }
+    if next==Execution::Unknown && value["worker_exit"].is_object() {
+        identity(&value["worker_exit"],step)?;
+        let proof:aiwork_core::ConfirmedWorkerExit=serde_json::from_value(value["worker_exit"].clone()).map_err(|_|"invalid worker exit proof")?;
+        if proof.review_ref.starts_with("bridge-worker-exit-v1:") {
+            state.store.release_confirmed_worker_execution_slot(&proof).map_err(|e|e.to_string())?;
+        } else {return Err("unsupported worker exit policy".into());}
+    }
     // A successful helper alone must NOT finish a parent still awaiting video preparation.
     if terminal && step.kind!=BudgetStepKind::Assist && step.request_id==step.parent_request_id {
         let result=if next==Execution::Failed {

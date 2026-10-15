@@ -324,6 +324,10 @@ pub struct CoreApiKeyAdminView {
     pub key_quota: Vec<CoreQuotaBalanceView>,
     /// Exact actual credits backed by a final request-scoped billing receipt.
     pub verified_credit_spent: i64,
+    /// Real reservations awaiting accounting; a subset of held, never refunded
+    /// merely because the local execution worker has exited.
+    #[serde(default)]
+    pub reconciliation_held_credits: i64,
     /// Remaining user-cap balance that is not already allocated to any key.
     pub pool_allocatable: Vec<CoreQuotaBalanceView>,
     pub created_at_ms: i64,

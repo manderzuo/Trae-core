@@ -203,6 +203,22 @@ impl<'de> Deserialize<'de> for ReadOnlyClarification {
 }
 
 pub(crate) fn planning_result_object(result:&Value)->Result<Value,Diagnostic> {
+    let choice=&result["choices"][0];
+    if choice["finish_reason"]=="tool_calls" || choice["message"]["tool_calls"].as_array().is_some_and(|v|!v.is_empty()) {
+        if result["choices"].as_array().is_none_or(|v|v.len()!=1) || choice["finish_reason"]!="tool_calls" {
+            return Err(Diagnostic::new("assistant_output_invalid"));
+        }
+        let message=&choice["message"];
+        let calls=message["tool_calls"].as_array().filter(|v|v.len()==1).ok_or_else(||Diagnostic::new("assistant_output_invalid"))?;
+        if !message["refusal"].is_null() || !message["function_call"].is_null()
+            || (!message["content"].is_null() && message["content"].as_str().is_none_or(|s|!s.trim().is_empty()))
+            || calls[0]["type"]!="function" || calls[0]["id"].as_str().is_none_or(|s|s.is_empty())
+            || calls[0]["function"]["name"]!="submit_video_plan" {
+            return Err(Diagnostic::new("assistant_output_invalid"));
+        }
+        let arguments=calls[0]["function"]["arguments"].as_str().ok_or_else(||Diagnostic::new("assistant_output_invalid"))?;
+        return object_checked(arguments,16*1024);
+    }
     match result_object(result) {
         Err(error) if error.code=="assistant_json_duplicate_key"=>{
             // result_object already validated stop/refusal/tools, size and fence.
@@ -261,6 +277,33 @@ pub(crate) fn legacy_result(result: &Value) -> Result<Value, Diagnostic> {
         return Err(Diagnostic::new("assistant_schema_invalid"));
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod structured_plan_regression {
+    use super::*;
+    #[test]
+    fn named_function_plan_preserves_dialogue_escapes_and_unicode() {
+        let prompt="女人说：\"加一套。\"\n镜头路径 C:\\clips\\片段，保持原句。";
+        let plan=serde_json::json!({"action":"create","effective_prompt":prompt,"spec_patch":{},"reference_policy":"replace","clarification":null});
+        let reply=serde_json::json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"id":"plan-one","type":"function","function":{"name":"submit_video_plan","arguments":plan.to_string()}}]}}]});
+        assert_eq!(planning_result_object(&reply).unwrap(),plan);
+    }
+    #[test]
+    fn planner_function_rejects_ambiguous_calls_and_malformed_arguments() {
+        let valid=serde_json::json!({"choices":[{"finish_reason":"tool_calls","message":{"content":null,"tool_calls":[{"id":"one","type":"function","function":{"name":"submit_video_plan","arguments":"{\"action\":\"create\"}"}}]}}]});
+        for bad_arguments in [r#"{"effective_prompt":"猫说:"你好""}"#,r#"{"action":"create","action":"revise"}"#,r#"{"x":"bad\q"}"#,r#"{"x":1} {"x":2}"#] {
+            let mut bad=valid.clone();bad["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]=serde_json::json!(bad_arguments);
+            assert!(planning_result_object(&bad).is_err());
+        }
+        for (field,value) in [("name",serde_json::json!("run_video")),("arguments",serde_json::json!({"action":"create"}))] {
+            let mut bad=valid.clone();bad["choices"][0]["message"]["tool_calls"][0]["function"][field]=value;
+            assert!(planning_result_object(&bad).is_err());
+        }
+        let mut bad=valid.clone();bad["choices"][0]["message"]["content"]=serde_json::json!("另一份规划");assert!(planning_result_object(&bad).is_err());
+        let mut bad=valid.clone();bad["choices"][0]["finish_reason"]=serde_json::json!("length");assert!(planning_result_object(&bad).is_err());
+        let mut bad=valid.clone();bad["choices"][0]["message"]["tool_calls"].as_array_mut().unwrap().push(valid["choices"][0]["message"]["tool_calls"][0].clone());assert!(planning_result_object(&bad).is_err());
+    }
 }
 
 #[cfg(test)]
