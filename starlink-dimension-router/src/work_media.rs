@@ -173,10 +173,12 @@ pub(crate) fn pin_kind(
             read_plain(state, &current, &reference(state, &current)?)?;
             return Ok(current);
         }
-        if old.state != "deleted" {
+        if old.state != "deleted" && !(kind=="tail_frame" && old.state=="active" && old.expires_at_ms<=now) {
             return Err("work_media_expired_or_unavailable".into());
         }
     }
+    let obsolete=existing.as_ref().filter(|m|m.state=="active" && m.expires_at_ms<=now)
+        .map(|m|reference(state,m)).transpose()?;
     let id = existing
         .map(|m| m.media_id)
         .unwrap_or_else(|| format!("media_{:032x}", rand::random::<u128>()));
@@ -235,6 +237,7 @@ pub(crate) fn pin_kind(
         .activate_work_media(p, &m.media_id)
         .map_err(|_| "work_media_store_unavailable")?;
     m.state = "active".into();
+    if let Some(old)=obsolete {if old.file!=r.file {if let Ok(file)=path(state,&old.file) {let _=fs::remove_file(file);}}}
     Ok(m)
 }
 pub fn materialize(

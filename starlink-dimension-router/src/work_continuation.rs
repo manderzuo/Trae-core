@@ -90,16 +90,12 @@ fn saved(
     let Some(id) = v.tail_frame_media_id.as_deref() else {
         return Ok(None);
     };
-    let media = state
+    let Some(media) = state
         .store
         .owned_work_media(p, id)
-        .map_err(|_| "work_media_unavailable")?
-        .filter(|m| {
-            m.work_id == v.work_id
-                && m.kind == "tail_frame"
-                && m.expires_at_ms > chrono::Utc::now().timestamp_millis()
-        })
-        .ok_or("work_media_unavailable")?;
+        .map_err(|_| "work_media_unavailable")? else {return Ok(None)};
+    if media.work_id!=v.work_id || media.kind!="tail_frame" {return Err("frame_identity_invalid".into());}
+    if media.expires_at_ms<=chrono::Utc::now().timestamp_millis() {return Ok(None);}
     let sealed = v.sealed_frame.as_ref().ok_or("frame_identity_invalid")?;
     let raw = zeroize::Zeroizing::new(
         state
@@ -122,7 +118,10 @@ fn saved(
     {
         return Err("frame_identity_invalid".into());
     }
-    crate::work_media::materialize(state, p, &media, chrono::Utc::now().timestamp_millis())?;
+    if let Err(code)=crate::work_media::materialize(state,p,&media,chrono::Utc::now().timestamp_millis()) {
+        if code=="reference_asset_missing" && state.store.expire_missing_tail_cache(p,&media,chrono::Utc::now().timestamp_millis()).map_err(|_|"work_media_unavailable")? {return Ok(None);}
+        return Err(code);
+    }
     Ok(Some(media))
 }
 pub async fn warm_tail_frame(

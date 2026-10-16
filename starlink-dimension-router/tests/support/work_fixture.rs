@@ -50,6 +50,7 @@ pub(crate) struct Bridge {
     pub(crate) video_diagnostic: Mutex<Option<Value>>,
     pub(crate) delivery_failure: Mutex<Option<Value>>,
     pub(crate) video_prepare_error: Mutex<Option<(u16, String)>>,
+    pub(crate) video_preflight_error: Mutex<Option<(u16, String)>>,
     pub(crate) next_video_failure: Mutex<Option<Value>>,
     pub(crate) video_failures: Mutex<BTreeMap<String, Value>>,
     pub(crate) asset_uploads: AtomicUsize,
@@ -67,6 +68,10 @@ impl BridgeTransport for Bridge {
             Some("Bearer bridge-only")
         );
         let input: Value = serde_json::from_slice(raw).unwrap_or(Value::Null);
+        if url.ends_with("/budgets/preflight") {
+            let error=self.video_preflight_error.lock().unwrap().clone();
+            return Ok(BridgeResponse{status:error.as_ref().map_or(200,|e|e.0),headers:BTreeMap::new(),body:serde_json::to_vec(&match error {Some((_,code))=>json!({"error":{"code":code}}),None=>json!({"wire_version":2,"request_id":input["request_id"],"status":"ready"})}).unwrap()});
+        }
         if url.ends_with("/frame-extractor/health") {
             let error=self.frame_health_error.lock().unwrap().clone();
             return Ok(BridgeResponse {status:if error.is_some(){503}else{200},headers:BTreeMap::new(),body:serde_json::to_vec(&match error {Some(code)=>json!({"error":{"code":code}}),None=>json!({"status":"ready"})}).unwrap()});
@@ -352,6 +357,7 @@ impl Fixture {
             video_diagnostic: Mutex::new(None),
             delivery_failure: Mutex::new(None),
             video_prepare_error: Mutex::new(None),
+            video_preflight_error: Mutex::new(None),
             next_video_failure: Mutex::new(None),
             video_failures: Mutex::new(BTreeMap::new()),
             asset_uploads: AtomicUsize::new(0),

@@ -79,7 +79,7 @@ fn continuation_is_request_bound_immutable_and_survives_reopen() {
     assert_eq!(saved.ciphertext,ciphertext);assert_eq!(saved.key_version,1);
     assert_eq!(saved.principal.unwrap(),principal);
     assert_eq!(saved.fingerprint,store.request_fingerprint_for_billing(&request.id).unwrap());
-    assert!(reopened.pending_budget_continuations_after("",100).unwrap().is_empty(),"a checkpoint without a successful helper cannot start paid work");
+    assert_eq!(reopened.pending_budget_continuations_after("",100).unwrap().len(),1,"a durably accepted unadmitted request resumes with its original identity");
     let connection=rusqlite::Connection::open(dir.0.join("data").join(CORE_DB_FILE)).unwrap();
     connection.execute("UPDATE api_keys SET status='revoked' WHERE id=?1",[&key.id]).unwrap();
     assert!(reopened.budget_continuation(&request.id).unwrap().unwrap().principal.is_none(),"recovery cannot reuse submit-time authorization after revocation");

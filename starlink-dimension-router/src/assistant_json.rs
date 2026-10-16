@@ -192,7 +192,7 @@ impl<'de> Deserialize<'de> for ReadOnlyClarification {
                     || value["action"]!="clarify" || !value["effective_prompt"].is_null()
                     || !(value["spec_patch"].is_null() || value["spec_patch"].as_object().is_some_and(|o|o.is_empty()))
                     || !(value["reference_policy"].is_null() || value["reference_policy"]=="inherit")
-                    || value["clarification"].as_str().is_none_or(|s|s.trim().is_empty() || s.len()>2048) {
+                    || value["clarification"].as_str().is_none_or(|s|s.trim().is_empty() || s.chars().count()>2048) {
                     return Err(de::Error::custom("assistant_duplicate_key"));
                 }
                 Ok(ReadOnlyClarification(value))
@@ -217,13 +217,13 @@ pub(crate) fn planning_result_object(result:&Value)->Result<Value,Diagnostic> {
             return Err(Diagnostic::new("assistant_output_invalid"));
         }
         let arguments=calls[0]["function"]["arguments"].as_str().ok_or_else(||Diagnostic::new("assistant_output_invalid"))?;
-        return object_checked(arguments,16*1024);
+        return object_checked(arguments,64*1024);
     }
     match result_object(result) {
         Err(error) if error.code=="assistant_json_duplicate_key"=>{
             // result_object already validated stop/refusal/tools, size and fence.
             let raw=result["choices"][0]["message"]["content"].as_str().ok_or_else(||error.clone())?;
-            serde_json::from_str::<ReadOnlyClarification>(json_source(raw,16*1024)?)
+            serde_json::from_str::<ReadOnlyClarification>(json_source(raw,64*1024)?)
                 .map(|v|v.0).map_err(|_|error)
         },
         other=>other,
@@ -252,7 +252,7 @@ pub(crate) fn result_object(result: &Value) -> Result<Value, Diagnostic> {
     let raw = message["content"]
         .as_str()
         .ok_or_else(|| Diagnostic::new("assistant_output_invalid"))?;
-    object_checked(raw, 16 * 1024)
+    object_checked(raw, 64 * 1024)
 }
 
 pub(crate) fn legacy_result(result: &Value) -> Result<Value, Diagnostic> {

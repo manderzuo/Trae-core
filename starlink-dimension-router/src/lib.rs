@@ -22,6 +22,7 @@ pub mod work_execution;
 pub mod work_continuation;
 pub mod work_routes;
 pub mod work_retry;
+pub(crate) mod request_recovery;
 pub mod video_billing;
 pub mod video_reconciler;
 pub(crate) mod budget_reconciler;

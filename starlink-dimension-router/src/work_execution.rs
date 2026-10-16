@@ -555,6 +555,10 @@ pub(crate) async fn execute(
             let s=state.clone();tokio::task::spawn_blocking(move||s.bridge_client().frame_extractor_health()).await.map_err(|_|"frame_extraction_unavailable")??;
         }
         let model = state.config.seedance_assistant_model.clone();
+        if operation.as_ref().is_none_or(|op|!op.steps.iter().any(|s|s.kind==BudgetStepKind::Assist)) {
+            let s=state.clone();let owner=p.clone();let id=request.clone();let body=normalized.clone();let prior=base.clone();
+            tokio::task::spawn_blocking(move||crate::budget_flow::video_preflight(&s,&owner,&id,&body,prior.as_ref())).await.map_err(|_|"budget_preparation_failed")??;
+        }
         state.seedance_results.progress(&request, Stage::Assistant);
         let assist = if let Some(step) = operation
             .as_ref()

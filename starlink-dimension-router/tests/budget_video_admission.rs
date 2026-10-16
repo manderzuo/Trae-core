@@ -30,6 +30,7 @@ impl BridgeTransport for Bridge {
     }
     fn send(&self,_method:&str,url:&str,headers:&BTreeMap<String,String>,body:&[u8])->Result<BridgeResponse,String> {
         assert_eq!(headers.get("authorization").map(String::as_str),Some("Bearer bridge-only"));
+        if url.ends_with("/budgets/preflight") {let input:Value=serde_json::from_slice(body).unwrap();return Ok(BridgeResponse{status:200,headers:BTreeMap::new(),body:serde_json::to_vec(&json!({"wire_version":2,"request_id":input["request_id"],"status":"ready"})).unwrap()});}
         if url.contains("/content?") {return Ok(BridgeResponse {status:self.download_status.load(Ordering::SeqCst) as u16,headers:BTreeMap::from([("content-type".into(),"video/mp4".into())]),body:b"fixture-mp4".to_vec()});}
         let value=if url.ends_with("/v1/assets") {
             let upload:Value=serde_json::from_slice(body).unwrap();

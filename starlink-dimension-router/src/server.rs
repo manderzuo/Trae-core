@@ -16,6 +16,8 @@ pub fn build_router(state: Arc<StarlinkRouterState>) -> Router {
         .route("/v1/chat/completions", post(user_routes::chat_completions).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
         .route("/v1/assets", post(user_routes::assets_upload).layer(DefaultBodyLimit::max(46 * 1024 * 1024)))
         .route("/v1/videos/generations", post(user_routes::video_generations))
+        .route("/v1/videos/generations/lookup", post(crate::request_recovery::video).layer(DefaultBodyLimit::max(8*1024*1024)))
+        .route("/v1/chat/completions/lookup", post(crate::request_recovery::chat).layer(DefaultBodyLimit::max(8*1024*1024)))
         .route("/v1/video-works/:work_id", get(crate::work_routes::get))
         .route("/v1/video-works/:work_id/continue", post(crate::work_routes::continue_work))
         .route("/v1/videos/:task_id", get(user_routes::video_task))

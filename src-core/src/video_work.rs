@@ -688,12 +688,17 @@ impl CoreStore {
             return Err(invalid("work is unavailable"));
         }
         let old=tx.query_row(&format!("SELECT {MEDIA_COLUMNS} FROM video_work_media m WHERE m.work_id=?1 AND m.kind=?2 AND m.content_sha256=?3"),params![m.work_id,m.kind,m.content_sha256],read_media).optional()?;
+        let now=chrono::Utc::now().timestamp_millis();
+        let replacing_expired=if let Some(old)=&old {
+            old.kind=="tail_frame" && old.state=="active" && old.expires_at_ms<=now && m.expires_at_ms>now &&
+                !tx.query_row("SELECT leases_json!='[]' FROM video_work_media WHERE media_id=?1",[&old.media_id],|r|r.get::<_,bool>(0))?
+        }else{false};
         if let Some(ref old) = old {
-            if old.state == "active" {
+            if old.state == "active" && !replacing_expired {
                 tx.commit()?;
                 return Ok(old.clone());
             }
-            if old.state != "deleted" {
+            if old.state != "deleted" && !replacing_expired {
                 return Err(invalid("private media is not ready"));
             }
         }
@@ -703,8 +708,9 @@ impl CoreStore {
             |r| r.get(0),
         )?;
         let used:i64=tx.query_row("SELECT COALESCE(SUM(size_bytes),0) FROM video_work_media WHERE owner_key_id=?1 AND state!='deleted'",[&p.key_id],|r|r.get(0))?;
-        if m.size_bytes > key_limit.saturating_sub(used)
-            || m.size_bytes > global_limit.saturating_sub(global)
+        let replaced_size=if replacing_expired {old.as_ref().map_or(0,|m|m.size_bytes)}else{0};
+        if m.size_bytes > key_limit.saturating_sub(used.saturating_sub(replaced_size))
+            || m.size_bytes > global_limit.saturating_sub(global.saturating_sub(replaced_size))
         {
             return Err(invalid("work media capacity exceeded"));
         }
@@ -719,7 +725,7 @@ impl CoreStore {
             if out.media_id != m.media_id {
                 return Err(invalid("reuse deleted media id for replacement"));
             }
-            tx.execute("UPDATE video_work_media SET encrypted_storage_ref=?2,key_version=?3,size_bytes=?4,expires_at_ms=?5,state='preparing' WHERE media_id=?1 AND state='deleted'",params![out.media_id,out.encrypted_storage_ref,out.key_version,out.size_bytes,out.expires_at_ms])?;
+            tx.execute("UPDATE video_work_media SET encrypted_storage_ref=?2,key_version=?3,size_bytes=?4,expires_at_ms=?5,state='preparing' WHERE media_id=?1 AND (state='deleted' OR (state='active' AND kind='tail_frame' AND expires_at_ms<=?6 AND leases_json='[]'))",params![out.media_id,out.encrypted_storage_ref,out.key_version,out.size_bytes,out.expires_at_ms,now])?;
         } else {
             tx.execute("INSERT INTO video_work_media(media_id,work_id,owner_key_id,kind,content_sha256,encrypted_storage_ref,key_version,size_bytes,expires_at_ms,state) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'preparing')",params![m.media_id,m.work_id,p.key_id,m.kind,m.content_sha256,m.encrypted_storage_ref,m.key_version,m.size_bytes,m.expires_at_ms])?;
         }
@@ -731,6 +737,14 @@ impl CoreStore {
         validate_owner(&con, p)?;
         if con.execute("UPDATE video_work_media SET state='active' WHERE media_id=?1 AND owner_key_id=?2 AND state='preparing'",params![id,p.key_id])?!=1 {return Err(invalid("private media cannot be activated"));}
         Ok(())
+    }
+    /// The caller has verified a missing ciphertext file, not a corrupt or
+    /// foreign object. Expire only this unchanged, unleased tail cache so the
+    /// original video can rebuild it under the existing version's frame proof.
+    pub fn expire_missing_tail_cache(&self,p:&Principal,m:&WorkMediaRef,now:i64)->Result<bool,CoreError>{
+        if now<=0 || m.owner_key_id!=p.key_id || m.kind!="tail_frame" {return Err(invalid("invalid missing tail cache"));}
+        let con=self.connection.lock().expect("core store mutex poisoned");validate_owner(&con,p)?;
+        Ok(con.execute("UPDATE video_work_media SET expires_at_ms=MIN(expires_at_ms,?7) WHERE media_id=?1 AND owner_key_id=?2 AND work_id=?3 AND kind='tail_frame' AND state='active' AND leases_json='[]' AND encrypted_storage_ref=?4 AND key_version=?5 AND content_sha256=?6",params![m.media_id,p.key_id,m.work_id,m.encrypted_storage_ref,m.key_version,m.content_sha256,now])?==1)
     }
     pub fn owned_work_media(
         &self,

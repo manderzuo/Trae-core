@@ -70,6 +70,23 @@ mod error_tests {
 fn post(client:&BridgeClient,path:&str,body:&Value,request:&str)->Result<Value,String> {
     client.json_request("POST",path,&serde_json::to_vec(body).map_err(|_|"budget encoding failed")?,Some(request))
 }
+pub(crate) fn video_preflight(state:&StarlinkRouterState,principal:&Principal,request:&str,body:&Value,base:Option<&aiwork_core::VideoWorkSnapshot>)->Result<(),String> {
+    // Only explicit/previously confirmed specifications are known before AI
+    // planning. Never infer production intent or timeline values with regexes.
+    let images=body["image_asset_ids"].as_array().map_or(0,Vec::len)+inline_images(body)?.len();
+    let videos=body["video_asset_ids"].as_array().map_or(0,Vec::len);
+    let mut wire=json!({"model":"seedance","prompt":"readiness-check",
+        "duration":body.get("duration").cloned().unwrap_or_else(||json!(base.map_or(5,|b|b.duration))),
+        "resolution":body.get("resolution").cloned().unwrap_or_else(||json!(base.map_or("480p",|b|b.resolution.as_str()))),
+        "ratio":body.get("ratio").cloned().unwrap_or_else(||json!(base.map_or("16:9",|b|b.ratio.as_str())))});
+    wire["image_asset_ids"]=json!((0..images).map(|n|format!("preflight-image-{n}")).collect::<Vec<_>>());
+    wire["video_asset_ids"]=json!((0..videos).map(|n|format!("preflight-video-{n}")).collect::<Vec<_>>());
+    let fingerprint=state.store.request_fingerprint_for_billing(request).map_err(|_|"budget_checkpoint_invalid")?;
+    crate::key_registry_sync::sync_now(state)?;
+    let reply=post(&state.bridge_client(),"/internal/bridge/v2/budgets/preflight",&json!({"wire_version":2,"parent_request_id":request,"request_id":request,"core_key_id":principal.key_id,"request_fingerprint":fingerprint,"endpoint":"videos","model":"seedance","step_kind":"video","body":wire}),request)?;
+    if reply["wire_version"]!=2 || reply["request_id"]!=request || reply["status"]!="ready" {return Err("budget_preparation_failed".into());}
+    Ok(())
+}
 pub(crate) fn prepare_step(state:&StarlinkRouterState,principal:&Principal,parent:&str,request:&str,model:&str,body:Value,kind:BudgetStepKind)->Result<BudgetStepView,String> {
     let endpoint=if kind==BudgetStepKind::Video {"videos"} else {"chat"};
     let fingerprint=state.store.request_fingerprint_for_billing(request).map_err(|e|e.to_string())?;
@@ -300,6 +317,10 @@ pub(crate) async fn seedance_work(state:Arc<StarlinkRouterState>,principal:Princ
     crate::budget_continuation::ensure_retry_due(&state,&request)?;
     if state.config.work_context_for_key(&principal.key_id) {return crate::work_execution::execute(state,principal,request,original,fresh,dispatch_only).await;}
     original=crate::budget_continuation::restore_inputs(&state,&principal,&request,&original)?;
+    if operation.as_ref().is_none_or(|op|!op.steps.iter().any(|s|s.kind==BudgetStepKind::Assist)) {
+        let s=state.clone();let p=principal.clone();let id=request.clone();let body=original.clone();
+        tokio::task::spawn_blocking(move||video_preflight(&s,&p,&id,&body,None)).await.map_err(|_|"budget_preparation_failed")??;
+    }
     state.seedance_results.progress(&request,Stage::Assistant);
     let assist=if let Some(step)=operation.and_then(|op|op.steps.into_iter().find(|s|s.kind==BudgetStepKind::Assist)) {step} else {
         if !fresh {return Err("budget_preparation_requires_recovery".into());}
@@ -637,5 +658,14 @@ pub(crate) async fn resume_checkpoint(state:Arc<StarlinkRouterState>,checkpoint:
     state.store.save_budget_continuation(&principal,&checkpoint.request_id,&body,checkpoint.key_version,&checkpoint.ciphertext).map_err(|_|"budget_checkpoint_invalid")?;
     let images=inline_images(&body)?;
     if !images.is_empty() {aiwork_core::require_scope(&principal,"assets:write").map_err(|_|"video_continuation_not_authorized")?;}
-    seedance_work(state,principal,checkpoint.request_id,body,false,images,true).await.map(|_|()).map_err(|e|e.code.to_string())
+    // No Core operation means no dispatch can have happened: admission is
+    // committed before sending. Resume the same helper identity, never create
+    // a new paid request to recover a previously admitted operation.
+    let unadmitted=state.store.budget_operation(&checkpoint.request_id).map_err(|_|"budget_checkpoint_invalid")?.is_none();
+    let request=checkpoint.request_id;
+    let outcome=seedance_work(state.clone(),principal,request.clone(),body,unadmitted,images,true).await;
+    if let Err(failure)=&outcome {
+        if unadmitted && state.store.budget_operation(&request).ok().flatten().is_none() {finish_unadmitted_failure(&state,&request,failure.code);}
+    }
+    outcome.map(|_|()).map_err(|e|e.code.to_string())
 }

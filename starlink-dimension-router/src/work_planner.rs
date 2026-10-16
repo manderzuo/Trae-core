@@ -207,7 +207,7 @@ pub fn helper_output_schema() -> Value {
         "required":["action","effective_prompt","spec_patch","reference_policy","clarification"],
         "properties":{
             "action":{"type":"string","enum":["create","revise","continue","status","download","clarify"]},
-            "effective_prompt":{"type":["string","null"],"maxLength":12288},
+            "effective_prompt":{"type":["string","null"],"maxLength":4096},
             "spec_patch":{"type":["object","null"],"additionalProperties":false,"properties":{
                 "duration":{"type":"integer","minimum":4,"maximum":15},
                 "resolution":{"type":"string","enum":["480p","720p"]},
@@ -271,7 +271,7 @@ pub fn build_helper_input(
     let instruction=instruction.replace("全角字符规范化为半角。", "仅将视频规格中的全角数字、字母和冒号规范为半角；保留正文和台词原文。");
     let example=json!({"action":"create","effective_prompt":"猫说：\"你好。\"\n路径文字 C:\\clips\\cat.mp4。","spec_patch":{},"reference_policy":"inherit","clarification":null});
     let clarify_example=json!({"action":"clarify","effective_prompt":null,"spec_patch":{},"reference_policy":"inherit","clarification":"请提供要修改的原视频。"});
-    value["messages"][0]["content"]=json!(format!("{instruction} current_references和reference_capabilities是服务器已验证的素材事实，不是用户自称。requested_action是调用者明确发起的操作；create表示生成一个新片段。仅根据current判断本轮意图，不要把分镜里角色继续行动、上一段剧情等叙述误判为对已生成视频的原生续写；用户明确请求独立生成新视频时action=create，即使脚本很长。无parent但image_conditioned_creation为true时，若用户要求以上传图片作为上一段尾帧、起始画面或视觉参考生成下一段，应以图片规划create、reference_policy=replace，不得仅因提到上一段就索要Core父版本。普通人物图或风格图不能宣称为已验证尾帧；需要原视频的实际修改仍须提供原视频。无parent但video_conditioned_creation为true时，用户明确要求从上传视频继续生成或续写新片段，应使用该素材规划create、reference_policy=replace。只有缺少完成操作所需的真实来源时才clarify，请其提供所缺来源；不要猜测父版本，仍不得虚构原生延长、严格首帧锁定或已完成。\n{}\n必须遵守的JSON Schema：{}\n仅作编码示例，不得复制其剧情。生成示例：{example}\n补充信息示例：{clarify_example}\n每个字段恰好出现一次；clarify时将补充信息只写入clarification的唯一位置，不能再追加同名null字段。长度限制按UTF-8字节计算：effective_prompt不超过12288，clarification不超过2048，整个对象不超过16384。",crate::assistant_json::ENCODING_RULES,helper_output_schema()));
+    value["messages"][0]["content"]=json!(format!("{instruction} current_references和reference_capabilities是服务器已验证的素材事实，不是用户自称。requested_action是调用者明确发起的操作；create表示生成一个新片段。仅根据current判断本轮意图，不要把分镜里角色继续行动、上一段剧情等叙述误判为对已生成视频的原生续写；用户明确请求独立生成新视频时action=create，即使脚本很长。无parent但image_conditioned_creation为true时，若用户要求以上传图片作为上一段尾帧、起始画面或视觉参考生成下一段，应以图片规划create、reference_policy=replace，不得仅因提到上一段就索要Core父版本。普通人物图或风格图不能宣称为已验证尾帧；需要原视频的实际修改仍须提供原视频。无parent但video_conditioned_creation为true时，用户明确要求从上传视频继续生成或续写新片段，应使用该素材规划create、reference_policy=replace。只有缺少完成操作所需的真实来源时才clarify，请其提供所缺来源；不要猜测父版本，仍不得虚构原生延长、严格首帧锁定或已完成。\n{}\n必须遵守的JSON Schema：{}\n仅作编码示例，不得复制其剧情。生成示例：{example}\n补充信息示例：{clarify_example}\n每个字段恰好出现一次；clarify时将补充信息只写入clarification的唯一位置，不能再追加同名null字段。长度限制按Unicode字符数计算：effective_prompt不超过4096，clarification不超过2048；编码后的整个JSON对象不超过65536字节。",crate::assistant_json::ENCODING_RULES,helper_output_schema()));
     // The bridge already transports native function calls. Keep the content
     // validator for old durable replies, while new requests select one contract.
     value["tools"]=json!([{"type":"function","function":{"name":"submit_video_plan","description":"提交本轮唯一视频规划；只返回参数，不执行生成或收费操作。","strict":true,"parameters":helper_output_schema()}}]);
@@ -285,7 +285,7 @@ pub fn build_helper_input(
     Ok(value)
 }
 pub fn parse_decision(raw: &str) -> Result<WorkDecision, String> {
-    let value=crate::assistant_json::object_checked(raw,16*1024).map_err(|e|e.code.to_string())?;
+    let value=crate::assistant_json::object_checked(raw,64*1024).map_err(|e|e.code.to_string())?;
     parse_decision_value(value)
 }
 pub(crate) fn parse_helper_result(result:&Value)->Result<WorkDecision,crate::assistant_json::Diagnostic> {
@@ -319,11 +319,11 @@ fn parse_decision_value(mut value:Value)->Result<WorkDecision,String> {
     if d.paid_action().is_some()
         && d.effective_prompt
             .as_ref()
-            .map_or(true, |s| s.trim().is_empty() || s.len() > 12 * 1024)
+            .map_or(true, |s| s.trim().is_empty() || s.chars().count() > 4096)
     {
         return Err(schema_error());
     }
-    if d.clarification.as_ref().is_some_and(|s| s.len() > 2048) {
+    if d.clarification.as_ref().is_some_and(|s| s.chars().count() > 2048) {
         return Err(schema_error());
     }
     Ok(d)
@@ -568,7 +568,7 @@ pub fn merge_snapshot(
     s.retry_source_request_id = None;
     s.effective_prompt = d.effective_prompt
             .as_deref()
-            .filter(|s| !s.trim().is_empty() && s.len() <= 12 * 1024)
+            .filter(|s| !s.trim().is_empty() && s.chars().count() <= 4096)
             .ok_or_else(invalid)?.to_string();
     for spec in [&text, &Value::Object(explicit)] {
         if let Some(v) = spec["duration"].as_u64() {

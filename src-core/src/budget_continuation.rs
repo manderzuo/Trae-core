@@ -134,10 +134,11 @@ impl CoreStore {
         if !(1..=100).contains(&limit) {return Err(CoreError::Validation {field:"continuation.limit".into(),reason:"must be 1..100".into()});}
         let connection=self.connection.lock().expect("core store mutex poisoned");
         let mut stmt=connection.prepare("SELECT c.request_id FROM budget_continuations c
-            JOIN budget_operations o ON o.parent_request_id=c.request_id
-            WHERE c.request_id>?1 AND NOT EXISTS(SELECT 1 FROM budget_execution_slot_releases e WHERE e.parent_request_id=c.request_id) AND NOT EXISTS(SELECT 1 FROM budget_continuation_retries retry WHERE retry.request_id=c.request_id AND (retry.state='attention' OR retry.next_attempt_at_ms>?3)) AND o.execution_state IN ('ready','running','unknown')
-            AND EXISTS(SELECT 1 FROM budget_steps s WHERE s.operation_id=o.operation_id AND s.kind='assist' AND s.execution_state='succeeded')
-            AND NOT EXISTS(SELECT 1 FROM budget_steps s WHERE s.operation_id=o.operation_id AND s.kind='video')
+            JOIN requests r ON r.id=c.request_id LEFT JOIN budget_operations o ON o.parent_request_id=c.request_id
+            WHERE c.request_id>?1 AND NOT EXISTS(SELECT 1 FROM budget_execution_slot_releases e WHERE e.parent_request_id=c.request_id) AND NOT EXISTS(SELECT 1 FROM budget_continuation_retries retry WHERE retry.request_id=c.request_id AND (retry.state='attention' OR retry.next_attempt_at_ms>?3))
+            AND ((o.operation_id IS NULL AND r.state IN ('received','validating')) OR
+              (o.execution_state IN ('ready','running','unknown') AND EXISTS(SELECT 1 FROM budget_steps s WHERE s.operation_id=o.operation_id AND s.kind='assist' AND s.execution_state='succeeded')
+               AND NOT EXISTS(SELECT 1 FROM budget_steps s WHERE s.operation_id=o.operation_id AND s.kind='video')))
             ORDER BY c.request_id LIMIT ?2")?;
         let ids=stmt.query_map(params![after,limit as i64,chrono::Utc::now().timestamp_millis()],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(ids)
